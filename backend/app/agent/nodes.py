@@ -307,9 +307,19 @@ def _business_date_of(value: Any, *, fallback: str, strict: bool = False) -> str
     解析失败、时间戳越界、类型错误都会抛 :class:`_BadBusinessDate`——调用方（订单行解析）
     据此整行拒绝，而不是把这行悄悄算进今天。
 
-    为什么时间戳要接四种异常：`datetime.fromtimestamp` 的越界表现**跨平台不一致**——
+    为什么时间戳要接三种异常：`datetime.fromtimestamp` 的越界表现**跨平台不一致**——
     Windows 上是 `OSError(22, Invalid argument)`，Linux/CPython 其他路径上可能是
     `ValueError` 或 `OverflowError`。只接 `ValueError` 就会"CI 绿、线上红"。
+
+    ## 这里**不接** `TypeError`（v1.5.2，与 `_best_effort_units` 的口径无关）
+
+    参数在每一支里都已先按类型收窄（`datetime` / `int|float` / `str`），能抛
+    `TypeError` 的只剩我们自己的代码（例如改了 `_BUSINESS_TZ` 的类型、或传了个
+    `datetime` 子类把方法写坏）。把它和"上游给了坏日期"一起折成 :class:`_BadBusinessDate`，
+    在 `strict=True` 的行级路径上就会变成"这一行脏"的整行拒绝——正是本仓明令禁止的
+    "代码 bug 被降级成数据脏"。所以 `TypeError` 必须照常传播；`_best_effort_units`
+    是**另一条旁路**（只喂审计样本、不影响业务结论），那里保留 `TypeError` 是有意的，
+    两处口径不同但都各自自洽。
     """
 
     def _bad(detail: str) -> str:
@@ -321,7 +331,7 @@ def _business_date_of(value: Any, *, fallback: str, strict: bool = False) -> str
         try:
             resolved = value if value.tzinfo else value.replace(tzinfo=_BUSINESS_TZ)
             return resolved.astimezone(_BUSINESS_TZ).strftime("%Y-%m-%d")
-        except (ValueError, TypeError, OSError, OverflowError) as exc:
+        except (ValueError, OSError, OverflowError) as exc:
             return _bad(f"无法把 datetime 折算成业务日期：{exc}")
     if isinstance(value, bool):
         # bool 是 int 的子类：不先拦下来，`create_time=True` 会被当成 1970-01-01 01:33:20+08:00。
@@ -332,7 +342,7 @@ def _business_date_of(value: Any, *, fallback: str, strict: bool = False) -> str
         try:
             seconds = float(value) / (1000.0 if float(value) > 1e11 else 1.0)
             return datetime.fromtimestamp(seconds, UTC).astimezone(_BUSINESS_TZ).strftime("%Y-%m-%d")
-        except (ValueError, TypeError, OSError, OverflowError) as exc:
+        except (ValueError, OSError, OverflowError) as exc:
             # 包含 NaN/inf（ValueError）与超范围整数（OSError/OverflowError，平台相关）。
             return _bad(f"时间戳 {value!r} 超出可表示范围：{exc}")
     if not isinstance(value, str):
@@ -355,7 +365,7 @@ def _business_date_of(value: Any, *, fallback: str, strict: bool = False) -> str
     try:
         resolved = parsed if parsed.tzinfo else parsed.replace(tzinfo=_BUSINESS_TZ)
         return resolved.astimezone(_BUSINESS_TZ).strftime("%Y-%m-%d")
-    except (ValueError, TypeError, OSError, OverflowError) as exc:
+    except (ValueError, OSError, OverflowError) as exc:
         return _bad(f"无法折算时间文本 {text!r} 的业务日期：{exc}")
 
 
@@ -912,8 +922,9 @@ def _best_effort_units(item: Mapping[str, Any], *, where: str) -> int | None:
     - 保留 `TypeError` → 最坏情况是"这条样本的 `units` 是 `null`"，指标一个数都不变。
 
     即：**旁路样本的完整性不许反过来决定业务结论的成败**。这是唯一一处故意保留
-    `TypeError` 的地方；`_read_order_row` / `_aggregate_orders` 里的 `except` 都已收窄到
-    `ValueError`，两处口径不同是有意的，不是忘了改。
+    `TypeError` 的地方；`_read_order_row` / `_aggregate_orders` / `_business_date_of`
+    里的 `except` 都已收窄到数据侧真正会抛的异常（`ValueError` / `OSError` /
+    `OverflowError`），两处口径不同是有意的，不是忘了改。
     """
     try:
         return _order_units(item, where=where)
@@ -944,7 +955,14 @@ _KNOWN_ORDER_ROW_KEYS: frozenset[str] = frozenset(
 )
 
 
-def _row_business_date(item: Mapping[str, Any], *, where: str, window_end: str) -> str:
+def _row_business_date(
+    item: Mapping[str, Any],
+    *,
+    where: str,
+    window_end: str,
+    order_id: str | None = None,
+    fallbacks: list[dict[str, Any]] | None = None,
+) -> str:
     """一行的业务日期：`create_time` → `pay_time` **逐字段尝试**，全都不是日期才整行拒绝。
 
     ## 三个必须分开的情况
@@ -965,10 +983,27 @@ def _row_business_date(item: Mapping[str, Any], *, where: str, window_end: str) 
     GMV 少算，可这一行其实有可用日期。日期在这两个字段上是**同义**的（都表示这单哪天成交），
     一个不可用不等于另一个也不可用；全都不可用才真的"猜不出这单是哪天的"。
 
+    ## 靠后续字段才成功时**必须留痕**（v1.5.2）
+
+    "第一个候选字段不可用、靠 `pay_time` 才解析成功"的行是**被接受**的（不是脏行），但它
+    说明上游的 `create_time` 正在系统性坏掉。旧实现只在**全都不可用**时留痕（整行拒绝），
+    于是 `create_time` 全写成 `False` 而 `pay_time` 始终合法的场景**永远查不出来**——同一
+    文件里 `_order_units` 的规矩是"降级必须可见"，日期这条降级却没有任何出口。
+
+    所以这里把跳过现场追加进 `fallbacks`（调用方 `_aggregate_orders` 只在**行最终被接受**后
+    合并，避免给一个后面又被拒/落在窗口外的行留下"日期降级"的假痕迹），由 `collect` 写成
+    一条 `collect.date_fallback`（warn，**不计入 `row_rejected`**：行是被接受的）。
+    样本只带 `order_id` / `where` / `reason` / `used_key` / `skipped_keys`，不重复异常原文
+    （那一行照样在 `collect.done` 里被计入指标，排障要的是"哪个字段坏了"）。
+
+    只有"**字段存在但给不出日期**"才算降级：`create_time` 键根本不存在、直接只给 `pay_time`
+    是上游不同接口的正常形态（见 `_ORDER_DATE_KEYS` 的注释），不告警——否则每次正常采集
+    都会 warn，把真正的系统性坏字段淹掉。
+
     失败时抛 :class:`_RowRejected`（`reason="bad_create_time"`），`error` 带上每个尝试过的字段
     与原因——"上游到底把哪个字段改坏了"不必再猜。
     """
-    attempts: list[str] = []
+    skipped: list[tuple[str, str, str]] = []
     for key in _ORDER_DATE_KEYS:
         if key not in item or item[key] is None:
             continue
@@ -976,17 +1011,30 @@ def _row_business_date(item: Mapping[str, Any], *, where: str, window_end: str) 
         if not value:
             # falsy ≠ 缺日期：`0` 是 1970-01-01、`""` 是空文本、`False` 是 bool——没有一个能
             # 表示"这单哪天成交"。折成 None 就会回退成今天，凭空造出一笔当日成交。
-            attempts.append(f"{where}.{key}={value!r}（falsy 值，不是日期）")
+            skipped.append((key, "falsy_value", f"{where}.{key}={value!r}（falsy 值，不是日期）"))
             continue
         try:
-            return _business_date_of(value, fallback=window_end, strict=True)
+            day = _business_date_of(value, fallback=window_end, strict=True)
         except _BadBusinessDate as exc:
-            attempts.append(f"{where}.{key}：{exc}")
+            skipped.append((key, "unparseable", f"{where}.{key}：{exc}"))
             continue
-    if attempts:
+        if skipped and fallbacks is not None:
+            # 行最终是否被接受由调用方决定（可能后面金额/件数坏掉，也可能落在窗口外）：
+            # 这里只把现场暂存到**这一行自己的** staging 列表，不直接算进全量审计。
+            fallbacks.append(
+                {
+                    "order_id": order_id,
+                    "where": where,
+                    "reason": skipped[0][1],
+                    "used_key": key,
+                    "skipped_keys": [skipped_key for skipped_key, _, _ in skipped],
+                }
+            )
+        return day
+    if skipped:
         raise _RowRejected(
             "业务日期不合法（"
-            + "；".join(attempts)
+            + "；".join(detail for _, _, detail in skipped)
             + f"）：{'/'.join(_ORDER_DATE_KEYS)} 都不是可用的日期，整行拒绝（不回退今天）",
             reason="bad_create_time",
         )
@@ -1000,6 +1048,7 @@ def _read_order_row(
     window_start: str,
     window_end: str,
     degraded: list[dict[str, Any]],
+    date_fallbacks: list[dict[str, Any]],
 ) -> dict[str, Any] | None:
     """把一行订单**校验并解析**成一个待提交的值；脏行抛 :class:`_RowRejected`。
 
@@ -1020,7 +1069,10 @@ def _read_order_row(
     1. 业务日期 → 窗口外的行直接 `None`（既不算错、也不进指标；上游会多给窗口外的单）。
        窗口判定**先于**金额解析：窗口外的行本来就不参与任何指标，把它算成"脏行"只会让
        审计里的拒绝计数虚高。日期的字段级细节（falsy / 逐字段尝试 / 全都不可用才拒绝）
-       见 :func:`_row_business_date`。
+       见 :func:`_row_business_date`；"靠后续字段才解析成功"的降级现场写进
+       `date_fallbacks`（staging，**只有这张行最终被接受时**才由调用方合并）。
+       注意顺序：`date_fallbacks` 在窗口判定**之前**产生，而窗口外的行 `return None`——
+       调用方按 `row is not None` 决定是否合并，所以窗口外行不会留下日期降级痕迹。
     2. 支付金额：必须是整数分、且**非负**（负数不是"退款/冲正"的表达方式，退款在
        `refund_amount` 里；负金额只会让 GMV 凭空变小）。
     3. 件数（仅对"已支付 + 有 sku + 成交额 > 0"的行）：缺失/非正按 1 件（降级），
@@ -1048,7 +1100,9 @@ def _read_order_row(
             reason="no_known_fields",
         )
     order_id = _order_id_of(item)
-    day = _row_business_date(item, where=where, window_end=window_end)
+    day = _row_business_date(
+        item, where=where, window_end=window_end, order_id=order_id, fallbacks=date_fallbacks
+    )
     if not (window_start <= day <= window_end):
         return None
 
@@ -1116,6 +1170,37 @@ def _read_order_row(
     return row
 
 
+def _check_row_accounting(
+    *,
+    rows_seen: int,
+    rows_accepted: int,
+    rows_rejected: int,
+    rows_out_of_window: int,
+    where: str,
+) -> None:
+    """行级账目恒等式（v1.5.2）：`rows_seen == rows_accepted + rows_rejected + rows_out_of_window`。
+
+    为什么必须显式断言：`rows_seen - rows_accepted` 曾经被读成"被拒行数"，实际它同时包含
+    **窗口外**的行（上游多给的、时区分页边界产生的），而 `rows_out_of_window` 不在任何事件的
+    `data` 里 → 账上差一个查不到的桶（实测 `100 - 93 = 7`，其中只有 3 行是脏行，另 4 行在
+    窗口外）。现在四者都进 `collect.done` / `collect.failed` / `collect.row_rejected`，这条
+    恒等式是它们能对账的唯一依据。
+
+    用 `raise AssertionError` 而不是 `assert`：`python -O` 会把语句级 `assert` 整条删掉，
+    而那正是"账永远对不上、还没有任何入口发现"的场景。异常消息带上四个数，出了问题能直接
+    看出是哪一桶被漏算。
+    """
+    total = rows_accepted + rows_rejected + rows_out_of_window
+    if rows_seen != total:
+        raise AssertionError(
+            f"{where}：行级账目不守恒——rows_seen={rows_seen}，"
+            f"但 rows_accepted({rows_accepted}) + rows_rejected({rows_rejected}) + "
+            f"rows_out_of_window({rows_out_of_window}) = {total}。"
+            "上游给的每一行必须落进这三个桶之一（被接受 / 被拒 / 窗口外），"
+            "否则 rows_seen - rows_accepted 就会包含一个查不到的桶。"
+        )
+
+
 def _aggregate_orders(
     payload: Any,
     *,
@@ -1166,6 +1251,12 @@ def _aggregate_orders(
       "漏了多少钱"仍然算不出来，人只能看到"有 N 行没进成本口径"却无法排序该先修哪一单。
     - `revenue <= 0` 也可能来自**负金额**——那种行不进这里，而是整行拒绝（见下面第 3 条）：
 
+    `date_fallback`（v1.5.2）：行被**接受**，但第一个候选日期字段（`create_time`）存在却给不出
+    日期，靠 `pay_time` 才解析成功。它不是脏行（行进了指标，所以**不**进 `row_rejected`），
+    但"上游把 `create_time` 写坏了"这件事必须可查——否则下一次所有行都退回 `pay_time`，
+    业务日期口径已经悄悄换了而没有人知道。现场只合并**被接受行**的暂存（窗口外/随后被拒的
+    行不留痕迹），由 `collect` 记一条 `collect.date_fallback`（warn）并置 `source.partial=True`。
+
     ## 第三条：**行级脏数据整行拒绝**（v1.5.1；这是"脏数据不许打死整轮"的根治）
 
     分界线（也是本仓对"降级 vs 硬失败"的判据）：
@@ -1189,6 +1280,15 @@ def _aggregate_orders(
     （真正进入任何指标的行）随聚合结果一起返回，`collect.done` 落进审计：只看 `gmv=0` 分不清
     "今天没卖东西"和"上游给的行全被拒了"，而这两个状态的处置完全不同。
 
+    **行级账目必须守恒（v1.5.2）**：
+    `rows_seen == rows_accepted + rows_rejected + rows_out_of_window`。
+    `rows_out_of_window` 是业务日期落在窗口外、被 :func:`_read_order_row` 返回 `None` 的行
+    （不是脏数据，也不进指标）。以前它只在本函数内部计数、**不进任何事件的 `data`**，于是
+    `rows_seen - rows_accepted` 会被读成"被拒行数"，而它其实 = 被拒 + 窗口外——账上差一个
+    查不到的桶。现在四者一起返回、由 :func:`_check_row_accounting` 断言，`collect` 再把
+    `rows_out_of_window` 写进三个出口（`collect.done` / `collect.failed` /
+    `collect.row_rejected`）。
+
     `row_rejected` 的样本也是 `{order_id, where, reason, error}`：`reason` 是稳定分类
     （`no_known_fields` / `bad_create_time` / `bad_pay_amount` / `bad_units` /
     `bad_refund_amount` / `bad_sku_id` / `not_an_object` / `unclassified`），`error` 保留原始
@@ -1210,6 +1310,9 @@ def _aggregate_orders(
     zero_revenue_paid: list[dict[str, Any]] = []
     #: 被整行拒绝的行（脏数据）——这些行**没有**进入任何指标，审计里必须说清楚
     row_rejected: list[dict[str, Any]] = []
+    #: 被**接受**、但第一个候选日期字段不可用（靠 `pay_time` 才解析成功）的行（v1.5.2）。
+    #: 它们不是脏行（行进了指标），所以单独一条 `collect.date_fallback`，不进 `row_rejected`。
+    date_fallbacks: list[dict[str, Any]] = []
     #: 拒绝率的分母/分子：分母是列表里的全部元素（含非对象元素与窗口外的行），
     #: 分子是真正进入任何指标的行。两者一起进 `collect.done`，否则"gmv=0"没法归因。
     rows_seen = len(raw_rows)
@@ -1248,6 +1351,10 @@ def _aggregate_orders(
         #: 这一行自己的降级留痕。**行被接受才合并到 `units_degraded`**：先合并再校验的话，
         #: 一个后面又被拒绝的行会在审计里留下"缺失件数"的痕迹，可它根本没进任何指标。
         staged_degraded: list[dict[str, Any]] = []
+        #: 同理，日期降级（靠 `pay_time` 才解析成功）也只在这一行**被接受**时合并：
+        #: 行在窗口外或随后金额/件数坏掉时，它没进任何指标，"create_time 坏了"这件事
+        #: 对指标没有影响，不该在审计里留一条会误导归因的痕迹。
+        staged_date_fallbacks: list[dict[str, Any]] = []
         try:
             row = _read_order_row(
                 item,
@@ -1255,6 +1362,7 @@ def _aggregate_orders(
                 window_start=window_start,
                 window_end=window_end,
                 degraded=staged_degraded,
+                date_fallbacks=staged_date_fallbacks,
             )
         except _RowRejected as exc:
             # 行级拒绝（v1.5.1）：这一行整行不进任何指标，但**必须留痕**，否则就是静默少算。
@@ -1281,6 +1389,7 @@ def _aggregate_orders(
             continue
         rows_accepted += 1
         units_degraded.extend(staged_degraded)
+        date_fallbacks.extend(staged_date_fallbacks)
         bucket = _bucket(row["day"])
         bucket["order_count"] += 1
         if not row["paid"]:
@@ -1323,6 +1432,13 @@ def _aggregate_orders(
         for sample in row_rejected:
             reason = str(sample.get("reason") or "unknown")
             reject_reasons[reason] = reject_reasons.get(reason, 0) + 1
+        _check_row_accounting(
+            rows_seen=rows_seen,
+            rows_accepted=rows_accepted,
+            rows_rejected=len(row_rejected),
+            rows_out_of_window=rows_out_of_window,
+            where="_aggregate_orders 全行被拒分支",
+        )
         detail = (
             f"全部 {rows_seen} 行都在业务窗口之外，没有任何一行进入指标"
             if rows_out_of_window == rows_seen
@@ -1345,14 +1461,26 @@ def _aggregate_orders(
         today["uv"] = day_uv
     # 降级/拒绝留痕与聚合结果**分开返回**：调用方（`collect`）要把它们从 `order_summary` 里取走
     # 变成审计条目，而 `MetricsSnapshot` 的输入不该多出与指标无关的键。
+    _check_row_accounting(
+        rows_seen=rows_seen,
+        rows_accepted=rows_accepted,
+        rows_rejected=len(row_rejected),
+        rows_out_of_window=rows_out_of_window,
+        where="_aggregate_orders 返回前",
+    )
     return {
         "by_date": {day: buckets[day] for day in sorted(buckets)},
         "units_degraded": units_degraded,
         "zero_revenue_paid": zero_revenue_paid,
         "row_rejected": row_rejected,
+        # 被接受、但靠后续字段才拿到日期的行（v1.5.2）：单独一条 warn，不进 row_rejected。
+        "date_fallback": date_fallbacks,
         # 拒绝率（v1.5.1）：`collect.done` 的审计靠这两个数把"0 单 0 元"归因清楚。
         "rows_seen": rows_seen,
         "rows_accepted": rows_accepted,
+        # 窗口外的行数（v1.5.2）：`rows_seen - rows_accepted` 里的另一个桶，必须和
+        # rows_accepted / rows_rejected 一起出现，否则"对账"永远差一截。
+        "rows_out_of_window": rows_out_of_window,
         **today,
     }
 
@@ -1440,7 +1568,8 @@ async def collect(state: AgentState, config: RunnableConfig) -> dict[str, Any]:
     `product_count: "3"` / `pay_amount: "199.00"` 这类**猜不出含义**的形状错仍然从 `collect`
     逃出 → 整轮 500。现在四档分明（判据写在 :func:`_aggregate_orders` 的 docstring）：
 
-    1. **能猜出含义 → 有界降级**（件数按 1 件、0 元单不进成本口径），照常算指标；
+    1. **能猜出含义 → 有界降级**（件数按 1 件、0 元单不进成本口径、日期靠后续字段才解析成功
+       也按解析到的日期计入但必须留痕），照常算指标；
     2. **一行的数据脏、猜不出含义 → 整行拒绝**：跳过该行并记 `collect.row_rejected`
        （warn，带 `count` + 最多 5 条样本 + 按原因计数），其余行照常算。"这一行一个已知订单
        字段都没有"（`{}` / `{"foo": 1}`）也在这一档，原因写作 `no_known_fields`——它**不是**
@@ -1453,16 +1582,19 @@ async def collect(state: AgentState, config: RunnableConfig) -> dict[str, Any]:
        与第 3 档**同一条** `_BatchContractError` 路径。没有这一档，"每一行都坏"就会退化成
        零告警的 0 单 0 元——F1b 要避免的状态只是从"整批"挪到了"逐行"。
 
-    只要出现任一降级/拒绝（`units_degraded` / `zero_revenue_paid` / `row_rejected`），
-    `source["partial"]` 就必须是 True：这次采集不是完整的一份，raw 快照里要能看出来
-    （v1.5.1 修掉了"行级拒绝后 partial 仍为 False"）。
+    只要出现任一降级/拒绝（`units_degraded` / `zero_revenue_paid` / `row_rejected` /
+    `date_fallback`），`source["partial"]` 就必须是 True：这次采集不是完整的一份，raw 快照里要能看出来
+    （v1.5.1 修掉了"行级拒绝后 partial 仍为 False"；v1.5.2 补上"日期降级也是降级"）。
 
     ## 两个出口都要有"这一轮采集怎么了"（成功与失败各一条）
 
     `collect.done`（info）与 `collect.failed`（error）**都**进 JSONL 汇，`data` 里都带
-    `rows_seen` / `rows_accepted` / `rows_rejected`（+ 失败时的 `reason` / `reject_reasons` /
-    `row_reject_samples`）。`collect.row_rejected` 也带同一对**分母**（`rows_seen` /
-    `rows_accepted`，v1.5.2）：否则日志页上的"7 行被拒"分不清是 7/7 还是 7/100。两个方向都要写：
+    `rows_seen` / `rows_accepted` / `rows_rejected` / `rows_out_of_window`（+ 失败时的
+    `reason` / `reject_reasons` / `row_reject_samples`）。`collect.row_rejected` 也带同一组
+    **分母/旁的桶**（v1.5.2）：否则日志页上的"7 行被拒"分不清是 7/7 还是 7/100，也拆不开
+    "3 行脏 + 4 行窗口外"。三者必须满足行级账目恒等式
+    `rows_seen == rows_accepted + rows_rejected + rows_out_of_window`（见
+    :func:`_check_row_accounting`，`collect` 在每个出口写入前断言）。两个方向都要写：
 
     - 只写失败会让人以为"没红就是正常"：一次**正常**采集在前端/日志页上是沉默的，而沉默
       既可能是"跑完了没事"，也可能是"根本没跑"——这两件事在排障里完全不是一回事；
@@ -1523,11 +1655,16 @@ async def collect(state: AgentState, config: RunnableConfig) -> dict[str, Any]:
     units_degraded: list[dict[str, Any]] = []
     zero_revenue_paid: list[dict[str, Any]] = []
     row_rejected: list[dict[str, Any]] = []
+    #: 被接受、但靠后续日期字段才解析成功的行（v1.5.2）：行进了指标，所以**不**进 `row_rejected`。
+    date_fallbacks: list[dict[str, Any]] = []
     #: 拒绝率（v1.5.1）：`rows_seen` 是上游给的**行数**（含非对象元素/窗口外的行），
     #: `rows_accepted` 是真正进入指标的行数。两者进 `collect.done` / `collect.failed`，
     #: 否则"gmv=0"分不清"今天没卖东西"和"给的行全没解析出来"。
     rows_seen = 0
     rows_accepted = 0
+    #: 窗口外行数（v1.5.2）：`rows_seen - rows_accepted` 的第二个桶。三个出口都必须带它，
+    #: 否则"100 - 93 = 7"里那 4 行窗口外的数据在日志上无处可查。
+    rows_out_of_window = 0
     reject_reasons: dict[str, int] = {}
     #: 失败分类（写进 `collect.failed` 的 `data.reason`）。**三档互斥**，默认是"接口没取到数据"：
     #: 订单请求本身失败时不会有任何异常对象可分类，只能靠这个标记说明"这不是数据脏"。
@@ -1568,6 +1705,9 @@ async def collect(state: AgentState, config: RunnableConfig) -> dict[str, Any]:
                 message = f"订单行全部被拒绝，无法聚合成指标：{exc}"
                 rows_seen = exc.rows_seen
                 rows_accepted = exc.rows_accepted
+                # 全部落在窗口外时（rows_out_of_window == rows_seen），失败审计也要能看出
+                # "不是脏、是窗口外"，否则这条失败会被误读成"上游全是脏行"（v1.5.2）。
+                rows_out_of_window = exc.rows_out_of_window
                 reject_reasons = dict(exc.reasons)
                 # 把拒绝样本接回来：`collect.failed` 的审计要能按原因计数（`rows_rejected`
                 # 与 `reject_reasons` 都从这里来），否则失败分支只剩一句"不可用"。
@@ -1589,16 +1729,29 @@ async def collect(state: AgentState, config: RunnableConfig) -> dict[str, Any]:
             units_degraded = aggregate.pop("units_degraded")
             zero_revenue_paid = aggregate.pop("zero_revenue_paid")
             row_rejected = aggregate.pop("row_rejected")
+            date_fallbacks = aggregate.pop("date_fallback")
             rows_seen = int(aggregate.pop("rows_seen"))
             rows_accepted = int(aggregate.pop("rows_accepted"))
+            rows_out_of_window = int(aggregate.pop("rows_out_of_window"))
             order_summary = {**aggregate, "by_date": by_date}
             # 只要有行被降级/拒绝，这次采集就**不是完整的一份**：`source.partial` 必须说出来。
             # 旧实现在行级拒绝后仍然是 partial=False（审查实测），于是"今天的数据不全"这件事
             # 在 raw 快照里不可见，只有一条 warn 审计——两个出口的口径互相矛盾。
-            if units_degraded or zero_revenue_paid or row_rejected:
+            # v1.5.2：日期降级（靠 pay_time 才解析成功）同样是"这份数据不是原样的"，也要置位。
+            if units_degraded or zero_revenue_paid or row_rejected or date_fallbacks:
                 source["partial"] = True
 
     if order_summary is None:
+        # 失败出口也必须对账（v1.5.2）：`batch_contract` / `orders_unavailable` 两个分支
+        # 根本没读到行（四个数都是 0），恒等式照样成立；`all_rows_rejected` 分支带着
+        # `rows_out_of_window` 回来，不校验就可能写出一个"被拒 + 窗口外 ≠ 看到"的审计。
+        _check_row_accounting(
+            rows_seen=rows_seen,
+            rows_accepted=rows_accepted,
+            rows_rejected=len(row_rejected),
+            rows_out_of_window=rows_out_of_window,
+            where="collect.failed 写入前",
+        )
         errors.append(
             make_agent_error(
                 node="collect",
@@ -1620,9 +1773,12 @@ async def collect(state: AgentState, config: RunnableConfig) -> dict[str, Any]:
             "reason": failure_reason,
             # 失败也必须带拒绝率：`gmv=0` 与"一行都没解析出来"在 trace 上是同一行摘要，
             # 只有这几个数能把"生意归零"和"数据不可用"分开。
+            # v1.5.2：`rows_out_of_window` 是 `rows_seen - rows_accepted` 的第二个桶，
+            # 少了它，失败审计里的"7 行没进指标"仍然无法拆成"3 行脏 + 4 行窗口外"。
             "rows_seen": rows_seen,
             "rows_accepted": rows_accepted,
             "rows_rejected": len(row_rejected),
+            "rows_out_of_window": rows_out_of_window,
             "reject_reasons": dict(reject_reasons),
             "row_reject_samples": reject_samples,
             "row_reject_samples_truncated": len(row_rejected) > len(reject_samples),
@@ -1661,6 +1817,13 @@ async def collect(state: AgentState, config: RunnableConfig) -> dict[str, Any]:
         order_summary=order_summary,
         source=source,
     )
+    _check_row_accounting(
+        rows_seen=rows_seen,
+        rows_accepted=rows_accepted,
+        rows_rejected=len(row_rejected),
+        rows_out_of_window=rows_out_of_window,
+        where="collect.done 写入前",
+    )
     done_data: dict[str, Any] = {
         "window": raw["window"],
         "products": len(products),
@@ -1668,11 +1831,14 @@ async def collect(state: AgentState, config: RunnableConfig) -> dict[str, Any]:
         "partial": bool(source["partial"]),
         # 拒绝率：分母=上游给的行数，分子=真正进入指标的行数。与
         # `rows_rejected`（整行被拒的条数）一起构成"这一轮采集到底发生了什么"的汇总。
+        # v1.5.2 起再加 `rows_out_of_window`：`rows_seen - rows_accepted` 必须能被这两个桶
+        # 完整解释（账目恒等式见 `_check_row_accounting`），否则读者会把窗口外的行算成脏行。
         "rows_seen": rows_seen,
         "rows_accepted": rows_accepted,
         # 整行被拒的条数在这里也出现一次：`collect.done` 是"这一轮采集到底发生了什么"的
         # 汇总入口，读者不必先去翻 `collect.row_rejected` 才知道今天有几行没进指标。
         "rows_rejected": len(row_rejected),
+        "rows_out_of_window": rows_out_of_window,
     }
     audits = _audit(
         state,
@@ -1695,9 +1861,9 @@ async def collect(state: AgentState, config: RunnableConfig) -> dict[str, Any]:
         ),
         data=done_data,
     )
-    # 采集层的两次**容错**必须留痕（v1.5.1）。它们不产生 approval_request、不进 action_log，
-    # 所以除了 `state.audit` 之外还必须写一条 JSONL：否则"这次为什么漏报亏本"在日志页上
-    # 找不到任何线索（而这正是这两个降级的唯一后果）。
+    # 采集层的三次**容错**必须留痕（v1.5.2：units / zero_revenue_paid / date_fallback）。
+    # 它们不产生 approval_request、不进 action_log，所以除了 `state.audit` 之外还必须写一条
+    # JSONL：否则"这次为什么漏报亏本 / 为什么日期口径变了"在日志页上找不到任何线索。
     if units_degraded:
         data = _degradation_summary("units", units_degraded)
         audits = append_audits(
@@ -1735,13 +1901,22 @@ async def collect(state: AgentState, config: RunnableConfig) -> dict[str, Any]:
     if row_rejected:
         # 行级拒绝（v1.5.1）：这些行**整行**没进指标。审计必须把这件事说出来，否则
         # "GMV 比昨天少了一截"就永远无法归因到"上游有几行脏数据被跳过了"。
+        _check_row_accounting(
+            rows_seen=rows_seen,
+            rows_accepted=rows_accepted,
+            rows_rejected=len(row_rejected),
+            rows_out_of_window=rows_out_of_window,
+            where="collect.row_rejected 写入前",
+        )
         data = _degradation_summary("row_rejected", row_rejected)
         data["excluded_from_metrics"] = True
         # **分母**必须跟着分子一起出现（v1.5.2）：只写 `count`（被拒条数）时，日志页上的
         # "7 行被拒"分不清是 7/7（整批脏）还是 7/100（个别脏）。`rows_seen` / `rows_accepted`
-        # 与 `collect.done` / `collect.failed` 同一个口径（上游给的行数 vs 进入指标的行数）。
+        # / `rows_out_of_window` 与 `collect.done` / `collect.failed` 同一个口径
+        # （上游给的行数 vs 进入指标的行数 vs 窗口外的行数）。
         data["rows_seen"] = rows_seen
         data["rows_accepted"] = rows_accepted
+        data["rows_out_of_window"] = rows_out_of_window
         # 文案必须自证"样本只是样本"（v1.5.1）：`count` 是全量，`samples` 只有前 N 条。
         # 只写"样本见 data.samples"会让读者把"看到 5 条"当成"一共就 5 条"。
         sample_note = f"仅前 {data['sample_limit']} 条样本" + (
@@ -1760,6 +1935,31 @@ async def collect(state: AgentState, config: RunnableConfig) -> dict[str, Any]:
                 f"有 {data['count']} 条订单行数据不合法（按原因：{data['reasons']}），已整行跳过："
                 "这些行没有进入 GMV / 订单数 / by_sku 中的任何一个指标"
                 f"（不是静默少算：样本见 data.samples，{sample_note}）"
+            ),
+            data=data,
+        )
+    if date_fallbacks:
+        # 日期降级（v1.5.2）：行是**被接受**的（进了指标），所以**不**写进 `row_rejected`。
+        # 但没有这条留痕，"上游把 create_time 全写成 False、靠 pay_time 照常算"就永远查不出来：
+        # 指标看起来一切正常，业务日期口径却已经悄悄从"下单日"换成了"支付日"。
+        data = _degradation_summary("date_fallback", date_fallbacks)
+        sample_note = f"仅前 {data['sample_limit']} 条样本" + (
+            "（其余已截断）" if data["samples_truncated"] else ""
+        )
+        audits = append_audits(
+            {"audit": audits},  # type: ignore[arg-type]
+            [make_audit_entry(node="collect", event="collect.date_fallback", data=data)],
+        )
+        _log_audit(
+            state,
+            node="collect",
+            event="collect.date_fallback",
+            level="warn",
+            message=(
+                f"有 {data['count']} 条订单行的 create_time 不可用、靠后续日期字段才解析成功"
+                f"（按原因：{data['reasons']}）：已按实际解析到的日期计入指标，"
+                "上游 create_time 可能正在系统性写坏（样本见 data.samples，"
+                f"{sample_note}）"
             ),
             data=data,
         )

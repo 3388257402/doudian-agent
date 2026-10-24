@@ -17,7 +17,7 @@
 路径（`status=failed`，不 500）；部分被拒保持 warn + `source["partial"]=True`；拒绝率
 （`rows_seen` / `rows_accepted`）进 `collect.done` 的审计。
 
-v1.5.2 补的四个洞（都在同一个"行级契约"上，因此并进本文件而不是另开一套夹具）：
+v1.5.2 补的七个洞（都在同一个"行级契约"上，因此并进本文件而不是另开一套夹具）：
 
 5. **falsy `create_time` 被算成今天**：`item.get("create_time") or item.get("pay_time")` 在 strict
    判定**之前**折掉 falsy 值，而 strict 对 `None` 仍然回退当日 → `False` / `0` / `""` 都变成
@@ -28,10 +28,18 @@ v1.5.2 补的四个洞（都在同一个"行级契约"上，因此并进本文�
    rows_rejected=0 / partial=False`。批层有该判据，行层没有 → `no_known_fields`。
 8. **代码 bug 被降级成数据脏**：把 `except ValueError` 变异成 `except Exception` 时全部用例照旧
    通过——`TypeError` 那条硬边界此前没有任何测试守护。
+9. **`rows_seen - rows_accepted` 对不上账**：它 = 被拒行 **+ 窗口外行**，而
+   `rows_out_of_window` 不在任何事件的 `data` 里 → "100-93=7"里有一个查不到的桶。
+10. **falsy 日期回落的成功路径零留痕**：`create_time=False` + 合法 `pay_time` → 行被接受、
+   用 pay_time 的日期，既不进 rejected 也不进任何审计 → "上游把 `create_time` 全写成 False"
+   永远查不出来。
+11. **`_best_effort_units` 的"唯一一处 TypeError"声明不成立**：`_business_date_of` 里还有三处
+   `except (..., TypeError, ...)`；本版收窄为数据侧真正会抛的三种异常，并各加一条用例。
 """
 
 from __future__ import annotations
 
+from datetime import datetime
 from typing import Any
 
 import pytest
@@ -84,6 +92,18 @@ def _done(update: dict[str, Any]) -> dict[str, Any]:
     entries = [entry for entry in update["audit"] if entry["event"] == "collect.done"]
     assert len(entries) == 1, [entry["event"] for entry in update["audit"]]
     return entries[0]["data"]
+
+
+def _assert_row_accounting(data: dict[str, Any], *, rejected_field: str = "rows_rejected") -> None:
+    """v1.5.2 的行级账目恒等式：看到 = 接受 + 被拒 + 窗口外。
+
+    四个数必须同时出现；少任何一个，`rows_seen - rows_accepted` 就会包含一个查不到的桶。
+    `collect.row_rejected` 的"被拒"项就是它自己的 `count`（该事件本身只汇总被拒行），
+    所以调用方传 `rejected_field="count"`——不在同一行里重复一个等值的 `rows_rejected` 键。
+    """
+    assert data["rows_seen"] == (
+        data["rows_accepted"] + data[rejected_field] + data["rows_out_of_window"]
+    ), data
 
 
 # ======================================================================================
@@ -542,6 +562,10 @@ async def test_unusable_create_time_falls_back_to_pay_time_instead_of_dropping_t
     一个不可用就该试下一个，两个都不可用才拒绝。
 
     用**另一个业务日**（10-20，不是今天）才能证明取到的是 `pay_time` 的日期而不是回退的今天。
+
+    v1.5.2 补上留痕：行被接受**不等于**这件事没发生。`create_time` 系统性坏掉、靠 `pay_time`
+    兜住时，指标一切正常、业务日期口径却已经悄悄换了；所以必须有一条 `collect.date_fallback`
+    （warn）且 `source.partial=True`，而它**不算** `row_rejected`（行是被接受的）。
     """
     fake_client.orders = [
         {
@@ -564,9 +588,230 @@ async def test_unusable_create_time_falls_back_to_pay_time_instead_of_dropping_t
     bucket = summary["by_date"]["2026-10-20"]
     assert bucket["gmv_cents"] == 555
     assert bucket["order_count"] == 1
-    assert update["raw"]["source"]["partial"] is False, "没有被拒/降级的行，采集是完整的"
+    # 日期降级也是降级：raw 快照必须自证"这份不是原样的 create_time 口径"。
+    assert update["raw"]["source"]["partial"] is True
+
+    fallbacks = [e for e in update["audit"] if e["event"] == "collect.date_fallback"]
+    assert len(fallbacks) == 1, [entry["event"] for entry in update["audit"]]
+    data = fallbacks[0]["data"]
+    assert data["kind"] == "date_fallback"
+    assert data["count"] == 1
+    assert data["reasons"] == {"unparseable": 1}
+    sample = data["samples"][0]
+    assert sample["order_id"] == "o_pay_time_only"
+    assert sample["where"] == "order[0]"
+    assert sample["used_key"] == "pay_time"
+    assert sample["skipped_keys"] == ["create_time"]
+    assert sample["reason"] == "unparseable"
+
+    # 同一条事实也必须进 JSONL（`/api/logs` 是它唯一的人类出口）。
+    rows = sink.read(run_id=RUN_ID, event_prefix="collect.date_fallback")
+    assert len(rows) == 1
+    assert rows[0]["level"] == "warn"
+    assert rows[0]["data"]["count"] == 1
+
     done = _done(update)
-    assert (done["rows_seen"], done["rows_accepted"]) == (2, 2)
+    _assert_row_accounting(done)
+    assert (done["rows_seen"], done["rows_accepted"], done["rows_rejected"]) == (2, 2, 0)
+
+
+@pytest.mark.parametrize("falsy_value", [False, 0, ""], ids=["false", "zero", "empty-string"])
+async def test_falsy_create_time_with_a_usable_pay_time_is_accepted_but_traced(
+    runtime: Any,
+    sink: JsonlLogSink,
+    fake_client: FakeDoudianClient,
+    falsy_value: Any,
+) -> None:
+    """`create_time` falsy + 合法 `pay_time` → 行被接受，但**必须有** `collect.date_fallback`。
+
+    这是第 3 条要修的现象：旧实现里这一行既不进 rejected、也不进任何审计（`attempts` 是局部
+    变量，成功即丢弃）。后果是"上游把 `create_time` 全写成 `False`"这件事**永远查不出来**，
+    而同一文件里 `_order_units` 的规矩是"降级必须可见"。
+
+    判据要能和"整行拒绝"分开：行进了指标（GMV 计入），`row_rejected` 一条都不许有。
+    """
+    fake_client.orders = [
+        {
+            "order_id": "o_falsy_but_paid",
+            "sku_id": "sku_a",
+            "pay_amount": 555,
+            "product_count": 1,
+            "create_time": falsy_value,
+            "pay_time": "2026-10-20 11:00:00",
+        },
+        _good_row(),
+    ]
+
+    update = await collect.__wrapped__(_state(), _config(runtime))  # type: ignore[attr-defined]
+
+    assert update.get("status") != RunStatus.FAILED.value
+    assert _rejected(update) == [], "行被接受了，不许同时记成 row_rejected"
+    assert update["raw"]["order_summary"]["gmv_cents"] == 9_900
+    assert update["raw"]["order_summary"]["by_date"]["2026-10-20"]["gmv_cents"] == 555
+    assert update["raw"]["source"]["partial"] is True
+
+    data = next(e for e in update["audit"] if e["event"] == "collect.date_fallback")["data"]
+    assert data["reasons"] == {"falsy_value": 1}
+    sample = data["samples"][0]
+    assert sample["order_id"] == "o_falsy_but_paid"
+    assert sample["used_key"] == "pay_time"
+    assert sample["skipped_keys"] == ["create_time"]
+    assert sample["reason"] == "falsy_value"
+    assert sink.read(run_id=RUN_ID, event_prefix="collect.date_fallback")[0]["level"] == "warn"
+
+    done = _done(update)
+    _assert_row_accounting(done)
+    assert (done["rows_seen"], done["rows_accepted"], done["rows_rejected"]) == (2, 2, 0)
+
+
+async def test_pay_time_only_row_is_not_a_date_degradation(
+    runtime: Any, sink: JsonlLogSink, fake_client: FakeDoudianClient
+) -> None:
+    """只给 `pay_time`（**键不存在**，不是"给了不可用的值"）是上游正常形态，不告警。
+
+    判据必须是"字段存在但给不出日期"，否则每次正常采集都会 warn（抖店不同接口本来就可能只给
+    其中一个日期字段），真正的系统性坏字段会被淹掉。
+    """
+    fake_client.orders = [
+        {
+            "order_id": "o_pay_only",
+            "sku_id": "sku_a",
+            "pay_amount": 555,
+            "product_count": 1,
+            "pay_time": "2026-10-20 11:00:00",
+        }
+    ]
+
+    update = await collect.__wrapped__(_state(), _config(runtime))  # type: ignore[attr-defined]
+
+    assert update.get("status") != RunStatus.FAILED.value
+    assert update["raw"]["source"]["partial"] is False
+    assert [e for e in update["audit"] if e["event"] == "collect.date_fallback"] == []
+    assert sink.read(run_id=RUN_ID, event_prefix="collect.date_fallback") == []
+    assert update["raw"]["order_summary"]["by_date"]["2026-10-20"]["gmv_cents"] == 555
+
+
+async def test_row_accounting_identity_includes_out_of_window_rows(
+    runtime: Any, sink: JsonlLogSink, fake_client: FakeDoudianClient
+) -> None:
+    """`rows_seen - rows_accepted` 必须能被 `rows_rejected + rows_out_of_window` 完整解释。
+
+    旧实现只在函数内部数 `rows_out_of_window`、不写进任何事件的 `data`，于是
+    `rows_seen - rows_accepted` 会被读成"被拒行数"——实际它是"被拒 + 窗口外"。
+    这里三行分别落进三个桶：1 好行 + 1 脏行 + 1 窗口外。
+    """
+    fake_client.orders = [
+        _good_row(),
+        {
+            "order_id": "o_bad",
+            "sku_id": "sku_a",
+            "pay_amount": "199.00",
+            "create_time": f"{TODAY} 09:00:00",
+        },
+        {
+            "order_id": "o_old",
+            "sku_id": "sku_a",
+            "pay_amount": 100,
+            "create_time": "2026-10-01 10:00:00",  # 窗口是 10-16..10-23
+        },
+    ]
+
+    update = await collect.__wrapped__(_state(), _config(runtime))  # type: ignore[attr-defined]
+
+    assert update.get("status") != RunStatus.FAILED.value
+    done = _done(update)
+    _assert_row_accounting(done)
+    assert (
+        done["rows_seen"],
+        done["rows_accepted"],
+        done["rows_rejected"],
+        done["rows_out_of_window"],
+    ) == (3, 1, 1, 1)
+
+    rejected = _rejected(update)[0]["data"]
+    _assert_row_accounting(rejected, rejected_field="count")
+    assert (rejected["rows_seen"], rejected["rows_accepted"]) == (3, 1)
+    assert rejected["rows_out_of_window"] == 1
+
+    rows = sink.read(run_id=RUN_ID, event_prefix="collect.row_rejected")
+    assert len(rows) == 1
+    _assert_row_accounting(rows[0]["data"], rejected_field="count")
+
+
+async def test_all_rows_out_of_window_fails_with_the_out_of_window_bucket(
+    runtime: Any, sink: JsonlLogSink, fake_client: FakeDoudianClient
+) -> None:
+    """全部落在窗口外 → 视同整批失败，但失败审计要能看出"不是脏、是窗口外"。
+
+    没有 `rows_out_of_window` 时，`all_rows_rejected` + `reject_reasons={}` 会被误读成
+    "上游给了 N 行脏数据"；四桶里真正的答案是 `rows_out_of_window == rows_seen`。
+    """
+    fake_client.orders = [
+        {
+            "order_id": f"o_old_{index}",
+            "sku_id": "sku_a",
+            "pay_amount": 100,
+            "create_time": "2026-10-01 10:00:00",
+        }
+        for index in range(2)
+    ]
+
+    update = await collect.__wrapped__(_state(), _config(runtime))  # type: ignore[attr-defined]
+
+    assert update.get("status") == RunStatus.FAILED.value
+    failed = next(entry for entry in update["audit"] if entry["event"] == "collect.failed")
+    data = failed["data"]
+    _assert_row_accounting(data)
+    assert data["reason"] == "all_rows_rejected"
+    assert (
+        data["rows_seen"],
+        data["rows_accepted"],
+        data["rows_rejected"],
+        data["rows_out_of_window"],
+    ) == (2, 0, 0, 2)
+
+    rows = sink.read(run_id=RUN_ID, event_prefix="collect.failed")
+    assert len(rows) == 1
+    _assert_row_accounting(rows[0]["data"])
+
+
+def test_business_date_of_propagates_type_error_from_our_own_code() -> None:
+    """`_business_date_of` **不接** `TypeError`（v1.5.2）：代码 bug 不许变成"日期脏"。
+
+    四个参数分支都已按类型收窄，数据侧只能触发 `OSError` / `OverflowError` / `ValueError`；
+    `TypeError` 只可能来自我们自己的代码（改了 `_BUSINESS_TZ`、或传了写坏的 `datetime` 子类）。
+    若被接住，`strict=True` 就会把它转成 `_BadBusinessDate` → 该行被拒 → 指标静默少算，
+    与 `_best_effort_units` 那条**旁路**（只喂审计样本、保留 TypeError）口径不同但各自自洽。
+    """
+
+    class _BoomDatetime(datetime):
+        def astimezone(self, tz: Any = None) -> Any:
+            raise TypeError("内部实现坏了（不是上游数据形状）")
+
+    value = _BoomDatetime(2026, 10, 23, 12, 0, tzinfo=nodes._BUSINESS_TZ)
+    with pytest.raises(TypeError):
+        nodes._business_date_of(value, fallback=TODAY)
+
+
+def test_best_effort_units_still_absorbs_type_error_by_design(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """`_best_effort_units` 是**唯一**故意保留 `TypeError` 的地方：它只喂审计样本。
+
+    这条与上一条一起锁死"两处口径不同是有意的"：谁若为了统一而把它也收窄，旁路样本的
+    一个 `TypeError` 就会打死整轮采集（当天所有指标一起没有），本用例会红。
+    """
+
+    def _boom(*_args: Any, **_kwargs: Any) -> int:
+        raise TypeError("内部实现坏了")
+
+    monkeypatch.setattr(nodes, "_order_units", _boom)
+    assert nodes._best_effort_units({"order_id": "o"}, where="order[0]") is None
+
+
+# ======================================================================================
+# v1.5.2：falsy 日期 / 逐字段尝试 / 行级"一个已知字段都没有" / 代码 bug 不许降级成数据脏
+# ======================================================================================
 
 
 async def test_rows_without_any_known_order_field_go_the_all_rows_rejected_path(
