@@ -1,0 +1,72 @@
+# ======================================================================================
+# .gitignore —— 只允许"能被 review 的东西"进仓库
+#
+# 三条硬要求（写错的后果）：
+# 1. 依赖目录（.venv/ node_modules/）绝不能进仓库：几百 MB，且是与平台绑定的二进制树。
+# 2. 运行痕迹（data/ 下的 sqlite、WAL、JSONL 日志）绝不能进仓库：里面是**真实的**运营数据、
+#    审批记录和 trace，带出去等于把用户的业务数据提交到公开仓库。
+# 3. 密钥（.env）绝不能进仓库：进过一次就永远在 git 历史里，删文件不等于删历史。
+# ======================================================================================
+
+# --- 依赖（Python / Node）---
+.venv/
+venv/
+node_modules/
+.pnpm-store/
+
+# --- 密钥与本地配置 ---
+.env
+.env.*
+!.env.example
+*.pem
+*.key
+.secrets/
+
+# --- 运行数据：数据库、WAL/SHM、日志、检查点 ---
+# `data/` 是默认的运行目录（settings.yaml 的 database.url / checkpoint.path / log_file 都指这里）
+data/
+*.db
+*.db-wal
+*.db-shm
+*.sqlite
+*.sqlite3
+*.jsonl
+!backend/tests/fixtures/**/*.jsonl
+
+# --- Python 缓存与测试产物 ---
+__pycache__/
+*.py[cod]
+*.egg-info/
+.eggs/
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+.coverage
+.coverage.*
+htmlcov/
+.tox/
+
+# --- 前端构建与自检产物 ---
+dist/
+frontend/dist/
+frontend/.verify/
+.vite/
+*.local
+*.tsbuildinfo
+
+# --- 编辑器 / 系统 ---
+.idea/
+.vscode/
+.DS_Store
+Thumbs.db
+desktop.ini
+
+# --- 临时输出（本地排查用，不属于仓库内容）---
+*.log
+full_test_out.txt
+tmp/
+
+# --- 内部记录（审查报告 + 本机环境探测）：不入库 ---
+# REVIEW-*.md 记的是修复过程中的审查结论（含漏洞复现细节）；ENV.md 是本机探测记录
+# （含本机路径与资源数值）。开源仓库只发布契约、决策记录与 RUNBOOK。
+docs/internal/

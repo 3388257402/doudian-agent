@@ -1,0 +1,48 @@
+# ======================================================================================
+# .dockerignore —— 构建上下文瘦身 + 防止运行数据进镜像层
+#
+# 没有这个文件时，`docker build .` 会把 `.venv/`（几百 MB）、`node_modules/`、
+# `data/`（SQLite + JSONL 日志）一起送给 daemon。慢，而且把运行痕迹烤进镜像。
+# ======================================================================================
+
+# 依赖
+.venv/
+venv/
+node_modules/
+.pnpm-store/
+
+# 运行数据与日志
+data/
+*.db
+*.db-wal
+*.db-shm
+*.sqlite
+*.jsonl
+
+# 密钥与本地配置
+.env
+.env.*
+!.env.example
+*.pem
+*.key
+
+# 版本控制与测试产物
+.git/
+.github/
+__pycache__/
+*.py[cod]
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+.coverage
+htmlcov/
+
+# 前端构建产物（镜像里自己构建）
+frontend/dist/
+frontend/.verify/
+dist/
+
+# 文档与演示脚本不必进运行时镜像（构建上下文仍有它们，除非被这里排除）
+docs/
+*.md
+!backend/requirements.txt

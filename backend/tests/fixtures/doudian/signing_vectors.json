@@ -1,0 +1,26 @@
+{
+  "app_key": "7000000000000000001",
+  "app_secret": "test_secret_do_not_use",
+  "timestamp": "2024-01-01 00:00:00",
+  "version": 2,
+  "vectors": [
+    {
+      "name": "edit_price",
+      "method": "product.editPrice",
+      "params": {"product_id": "3400000000000000001", "sku_id": "3400000000000000002", "price": 9900},
+      "param_json": "{\"price\":9900,\"product_id\":\"3400000000000000001\",\"sku_id\":\"3400000000000000002\"}",
+      "sign": "d51d5ea0311439786664d17e957cf3d1c4a734c2ac64c27bfbab453a876d7163"
+    },
+    {
+      "name": "empty_params",
+      "method": "shop.getShopInfo",
+      "params": {},
+      "param_json": "{}",
+      "sign": "c3901cae95b0043b60b57c1a494aeb927045419a17b7d7b032db5f98dd1ad83f"
+    }
+  ],
+  "callback": {
+    "body": "{\"msg_id\":\"1\",\"type\":\"order.new\"}",
+    "event_sign": "35b25ee40affe3b74045b3c7fda228d3"
+  }
+}

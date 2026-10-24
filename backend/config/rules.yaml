@@ -1,0 +1,56 @@
+# 异常检测规则（CONTRACT §8.3）
+#
+# 表达式求值走白名单 AST 解释器（app/services/rules.py）：
+#   - 没有函数调用（白名单里没有 Call）：没有 abs()、没有 len()、没有 __import__
+#   - 没有属性访问、没有下标、没有推导式、没有 f-string
+#   - 只能引用 §8.3.3 冻结的 18 个名字
+#
+# 任何结构错误（未知字段 / 语法错误 / 拼错的指标名）都在**加载期**抛 RuleLoadError，
+# 不会拖到运行期变成"规则永远不触发"。
+
+version: "1"
+
+rules:
+  - id: gmv_drop_day
+    enabled: true
+    severity: warn
+    metric: gmv_cents
+    when: "gmv_cents < gmv_7d_avg_cents * 0.7"
+    window: day
+    description: "当日 GMV 低于近 7 日均值的 70%"
+    actions:
+      - type: price_update
+        target_from: top_gmv_sku
+        params: {price_drop_pct: 3}
+
+  - id: refund_spike
+    enabled: true
+    severity: critical
+    metric: refund_rate
+    when: "refund_rate is not None and refund_rate > 0.08"
+    window: day
+    description: "退款率超过 8%"
+    actions:
+      - type: stock_update
+        target_from: top_refund_sku
+        params: {stock: 0}
+
+  - id: gmv_collapse_day
+    enabled: true
+    severity: critical
+    metric: gmv_cents
+    when: "gmv_7d_avg_cents is not None and gmv_7d_avg_cents > 0 and gmv_cents < gmv_7d_avg_cents * 0.5"
+    window: day
+    description: "当日 GMV 低于近 7 日均值的一半"
+    actions:
+      - type: price_update
+        target_from: top_gmv_sku
+        params: {price_drop_pct: 10}
+
+  - id: aov_drop_day
+    enabled: false
+    severity: info
+    metric: aov_cents
+    when: "gmv_delta_ratio is not None and gmv_delta_ratio < -0.2"
+    window: day
+    description: "GMV 环比跌幅超过 20%（默认关闭，用于人工排查）"

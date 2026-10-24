@@ -1,0 +1,53 @@
+{
+  "name": "products_ok",
+  "match": {
+    "method": "product.listV2",
+    "body_contains": {}
+  },
+  "response": {
+    "status": 200,
+    "headers": {"x-tt-logid": "20261023143000PRODUCTLIST"},
+    "json": {
+      "err_no": 0,
+      "message": "success",
+      "data": {
+        "page": 0,
+        "size": 50,
+        "total": 3,
+        "products": [
+          {
+            "product_id": "3400000000000000001",
+            "sku_id": "3400000000000000002",
+            "title": "真丝衬衫（白/160）",
+            "current_price_cents": 19900,
+            "stock": 42,
+            "is_on_sale": true,
+            "gmv_30d_cents": 398000,
+            "refund_order_count_30d": 6
+          },
+          {
+            "product_id": "3400000000000000011",
+            "sku_id": "3400000000000000012",
+            "title": "羊毛围巾（驼色）",
+            "current_price_cents": 25900,
+            "stock": 8,
+            "is_on_sale": true,
+            "gmv_30d_cents": 259000,
+            "refund_order_count_30d": 1
+          },
+          {
+            "product_id": "3400000000000000001",
+            "sku_id": "3400000000000000003",
+            "title": "真丝衬衫（黑/160）",
+            "current_price_cents": 19900,
+            "stock": 3,
+            "is_on_sale": true,
+            "gmv_30d_cents": 199000,
+            "refund_order_count_30d": 9
+          }
+        ]
+      }
+    }
+  },
+  "delay_ms": 0
+}

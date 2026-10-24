@@ -1,0 +1,26 @@
+﻿installed_at=2026-10-24T01:03:26.5300475+08:00
+interpreter=G:\SN\doudian-agent\.venv\Scripts\python.exe
+python=3.12.8
+pip_freeze_lines=68
+installer=platform (task t3, 独占安装)
+command=.venv\Scripts\python.exe -m pip install -r backend\requirements.txt; .venv\Scripts\python.exe -m pip install apscheduler==3.11.0
+note=apscheduler/tenacity 在 venv 内但本仓库代码不 import（DECISIONS 附 A：效果调度用表+60s 轮询、重试自实现）；requirements.txt 只 pin 真正被 import 的包
+---
+fastapi==0.161.1
+uvicorn==0.54.0
+httpx==0.28.1
+tenacity==9.2.1
+SQLAlchemy==2.1.6
+aiosqlite==0.22.1
+pydantic==2.14.1
+pydantic-settings==2.16.1
+PyYAML==6.0.3
+apscheduler==3.11.0
+langgraph==1.2.16
+langgraph-checkpoint==4.3.0
+langgraph-checkpoint-sqlite==3.1.2
+langgraph-checkpoint-postgres==3.2.0
+pytest==9.1.1
+pytest-asyncio==1.4.0
+respx==0.23.1
+psycopg==3.3.6

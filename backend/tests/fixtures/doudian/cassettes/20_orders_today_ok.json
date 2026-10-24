@@ -1,0 +1,67 @@
+{
+  "name": "orders_today_ok",
+  "match": {
+    "method": "order.searchList",
+    "body_contains": {}
+  },
+  "response": {
+    "status": 200,
+    "headers": {"x-tt-logid": "20261023143000ORDERLIST"},
+    "json": {
+      "err_no": 0,
+      "message": "success",
+      "data": {
+        "page": 0,
+        "size": 50,
+        "total": 3,
+        "orders": [
+          {
+            "order_id": "6900000000000000001",
+            "status": "paid",
+            "pay_amount_cents": 19900,
+            "order_amount_cents": 19900,
+            "refund_amount_cents": 0,
+            "product_id": "3400000000000000001",
+            "sku_id": "3400000000000000002",
+            "product_name": "真丝衬衫（白/160）",
+            "buyer_count": 1,
+            "create_time": "2026-10-23 09:12:00"
+          },
+          {
+            "order_id": "6900000000000000002",
+            "status": "paid",
+            "pay_amount_cents": 25900,
+            "order_amount_cents": 25900,
+            "refund_amount_cents": 0,
+            "product_id": "3400000000000000011",
+            "sku_id": "3400000000000000012",
+            "product_name": "羊毛围巾（驼色）",
+            "buyer_count": 1,
+            "create_time": "2026-10-23 11:40:00"
+          },
+          {
+            "order_id": "6900000000000000003",
+            "status": "refunded",
+            "pay_amount_cents": 9900,
+            "order_amount_cents": 9900,
+            "refund_amount_cents": 9900,
+            "product_id": "3400000000000000001",
+            "sku_id": "3400000000000000003",
+            "product_name": "真丝衬衫（黑/160）",
+            "buyer_count": 1,
+            "create_time": "2026-10-23 13:05:00"
+          }
+        ],
+        "summary": {
+          "gmv_cents": 55700,
+          "order_count": 3,
+          "paid_order_count": 3,
+          "refund_order_count": 1,
+          "refund_amount_cents": 9900,
+          "uv": 480
+        }
+      }
+    }
+  },
+  "delay_ms": 0
+}

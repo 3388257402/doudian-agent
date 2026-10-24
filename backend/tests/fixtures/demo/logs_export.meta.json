@@ -1,0 +1,23 @@
+{
+  "generated_at": "2026-10-24T11:05:31.082330+00:00",
+  "run_id": "demo-export-fixture",
+  "source_log": "G:\\SN\\doudian-agent\\data\\demo\\logs\\app.jsonl",
+  "command": "python backend/tests/fixtures/demo/export_event_log.py",
+  "demo_command": "python backend/tests/fixtures/demo/run_demo.py --run-id demo-export-fixture",
+  "clock": "2026-10-23T12:00:00Z（演示固定时钟，与离线夹具的业务日对齐）",
+  "events": 9,
+  "event_names": [
+    "node.trace"
+  ],
+  "nodes": [
+    "collect",
+    "compute_metrics",
+    "detect_anomalies",
+    "propose_actions",
+    "approval_gate",
+    "execute",
+    "record_effect",
+    "finalize"
+  ],
+  "note": "本文件由脚本导出，**不要手改**。改了事件名就重跑 export_event_log.py；一致性由 check_event_names.py 断言（每个事件名都必须在 backend/app 有生产者）。"
+}

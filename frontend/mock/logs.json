@@ -1,0 +1,647 @@
+{
+  "items": [
+    {
+      "seq": 1290,
+      "ts": "2026-10-23T14:26:03.640Z",
+      "level": "info",
+      "event": "node.trace",
+      "run_id": "run_20261023T142530Z_9f3c1a7b",
+      "trace_id": "7c1f0b9e2d4a4c1e9b3a5d7f1c2e4a6b",
+      "shop_id": "12345678",
+      "node": "effect",
+      "message": "node ok",
+      "data": {
+        "outcome": "ok",
+        "duration_ms": 11.3,
+        "input_digest": "c4d5e6f70819a2b3",
+        "output_digest": "70819a2b3c4d5e6f",
+        "error": null
+      }
+    },
+    {
+      "seq": 1289,
+      "ts": "2026-10-23T14:26:02.980Z",
+      "level": "info",
+      "event": "node.trace",
+      "run_id": "run_20261023T142530Z_9f3c1a7b",
+      "trace_id": "7c1f0b9e2d4a4c1e9b3a5d7f1c2e4a6b",
+      "shop_id": "12345678",
+      "node": "execute",
+      "message": "node ok",
+      "data": {
+        "outcome": "ok",
+        "duration_ms": 42.7,
+        "input_digest": "3f7a9c1b2d4e5f60",
+        "output_digest": "8b2c4d6e0f1a3b5c",
+        "error": null
+      }
+    },
+    {
+      "seq": 1288,
+      "ts": "2026-10-23T14:26:02.113Z",
+      "level": "info",
+      "event": "action.executed",
+      "run_id": "run_20261023T142530Z_9f3c1a7b",
+      "trace_id": "7c1f0b9e2d4a4c1e9b3a5d7f1c2e4a6b",
+      "shop_id": "12345678",
+      "node": "execute",
+      "message": "price updated",
+      "data": {
+        "action_id": "run_20261023T142530Z_9f3c1a7b:price_update:3400000000000000002",
+        "idempotency_key": "9a1b7c3d5e6f8091a2b3c4d5e6f70819a2b3c4d5e6f70819a2b3c4d5e6f70819",
+        "price_cents": 9600
+      }
+    },
+    {
+      "seq": 1287,
+      "ts": "2026-10-23T14:26:01.900Z",
+      "level": "info",
+      "event": "node.trace",
+      "run_id": "run_20261023T142530Z_9f3c1a7b",
+      "trace_id": "7c1f0b9e2d4a4c1e9b3a5d7f1c2e4a6b",
+      "shop_id": "12345678",
+      "node": "approval_gate",
+      "message": "node ok",
+      "data": {
+        "outcome": "ok",
+        "duration_ms": 6.8,
+        "input_digest": "3f7a9c1b2d4e5f60",
+        "output_digest": "9a2b3c4d5e6f7081",
+        "error": null
+      }
+    },
+    {
+      "seq": 1286,
+      "ts": "2026-10-23T14:26:01.870Z",
+      "level": "info",
+      "event": "approval.decided",
+      "run_id": "run_20261023T142530Z_9f3c1a7b",
+      "trace_id": "7c1f0b9e2d4a4c1e9b3a5d7f1c2e4a6b",
+      "shop_id": "12345678",
+      "node": "approval_gate",
+      "message": "2 条裁决已落库（1 approve / 1 edit）",
+      "data": {
+        "thread_id": "12345678:run_20261023T142530Z_9f3c1a7b",
+        "interrupt_id": "6f1e9c2a7b3d4e5f",
+        "decided": 2
+      }
+    },
+    {
+      "seq": 1285,
+      "ts": "2026-10-23T14:26:01.402Z",
+      "level": "info",
+      "event": "approval.resumed",
+      "run_id": "run_20261023T142530Z_9f3c1a7b",
+      "trace_id": "7c1f0b9e2d4a4c1e9b3a5d7f1c2e4a6b",
+      "shop_id": "12345678",
+      "node": "approval_gate",
+      "message": "resume from interrupt",
+      "data": {
+        "interrupt_id": "6f1e9c2a7b3d4e5f",
+        "operator": "ops_zhang"
+      }
+    },
+    {
+      "seq": 1284,
+      "ts": "2026-10-23T14:25:31.240Z",
+      "level": "info",
+      "event": "node.trace",
+      "run_id": "run_20261023T142530Z_9f3c1a7b",
+      "trace_id": "7c1f0b9e2d4a4c1e9b3a5d7f1c2e4a6b",
+      "shop_id": "12345678",
+      "node": "approval_gate",
+      "message": "node interrupted (awaiting human decision)",
+      "data": {
+        "outcome": "interrupted",
+        "duration_ms": 12.1,
+        "input_digest": "3f7a9c1b2d4e5f60",
+        "output_digest": null,
+        "error": null
+      }
+    },
+    {
+      "seq": 1283,
+      "ts": "2026-10-23T14:25:31.208Z",
+      "level": "info",
+      "event": "approval.requested",
+      "run_id": "run_20261023T142530Z_9f3c1a7b",
+      "trace_id": "7c1f0b9e2d4a4c1e9b3a5d7f1c2e4a6b",
+      "shop_id": "12345678",
+      "node": "approval_gate",
+      "message": "挂起等待人工审批（2 条动作）",
+      "data": {
+        "proposals": 2,
+        "notifier": "dry_run"
+      }
+    },
+    {
+      "seq": 1282,
+      "ts": "2026-10-23T14:25:31.010Z",
+      "level": "info",
+      "event": "node.trace",
+      "run_id": "run_20261023T142530Z_9f3c1a7b",
+      "trace_id": "7c1f0b9e2d4a4c1e9b3a5d7f1c2e4a6b",
+      "shop_id": "12345678",
+      "node": "propose",
+      "message": "node ok",
+      "data": {
+        "outcome": "ok",
+        "duration_ms": 30.9,
+        "input_digest": "5d6e0f1a3b5c7d9e",
+        "output_digest": "1a3b5c7d9e0f2a4c",
+        "error": null
+      }
+    },
+    {
+      "seq": 1281,
+      "ts": "2026-10-23T14:25:30.991Z",
+      "level": "warn",
+      "event": "action.risk_high",
+      "run_id": "run_20261023T142530Z_9f3c1a7b",
+      "trace_id": "7c1f0b9e2d4a4c1e9b3a5d7f1c2e4a6b",
+      "shop_id": "12345678",
+      "node": "propose",
+      "message": "coupon_create 风险档 high，需人工确认让利上限",
+      "data": {
+        "action_id": "run_20261023T142530Z_9f3c1a7b:coupon_create:3400000000000000005",
+        "max_discount_cents": 100000
+      }
+    },
+    {
+      "seq": 1280,
+      "ts": "2026-10-23T14:25:30.774Z",
+      "level": "info",
+      "event": "action.proposed",
+      "run_id": "run_20261023T142530Z_9f3c1a7b",
+      "trace_id": "7c1f0b9e2d4a4c1e9b3a5d7f1c2e4a6b",
+      "shop_id": "12345678",
+      "node": "propose",
+      "message": "proposed 2 actions",
+      "data": {
+        "action_ids": [
+          "run_20261023T142530Z_9f3c1a7b:price_update:3400000000000000002",
+          "run_20261023T142530Z_9f3c1a7b:coupon_create:3400000000000000005"
+        ]
+      }
+    },
+    {
+      "seq": 1279,
+      "ts": "2026-10-23T14:25:30.560Z",
+      "level": "info",
+      "event": "node.trace",
+      "run_id": "run_20261023T142530Z_9f3c1a7b",
+      "trace_id": "7c1f0b9e2d4a4c1e9b3a5d7f1c2e4a6b",
+      "shop_id": "12345678",
+      "node": "anomaly",
+      "message": "node ok",
+      "data": {
+        "outcome": "ok",
+        "duration_ms": 21.7,
+        "input_digest": "b3c4d5e6f70819a2",
+        "output_digest": "3c4d5e6f70819a2b",
+        "error": null
+      }
+    },
+    {
+      "seq": 1278,
+      "ts": "2026-10-23T14:25:30.512Z",
+      "level": "error",
+      "event": "anomaly.rule_skipped",
+      "run_id": "run_20261023T142530Z_9f3c1a7b",
+      "trace_id": "7c1f0b9e2d4a4c1e9b3a5d7f1c2e4a6b",
+      "shop_id": "12345678",
+      "node": "anomaly",
+      "message": "规则 refund_rate_spike 求值失败已跳过：division by zero",
+      "data": {
+        "rule_id": "refund_rate_spike",
+        "error": "ZeroDivisionError"
+      }
+    },
+    {
+      "seq": 1277,
+      "ts": "2026-10-23T14:25:30.410Z",
+      "level": "info",
+      "event": "anomaly.detected",
+      "run_id": "run_20261023T142530Z_9f3c1a7b",
+      "trace_id": "7c1f0b9e2d4a4c1e9b3a5d7f1c2e4a6b",
+      "shop_id": "12345678",
+      "node": "anomaly",
+      "message": "2 条异常（1 critical / 1 warn）",
+      "data": {
+        "anomaly_ids": [
+          "3f7a9c1b2d4e5f60",
+          "9c1b2d4e5f603f7a"
+        ]
+      }
+    },
+    {
+      "seq": 1276,
+      "ts": "2026-10-23T14:25:30.260Z",
+      "level": "info",
+      "event": "node.trace",
+      "run_id": "run_20261023T142530Z_9f3c1a7b",
+      "trace_id": "7c1f0b9e2d4a4c1e9b3a5d7f1c2e4a6b",
+      "shop_id": "12345678",
+      "node": "metrics",
+      "message": "node ok",
+      "data": {
+        "outcome": "ok",
+        "duration_ms": 58.2,
+        "input_digest": "70819a2b3c4d5e6f",
+        "output_digest": "9e0f2a4c6b8d1e3f",
+        "error": null
+      }
+    },
+    {
+      "seq": 1275,
+      "ts": "2026-10-23T14:25:30.201Z",
+      "level": "info",
+      "event": "metrics.computed",
+      "run_id": "run_20261023T142530Z_9f3c1a7b",
+      "trace_id": "7c1f0b9e2d4a4c1e9b3a5d7f1c2e4a6b",
+      "shop_id": "12345678",
+      "node": "metrics",
+      "message": "metrics computed for 2026-10-22",
+      "data": {
+        "gmv_cents": 12840000,
+        "gmv_7d_avg_cents": 18660000,
+        "refund_rate": 0.034591,
+        "cvr": 0.062109
+      }
+    },
+    {
+      "seq": 1274,
+      "ts": "2026-10-23T14:25:30.010Z",
+      "level": "info",
+      "event": "node.trace",
+      "run_id": "run_20261023T142530Z_9f3c1a7b",
+      "trace_id": "7c1f0b9e2d4a4c1e9b3a5d7f1c2e4a6b",
+      "shop_id": "12345678",
+      "node": "collect",
+      "message": "node ok",
+      "data": {
+        "outcome": "ok",
+        "duration_ms": 1320.4,
+        "input_digest": "3f7a9c1b2d4e5f60",
+        "output_digest": "6f70819a2b3c4d5e",
+        "error": null
+      }
+    },
+    {
+      "seq": 1273,
+      "ts": "2026-10-23T14:25:29.930Z",
+      "level": "debug",
+      "event": "collect.page",
+      "run_id": "run_20261023T142530Z_9f3c1a7b",
+      "trace_id": "7c1f0b9e2d4a4c1e9b3a5d7f1c2e4a6b",
+      "shop_id": "12345678",
+      "node": "collect",
+      "message": "order.searchList page=1 size=100",
+      "data": {
+        "method": "order.searchList",
+        "pages": 4,
+        "sign": "***",
+        "access_token": "***"
+      }
+    },
+    {
+      "seq": 1272,
+      "ts": "2026-10-23T14:25:28.640Z",
+      "level": "info",
+      "event": "collect.started",
+      "run_id": "run_20261023T142530Z_9f3c1a7b",
+      "trace_id": "7c1f0b9e2d4a4c1e9b3a5d7f1c2e4a6b",
+      "shop_id": "12345678",
+      "node": "collect",
+      "message": "run started (dry_run=true)",
+      "data": {
+        "trigger": "manual",
+        "dry_run": true
+      }
+    },
+    {
+      "seq": 1268,
+      "ts": "2026-10-23T09:00:13.030Z",
+      "level": "info",
+      "event": "node.trace",
+      "run_id": "run_20261023T090000Z_1a2b3c4d",
+      "trace_id": "b21e0c4d6f8a1b3c5d7e9f0a2b4c6d8e",
+      "shop_id": "12345678",
+      "node": "effect",
+      "message": "node ok",
+      "data": {
+        "outcome": "ok",
+        "duration_ms": 12.7,
+        "input_digest": "2b4c6d8e0f1a3b5c",
+        "output_digest": "6d8e0f1a3b5c7d9e",
+        "error": null
+      }
+    },
+    {
+      "seq": 1267,
+      "ts": "2026-10-23T09:00:13.010Z",
+      "level": "info",
+      "event": "effect.scheduled",
+      "run_id": "run_20261023T090000Z_1a2b3c4d",
+      "trace_id": "b21e0c4d6f8a1b3c5d7e9f0a2b4c6d8e",
+      "shop_id": "12345678",
+      "node": "effect",
+      "message": "登记 3 个效果窗口（T+1 / T+3 / T+7）",
+      "data": {
+        "offsets": [
+          1,
+          3,
+          7
+        ],
+        "attribution": "single_arm_before_after"
+      }
+    },
+    {
+      "seq": 1266,
+      "ts": "2026-10-23T09:00:12.900Z",
+      "level": "info",
+      "event": "node.trace",
+      "run_id": "run_20261023T090000Z_1a2b3c4d",
+      "trace_id": "b21e0c4d6f8a1b3c5d7e9f0a2b4c6d8e",
+      "shop_id": "12345678",
+      "node": "execute",
+      "message": "node ok",
+      "data": {
+        "outcome": "ok",
+        "duration_ms": 1780.6,
+        "input_digest": "8e0f1a3b5c7d9e2b",
+        "output_digest": "0f1a3b5c7d9e2b4c",
+        "error": null
+      }
+    },
+    {
+      "seq": 1265,
+      "ts": "2026-10-23T09:00:12.884Z",
+      "level": "info",
+      "event": "action.executed",
+      "run_id": "run_20261023T090000Z_1a2b3c4d",
+      "trace_id": "b21e0c4d6f8a1b3c5d7e9f0a2b4c6d8e",
+      "shop_id": "12345678",
+      "node": "execute",
+      "message": "stock updated to 0",
+      "data": {
+        "action_id": "run_20261023T090000Z_1a2b3c4d:stock_update:3400000000000000003",
+        "idempotency_key": "3c4d5e6f70819a2b3c4d5e6f70819a2b3c4d5e6f70819a2b3c4d5e6f70819a2b",
+        "stock": 0
+      }
+    },
+    {
+      "seq": 1264,
+      "ts": "2026-10-23T09:00:11.760Z",
+      "level": "warn",
+      "event": "action.retry",
+      "run_id": "run_20261023T090000Z_1a2b3c4d",
+      "trace_id": "b21e0c4d6f8a1b3c5d7e9f0a2b4c6d8e",
+      "shop_id": "12345678",
+      "node": "execute",
+      "message": "上游 429，按重试预算退避后重试（第 1 次）",
+      "data": {
+        "action_id": "run_20261023T090000Z_1a2b3c4d:stock_update:3400000000000000003",
+        "attempt": 1,
+        "backoff_ms": 800
+      }
+    },
+    {
+      "seq": 1263,
+      "ts": "2026-10-23T09:00:11.100Z",
+      "level": "error",
+      "event": "action.unknown",
+      "run_id": "run_20261023T090000Z_1a2b3c4d",
+      "trace_id": "b21e0c4d6f8a1b3c5d7e9f0a2b4c6d8e",
+      "shop_id": "12345678",
+      "node": "execute",
+      "message": "上游超时，结果未知 → 记 unknown 并进入对账",
+      "data": {
+        "action_id": "run_20261023T090000Z_1a2b3c4d:stock_update:3400000000000000003",
+        "category": "ambiguous"
+      }
+    },
+    {
+      "seq": 1262,
+      "ts": "2026-10-23T09:00:11.040Z",
+      "level": "info",
+      "event": "node.trace",
+      "run_id": "run_20261023T090000Z_1a2b3c4d",
+      "trace_id": "b21e0c4d6f8a1b3c5d7e9f0a2b4c6d8e",
+      "shop_id": "12345678",
+      "node": "approval_gate",
+      "message": "node ok",
+      "data": {
+        "outcome": "ok",
+        "duration_ms": 5.1,
+        "input_digest": "1a3b5c7d9e2b4c6d",
+        "output_digest": "5c7d9e2b4c6d8e0f",
+        "error": null
+      }
+    },
+    {
+      "seq": 1261,
+      "ts": "2026-10-23T09:00:11.020Z",
+      "level": "info",
+      "event": "approval.decided",
+      "run_id": "run_20261023T090000Z_1a2b3c4d",
+      "trace_id": "b21e0c4d6f8a1b3c5d7e9f0a2b4c6d8e",
+      "shop_id": "12345678",
+      "node": "approval_gate",
+      "message": "1 条裁决已落库（1 approve）",
+      "data": {
+        "thread_id": "12345678:run_20261023T090000Z_1a2b3c4d",
+        "interrupt_id": "b7c1d2e3f4a5b6c7",
+        "decided": 1
+      }
+    },
+    {
+      "seq": 1260,
+      "ts": "2026-10-23T09:00:11.000Z",
+      "level": "info",
+      "event": "approval.resumed",
+      "run_id": "run_20261023T090000Z_1a2b3c4d",
+      "trace_id": "b21e0c4d6f8a1b3c5d7e9f0a2b4c6d8e",
+      "shop_id": "12345678",
+      "node": "approval_gate",
+      "message": "resume from interrupt",
+      "data": {
+        "interrupt_id": "b7c1d2e3f4a5b6c7",
+        "operator": "ops_zhang"
+      }
+    },
+    {
+      "seq": 1259,
+      "ts": "2026-10-23T09:00:10.950Z",
+      "level": "info",
+      "event": "node.trace",
+      "run_id": "run_20261023T090000Z_1a2b3c4d",
+      "trace_id": "b21e0c4d6f8a1b3c5d7e9f0a2b4c6d8e",
+      "shop_id": "12345678",
+      "node": "approval_gate",
+      "message": "node interrupted (awaiting human decision)",
+      "data": {
+        "outcome": "interrupted",
+        "duration_ms": 8.4,
+        "input_digest": "1a3b5c7d9e2b4c6d",
+        "output_digest": null,
+        "error": null
+      }
+    },
+    {
+      "seq": 1258,
+      "ts": "2026-10-23T09:00:10.900Z",
+      "level": "info",
+      "event": "approval.requested",
+      "run_id": "run_20261023T090000Z_1a2b3c4d",
+      "trace_id": "b21e0c4d6f8a1b3c5d7e9f0a2b4c6d8e",
+      "shop_id": "12345678",
+      "node": "approval_gate",
+      "message": "挂起等待人工审批（1 条动作）",
+      "data": {
+        "proposals": 1,
+        "notifier": "dry_run"
+      }
+    },
+    {
+      "seq": 1257,
+      "ts": "2026-10-23T09:00:10.700Z",
+      "level": "info",
+      "event": "node.trace",
+      "run_id": "run_20261023T090000Z_1a2b3c4d",
+      "trace_id": "b21e0c4d6f8a1b3c5d7e9f0a2b4c6d8e",
+      "shop_id": "12345678",
+      "node": "propose",
+      "message": "node ok",
+      "data": {
+        "outcome": "ok",
+        "duration_ms": 26.5,
+        "input_digest": "5d6e0f1a3b5c7d9e",
+        "output_digest": "1a3b5c7d9e2b4c6d",
+        "error": null
+      }
+    },
+    {
+      "seq": 1256,
+      "ts": "2026-10-23T09:00:10.500Z",
+      "level": "info",
+      "event": "node.trace",
+      "run_id": "run_20261023T090000Z_1a2b3c4d",
+      "trace_id": "b21e0c4d6f8a1b3c5d7e9f0a2b4c6d8e",
+      "shop_id": "12345678",
+      "node": "anomaly",
+      "message": "node ok",
+      "data": {
+        "outcome": "ok",
+        "duration_ms": 18.2,
+        "input_digest": "b3c4d5e6f70819a2",
+        "output_digest": "5d6e0f1a3b5c7d9e",
+        "error": null
+      }
+    },
+    {
+      "seq": 1255,
+      "ts": "2026-10-23T09:00:10.310Z",
+      "level": "info",
+      "event": "node.trace",
+      "run_id": "run_20261023T090000Z_1a2b3c4d",
+      "trace_id": "b21e0c4d6f8a1b3c5d7e9f0a2b4c6d8e",
+      "shop_id": "12345678",
+      "node": "metrics",
+      "message": "node ok",
+      "data": {
+        "outcome": "ok",
+        "duration_ms": 41.9,
+        "input_digest": "70819a2b3c4d5e6f",
+        "output_digest": "b3c4d5e6f70819a2",
+        "error": null
+      }
+    },
+    {
+      "seq": 1254,
+      "ts": "2026-10-23T09:00:10.020Z",
+      "level": "info",
+      "event": "node.trace",
+      "run_id": "run_20261023T090000Z_1a2b3c4d",
+      "trace_id": "b21e0c4d6f8a1b3c5d7e9f0a2b4c6d8e",
+      "shop_id": "12345678",
+      "node": "collect",
+      "message": "node ok",
+      "data": {
+        "outcome": "ok",
+        "duration_ms": 112.4,
+        "input_digest": "3f7a9c1b2d4e5f60",
+        "output_digest": "70819a2b3c4d5e6f",
+        "error": null
+      }
+    },
+    {
+      "seq": 1253,
+      "ts": "2026-10-23T09:00:09.900Z",
+      "level": "info",
+      "event": "collect.started",
+      "run_id": "run_20261023T090000Z_1a2b3c4d",
+      "trace_id": "b21e0c4d6f8a1b3c5d7e9f0a2b4c6d8e",
+      "shop_id": "12345678",
+      "node": "collect",
+      "message": "run started (dry_run=false)",
+      "data": {
+        "trigger": "scheduled",
+        "dry_run": false
+      }
+    },
+    {
+      "seq": 1252,
+      "ts": "2026-10-23T08:00:04.240Z",
+      "level": "error",
+      "event": "run.failed",
+      "run_id": "run_20261023T080000Z_5e6f7a8b",
+      "trace_id": "e5f6a7b8c9d0e1f2a3b4c5d6e7f80912",
+      "shop_id": "12345678",
+      "node": null,
+      "message": "run 终止：collect 失败，未产生任何审批与副作用",
+      "data": {
+        "failed_node": "collect",
+        "error_type": "DoudianUpstreamError",
+        "attempts": 4
+      }
+    },
+    {
+      "seq": 1251,
+      "ts": "2026-10-23T08:00:04.200Z",
+      "level": "error",
+      "event": "node.trace",
+      "run_id": "run_20261023T080000Z_5e6f7a8b",
+      "trace_id": "e5f6a7b8c9d0e1f2a3b4c5d6e7f80912",
+      "shop_id": "12345678",
+      "node": "collect",
+      "message": "node failed",
+      "data": {
+        "outcome": "error",
+        "duration_ms": 3011.4,
+        "input_digest": "3f7a9c1b2d4e5f60",
+        "output_digest": null,
+        "error": {
+          "type": "DoudianUpstreamError",
+          "message": "upstream 503 after 4 attempts"
+        }
+      }
+    },
+    {
+      "seq": 1250,
+      "ts": "2026-10-23T08:00:01.100Z",
+      "level": "info",
+      "event": "collect.started",
+      "run_id": "run_20261023T080000Z_5e6f7a8b",
+      "trace_id": "e5f6a7b8c9d0e1f2a3b4c5d6e7f80912",
+      "shop_id": "12345678",
+      "node": "collect",
+      "message": "run started (dry_run=false)",
+      "data": {
+        "trigger": "scheduled",
+        "dry_run": false
+      }
+    }
+  ],
+  "next_cursor": null
+}

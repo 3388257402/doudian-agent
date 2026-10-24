@@ -1,0 +1,33 @@
+# ======================================================================================
+# 后端镜像（Python 3.12 + FastAPI/uvicorn）
+#
+# 构建上下文是**仓库根**（compose 里 context: .），所以要带上 `.dockerignore`：
+# 没有它，`.venv/`、`node_modules/`、`data/`（SQLite + 日志）会一起被塞进构建上下文，
+# 几百 MB 起步，而且把运行数据打进镜像层。
+#
+#   docker build -f Dockerfile.backend -t doudian-agent-backend .
+# ======================================================================================
+FROM python:3.12-slim
+
+# - 不写 .pyc、日志立刻出、pip 不留缓存层
+ENV PYTHONDONTWRITEBYTECODE=1 \
+    PYTHONUNBUFFERED=1 \
+    PIP_NO_CACHE_DIR=1 \
+    PIP_DISABLE_PIP_VERSION_CHECK=1
+
+WORKDIR /app
+
+# 依赖单独一层：改代码不会让 pip 重装（先拷贝清单，再装，再拷源码）
+COPY backend/requirements.txt ./requirements.txt
+RUN pip install -r requirements.txt
+
+# 应用代码 + 配置（config/ 里只有变量名，没有密钥：密钥走环境变量）
+COPY backend/ ./
+
+# 数据目录：开发是 SQLite（doudian.db / checkpoint.db）+ JSONL 日志，生产可换成 Postgres
+RUN mkdir -p /app/data/logs
+
+EXPOSE 8000
+
+# 启动期配置错误会让进程非 0 退出（见 app/main.py 的 lifespan）：容器化下更容易被发现
+CMD ["python", "-m", "uvicorn", "app.main:app", "--host", "0.0.0.0", "--port", "8000"]

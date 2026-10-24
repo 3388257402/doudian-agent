@@ -1,0 +1,22 @@
+{
+  "name": "shop_info_ok",
+  "match": {
+    "method": "shop.getShopInfo",
+    "body_contains": {}
+  },
+  "response": {
+    "status": 200,
+    "headers": {"x-tt-logid": "20261023143000SHOPINFO"},
+    "json": {
+      "err_no": 0,
+      "message": "success",
+      "data": {
+        "shop_id": "12345678",
+        "shop_name": "示例旗舰店",
+        "status": "open",
+        "open_time": "2023-03-01 10:00:00"
+      }
+    }
+  },
+  "delay_ms": 0
+}

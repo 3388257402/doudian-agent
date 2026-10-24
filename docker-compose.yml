@@ -1,0 +1,92 @@
+# ======================================================================================
+# 一条命令起前后端：`docker compose up --build`
+#
+#   前端 http://localhost:5173   （nginx：静态资源 + /api 反代到后端）
+#   后端 http://localhost:8000/docs
+#
+# **开发默认 SQLite**：数据在命名卷 `doudian-data` 里（容器内 /app/data）。
+# **生产切 Postgres 只改 DATABASE_URL**（ADR-012：代码里没有任何方言分支，除了 SQLite 的
+# WAL PRAGMA 与连接参数）：
+#
+#   DATABASE_URL=postgresql+psycopg://doudian:doudian@postgres:5432/doudian
+#   CHECKPOINT_TYPE=postgres
+#   CHECKPOINT_URL=postgresql://doudian:doudian@postgres:5432/doudian
+#
+# 需要 Postgres 时把下面注释掉的 `postgres` 服务打开（`--profile postgres` 也行），
+# 上面三个变量填好即可，不用改代码、不用改镜像。
+#
+# 凭据从 `.env` 读（`docker compose` 会自动读同目录的 `.env` 做变量替换；
+# 没有 `.env` 时下面全部走 `${VAR:-默认值}`，所以 compose 不会因为缺文件而报错）。
+# ======================================================================================
+
+services:
+  backend:
+    build:
+      context: .
+      dockerfile: Dockerfile.backend
+    image: doudian-agent-backend:dev
+    environment:
+      # --- 数据库（dev 默认 SQLite，落在卷里）---
+      DATABASE_URL: ${DATABASE_URL:-sqlite+pysqlite:///./data/doudian.db}
+      CHECKPOINT_TYPE: ${CHECKPOINT_TYPE:-sqlite}
+      CHECKPOINT_PATH: ${CHECKPOINT_PATH:-data/checkpoint.db}
+      CHECKPOINT_URL: ${CHECKPOINT_URL:-}
+      LOG_LEVEL: ${LOG_LEVEL:-INFO}
+      # --- 抖店凭据（默认空 → dry_run 走离线夹具，零凭据可跑）---
+      DOUDIAN_APP_KEY: ${DOUDIAN_APP_KEY:-}
+      DOUDIAN_APP_SECRET: ${DOUDIAN_APP_SECRET:-}
+      DOUDIAN_ACCESS_TOKEN: ${DOUDIAN_ACCESS_TOKEN:-}
+      # --- 通知（默认 dry_run：只写日志，不发请求）---
+      FEISHU_WEBHOOK_URL: ${FEISHU_WEBHOOK_URL:-}
+    volumes:
+      # SQLite / checkpoint / JSONL 日志。用命名卷而不是 ./data：
+      # 不往宿主机工作区写运行数据，也就不会有人手滑把库文件提交上去。
+      - doudian-data:/app/data
+    ports:
+      - "8000:8000"
+    healthcheck:
+      # /api/healthz 会真的探 db + checkpointer，比"进程还活着"更有信息量
+      test:
+        - "CMD-SHELL"
+        - "python -c \"import urllib.request,sys; sys.exit(0 if urllib.request.urlopen('http://127.0.0.1:8000/api/healthz').status==200 else 1)\""
+      interval: 15s
+      timeout: 5s
+      retries: 5
+      start_period: 20s
+    restart: unless-stopped
+
+  frontend:
+    build:
+      context: .
+      dockerfile: Dockerfile.frontend
+      args:
+        # 构建期变量：live = 打 /api/*（由 nginx 反代给 backend 容器）
+        VITE_API_MODE: ${VITE_API_MODE:-live}
+        VITE_SHOP_ID: ${VITE_SHOP_ID:-12345678}
+    image: doudian-agent-frontend:dev
+    ports:
+      - "5173:80"
+    depends_on:
+      backend:
+        condition: service_healthy
+    restart: unless-stopped
+
+  # --- 生产路径（可选）：把上面的 DATABASE_URL / CHECKPOINT_* 指过来即可 ---------------
+  # postgres:
+  #   image: postgres:16-alpine
+  #   environment:
+  #     POSTGRES_USER: doudian
+  #     POSTGRES_PASSWORD: doudian
+  #     POSTGRES_DB: doudian
+  #   volumes:
+  #     - doudian-pg:/var/lib/postgresql/data
+  #   healthcheck:
+  #     test: ["CMD-SHELL", "pg_isready -U doudian -d doudian"]
+  #     interval: 10s
+  #     retries: 5
+  #   ports:
+  #     - "5432:5432"
+
+volumes:
+  doudian-data:
+  # doudian-pg:

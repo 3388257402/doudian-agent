@@ -1,0 +1,17 @@
+{
+  "name": "edit_price_ok",
+  "match": {
+    "method": "product.editPrice",
+    "body_contains": {}
+  },
+  "response": {
+    "status": 200,
+    "headers": {"x-tt-logid": "20261023143000EDITPRICE"},
+    "json": {
+      "err_no": 0,
+      "message": "success",
+      "data": {"product_id": "3400000000000000001", "sku_id": "3400000000000000002"}
+    }
+  },
+  "delay_ms": 0
+}

@@ -1,0 +1,6 @@
+# 构建产物与自检快照不入库（frontend 自己的忽略规则；根 .gitignore 由 devops 维护）
+node_modules/
+dist/
+.verify/
+.vite/
+*.local
