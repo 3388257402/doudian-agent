@@ -327,8 +327,10 @@ check("§7.6.1 不变量：同一 run 的 node.trace 条数 == 派生出的步�
   for (const [runId, count] of perRun) {
     assert(count > 0, `run ${runId} 步数为 0`);
   }
-  // 14:25 那个 run：collect/metrics/anomaly/propose/approval_gate(interrupted)/approval_gate(恢复)/execute/effect
-  assertEqual(perRun.get("run_20261023T142530Z_9f3c1a7b"), 8, "run B 的步数（含 interrupt 与恢复各一次）");
+  // 14:25 那个 run（从真实 demo 导出）：8 个节点各一次 + `approval_gate` 的恢复重放 = 9 条。
+  // 数字跟着 fixture 走：mock/logs.json 由 backend 的 export_event_log.py --mock-out 重新生成，
+  // 想改这里先重导 fixture（不要在 JSON 里手写一条假的）。
+  assertEqual(perRun.get("run_20261023T142530Z_9f3c1a7b"), 9, "run B 的步数（8 个节点 + 审批恢复重放）");
 });
 
 // ————————————————————————— §7.5 派生指标 —————————————————————————
@@ -735,9 +737,11 @@ check("§7.6.1 不变量：派生 run 摘要的步数 = 该 run 的 node.trace �
   const b = byRun.get("run_20261023T142530Z_9f3c1a7b");
   assert(b !== undefined, "缺少 run B 的摘要");
   if (!b) return;
-  assertEqual(b.steps, 8, "run B 步数");
-  assertEqual([b.ok, b.interrupted, b.error], [7, 1, 0], "run B 三态计数（approval_gate 挂起一条）");
+  assertEqual(b.steps, 9, "run B 步数（8 个节点 + 审批恢复重放）");
+  assertEqual([b.ok, b.interrupted, b.error], [8, 1, 0], "run B 三态计数（approval_gate 挂起一条）");
   const failed = byRun.get("run_20261023T080000Z_5e6f7a8b");
+  // 失败 run 来自真实 demo 的 `collect-failure` 场景：collect 的 node.trace 是 error，
+  // finalize 照常 ok（它把 run 收口成 failed），所以 error 计数恰好是 1。
   assertEqual(failed?.error, 1, "失败 run 的 error 计数");
   assertEqual(summaries[0]?.runId, "run_20261023T080000Z_5e6f7a8b", "出问题的 run 排最前");
 });

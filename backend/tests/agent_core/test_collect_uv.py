@@ -96,7 +96,7 @@ async def test_malformed_uv_fails_the_run_instead_of_silently_dropping(
     静默降级成 `None` 会把"上游改了数据结构"伪装成"这家店没有访客数据"——那是一个永远
     不会被告警发现、却能让所有 uv/cvr 规则静默失效的状态，比一次响亮的失败糟得多。
 
-    v1.5.3 改了**失败方式**：旧实现抛裸 `ValueError`，从 `collect` 逃到图再 re-raise，
+    v1.5.1 改了**失败方式**：旧实现抛裸 `ValueError`，从 `collect` 逃到图再 re-raise，
     `POST /api/agent/run` **500**——这与 F1b 已经确立的"整批形状错 → failed、不 500"自相
     矛盾（同一类事故两种形态）。现在抛 `_BatchContractError`，走同一条路径：
     错误照样进 `errors` 与 `status`，只是不再把一次上游改字段升级成一个栈。

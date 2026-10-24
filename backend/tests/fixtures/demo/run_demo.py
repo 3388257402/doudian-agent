@@ -17,8 +17,19 @@
 
     .venv\\Scripts\\python.exe backend\\tests\\fixtures\\demo\\run_demo.py
     .venv\\Scripts\\python.exe backend\\tests\\fixtures\\demo\\run_demo.py --verdict reject
+    .venv\\Scripts\\python.exe backend\\tests\\fixtures\\demo\\run_demo.py --scenario pending
+    .venv\\Scripts\\python.exe backend\\tests\\fixtures\\demo\\run_demo.py --scenario collect-failure
 
-退出码：0 = 全链路跑通；2 = 链路在预期之外停住（贴在输出里的位置就是断点）。
+`--scenario` 只影响"这次演示跑到哪、以及上游给什么"，走的仍然是实现层的同一条链路
+（`POST /api/agent/run` → 图 → `finalize`）：
+
+- `full`（默认）：采集 → 指标 → 检测 → 审批（interrupt/resume）→ 执行 → 效果窗口；
+- `pending`：只跑到审批挂起就停（"等人工裁决"这一态的真实事件流）；
+- `collect-failure`：把订单接口的响应换成"上游把 `data` 结构改坏了"，于是 `collect` 按
+  **整批契约坏**硬失败（`status=failed`，不 500），产生一条真实的 `collect.failed` 红行。
+  它存在的理由：失败态的事件流过去在演示数据里是手写的，改一次事件名就漂一次。
+
+退出码：0 = 本次场景跑通；2 = 链路在预期之外停住（贴在输出里的位置就是断点）。
 """
 
 from __future__ import annotations
@@ -47,6 +58,7 @@ from sqlalchemy import select  # noqa: E402
 from app.agent import adapters  # noqa: E402
 from app.config import load_settings  # noqa: E402
 from app.db import session_scope  # noqa: E402
+from app.enums import RunStatus  # noqa: E402
 from app.main import create_app  # noqa: E402
 from app.models import EffectSnapshot  # noqa: E402
 from app.services.effects import run_effect_evaluator_once  # noqa: E402
@@ -122,7 +134,37 @@ def _demo_settings(*, keep_data: bool = False) -> Any:
     )
 
 
-async def _run(*, verdict: str, run_id: str | None = None, keep_data: bool = False) -> int:
+def _break_order_response(client: Any) -> None:
+    """把 `search_orders` 换成"上游把 `data` 结构改坏了"的响应（其余方法原样转发）。
+
+    为什么用实例属性覆盖而不是新写一个 client：`collect` 走的是**同一条**真实路径
+    （`_aggregate_orders` → `_require_orders_container` → `_BatchContractError` →
+    `status=failed` → `finalize`），这里只替换"外部世界给回来的那份 JSON"，与离线 cassette
+    回放的定位一致。换成 mock 掉节点/图，演示出来的 `collect.failed` 就不是真事件了。
+
+    返回的 `DoudianResponse` 用真实数据类而不是 `SimpleNamespace`：`_note_call` 会读
+    `request_id` / `ok`，任何一个字段缺失都会把"结构坏"演示成"属性错"。
+    """
+    from app.services.doudian_client import DoudianResponse
+
+    async def _malformed(**_kwargs: Any) -> DoudianResponse:
+        return DoudianResponse(
+            ok=True,
+            err_no=0,
+            message="ok",
+            data={"oops": 1},
+            http_status=200,
+            request_id="demo-req-malformed-batch",
+            raw={"data": {"oops": 1}},
+            attempts=1,
+        )
+
+    client.search_orders = _malformed  # type: ignore[method-assign]
+
+
+async def _run(
+    *, verdict: str, run_id: str | None = None, keep_data: bool = False, scenario: str = "full"
+) -> int:
     settings = _demo_settings(keep_data=keep_data)
     if settings.is_prod or not settings.doudian.dry_run:
         return _fail(
@@ -168,6 +210,10 @@ async def _run(*, verdict: str, run_id: str | None = None, keep_data: bool = Fal
         ) as http:
             # --- 1) 触发 run --------------------------------------------------------
             _step(1, total, "触发 run：POST /api/agent/run（采集 → 指标 → 检测 → 待审批）")
+            if scenario == "collect-failure":
+                # 只替换"上游给回来的那份 JSON"：结构坏了 → 整批契约错 → failed（不是 500）。
+                _break_order_response(wired.client)
+                print("  场景 collect-failure：订单接口的 data 被换成 {\"oops\": 1}（模拟上游改结构）")
             response = await http.post(
                 "/api/agent/run",
                 json={"shop_id": DEMO_SHOP_ID, "run_id": run_id, "trigger": "manual"},
@@ -179,6 +225,19 @@ async def _run(*, verdict: str, run_id: str | None = None, keep_data: bool = Fal
             status_1 = body["status"]
             print(f"  HTTP {response.status_code} status={status_1} trace_id={body['trace_id']}")
             _kv("thread_id", body["thread_id"])
+            if scenario == "collect-failure":
+                # 判据：整批失败是"202 + status=failed"（契约 §7.2：不可重试的业务/结构错误
+                # 不许报 502，也不许 500），并且**没有**待审批动作。
+                if status_1 != RunStatus.FAILED.value or pending:
+                    return _fail(
+                        f"预期整批失败（status=failed 且无待办），实际 status={status_1} "
+                        f"pending={len(pending)}"
+                    )
+                print("  → collect 判定整批不可用：本轮 status=failed，无审批、无副作用。")
+                print("    事件流里应有一条 level=error 的 collect.failed（reason=batch_contract）。")
+                print()
+                print("场景跑通：整批契约坏 → collect.failed 红行 + node.trace(outcome=error)。")
+                return 0
             if status_1 != "awaiting_approval" or not pending:
                 return _fail(
                     f"预期停在 awaiting_approval 且有 1 条待办，实际 status={status_1} "
@@ -186,6 +245,11 @@ async def _run(*, verdict: str, run_id: str | None = None, keep_data: bool = Fal
                     "（多半是 config/rules.yaml 被改过：demo 依赖 refund_spike 规则）"
                 )
             print("  → 图停在 approval_gate：涉及资金/库存的动作必须人工裁决，不自动放行。")
+            if scenario == "pending":
+                # 刻意不裁决：这一档演示的是"等人工裁决"的真实事件流（挂起后没有人恢复）。
+                print()
+                print("场景跑通：run 停在 awaiting_approval（不做裁决，线程保持挂起）。")
+                return 0
 
             # --- 2) 审批台 ----------------------------------------------------------
             _step(2, total, "读审批台：GET /api/alerts（数据源是 approval_request 表，不是内存）")
@@ -356,8 +420,24 @@ def main(argv: list[str] | None = None) -> int:
         action="store_true",
         help="保留 data/demo 里上次运行的库与日志（默认每次清空，保证演示可复现）",
     )
+    parser.add_argument(
+        "--scenario",
+        choices=("full", "pending", "collect-failure"),
+        default="full",
+        help=(
+            "演示到哪：full=全链路（默认）；pending=只到审批挂起就停；"
+            "collect-failure=订单响应结构坏 → 整批契约失败（collect.failed）"
+        ),
+    )
     args = parser.parse_args(argv)
-    return asyncio.run(_run(verdict=args.verdict, run_id=args.run_id, keep_data=args.keep_data))
+    return asyncio.run(
+        _run(
+            verdict=args.verdict,
+            run_id=args.run_id,
+            keep_data=args.keep_data,
+            scenario=args.scenario,
+        )
+    )
 
 
 if __name__ == "__main__":

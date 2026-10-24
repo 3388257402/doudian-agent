@@ -56,8 +56,11 @@ EXPECTED_NODES: tuple[str, ...] = (
 #:
 #: 1. `node.trace`（8 个节点各一条，+ 审批重放一条）——节点级事实源；
 #: 2. 审计出口事件（v1.5.1 起）：`metrics.computed` / `anomaly.detected` / `sku_costs.unmatched` /
-#:    `collect.units_degraded` / `collect.zero_revenue_paid`。它们过去**只**进 `state.audit`
-#:    （checkpoint），于是 `loss_making` 这类只告警不给动作的规则在日志页上完全不存在。
+#:    `collect.units_degraded` / `collect.zero_revenue_paid` / `collect.row_rejected`，以及采集的两个
+#:    **结果**事件 `collect.done`（info）/ `collect.failed`（error，`data.reason` 区分
+#:    `batch_contract` 与 `all_rows_rejected`）。它们过去**只**进 `state.audit`（checkpoint），
+#:    于是 `loss_making` 这类只告警不给动作的规则在日志页上完全不存在，整批失败的采集也和
+#:    "上游 503"长得一模一样。
 #:
 #: "链路走完"的判据仍然是**8 个节点的 node.trace 都在**：审计事件是"事实的可见性"，
 #: 不是"节点跑了"的判据（采集失败时 `collect.done` 就不会出现，而 `collect` 的 node.trace 仍在）。
@@ -66,6 +69,21 @@ EXPECTED_NODES: tuple[str, ...] = (
 REPO_ROOT = HERE.parents[3]
 DEMO_SCRIPT = HERE / "run_demo.py"
 SOURCE_LOG = REPO_ROOT / "data" / "demo" / "logs" / "app.jsonl"
+
+#: `frontend/mock/logs.json` 的来源：**三次真实 demo 运行**，不是手写。
+#:
+#: 三个场景必须都留着，因为前端 fixtures 的职责就是"三种 run 长什么样"：
+#: 成功（含一次挂起与恢复）/ 挂起后无人裁决 / 整批契约坏（`collect.failed`）。
+#: `run_id` 写死而不是每次生成：前端断言（verify-suite / dom-check）要引用具体那个 run
+#: 的步数；写死之后"重导一次"不会让断言跟着漂。
+MOCK_RUNS: tuple[tuple[str, str, bool], ...] = (
+    ("run_20261023T142530Z_9f3c1a7b", "full", False),
+    ("run_20261023T090000Z_1a2b3c4d", "pending", True),
+    ("run_20261023T080000Z_5e6f7a8b", "collect-failure", True),
+)
+
+#: `--mock-out` 的默认落点（仓库内相对路径：导出即覆盖前端 fixtures）
+DEFAULT_MOCK_OUT = REPO_ROOT / "frontend" / "mock" / "logs.json"
 
 
 def _read_source_log() -> list[dict[str, Any]]:
@@ -92,7 +110,21 @@ def main(argv: list[str] | None = None) -> int:
         default=None,
         help="复用某个已存在的 run_id（默认新生成 demo-export-<时间戳>）",
     )
+    parser.add_argument(
+        "--mock-out",
+        type=Path,
+        nargs="?",
+        const=DEFAULT_MOCK_OUT,
+        default=None,
+        help=(
+            "重新生成前端 fixtures（默认 frontend/mock/logs.json）：按 MOCK_RUNS 跑三次真实"
+            " demo（成功 / 挂起 / 整批失败），不手写任何一行"
+        ),
+    )
     args = parser.parse_args(argv)
+
+    if args.mock_out is not None:
+        return _export_mock(args.mock_out)
 
     run_id = args.run_id or f"demo-export-{datetime.now(UTC).strftime('%Y%m%d-%H%M%S')}"
     command = [sys.executable, str(DEMO_SCRIPT), "--run-id", run_id]
@@ -178,6 +210,114 @@ def main(argv: list[str] | None = None) -> int:
     print(f"   python backend/tests/fixtures/demo/check_event_names.py {args.out.as_posix()}")
     # 自检一次，让"导出即通过"成为命令的结论而不是人的判断
     return main_check(args.out)
+
+
+def _node_names_by_run(rows: list[dict[str, Any]]) -> dict[str, list[str]]:
+    """每个 run 的 `node.trace` 节点名（按 seq 升序，含重复的审批重放）。"""
+    ordered = sorted(rows, key=lambda row: int(row.get("seq") or 0))
+    grouped: dict[str, list[str]] = {}
+    for row in ordered:
+        if row.get("event") != "node.trace":
+            continue
+        run_id = str(row.get("run_id") or "")
+        grouped.setdefault(run_id, []).append(str(row.get("node") or ""))
+    return grouped
+
+
+def _export_mock(out: Path) -> int:
+    """按 `MOCK_RUNS` 跑三次真实 demo，产出 `frontend/mock/logs.json`（§7.6 的响应形状）。
+
+    为什么不用 `logs_export.jsonl` 抄一份：前端那一份的职责是"三种 run 长什么样"——成功、
+    挂起后无人裁决、整批契约坏；单跑一次 demo 只有第一种。所以这里按场景跑三次，再把
+    **只属于这三个 run_id** 的行合并（启动期的 `app.started` 之类不是"某个 run 的事件"，
+    `run_id` 为 null，天然被筛掉）。
+
+    为什么从第二个场景起用 `--keep-data`：第一个场景必须先清掉上次的 `data/demo`
+    （动作幂等键不含 run_id，留着旧库会让这次执行变成 `skipped_duplicate`，演示就残了）；
+    后两个必须保留——它们要往同一个 `app.jsonl` 里**追加**，否则只剩最后一次的日志。
+    """
+    run_ids = {run_id for run_id, _, _ in MOCK_RUNS}
+    for index, (run_id, scenario, keep) in enumerate(MOCK_RUNS, start=1):
+        command = [
+            sys.executable,
+            str(DEMO_SCRIPT),
+            "--run-id",
+            run_id,
+            "--scenario",
+            scenario,
+        ]
+        if keep:
+            command.append("--keep-data")
+        print(f"1.{index}) 跑一次真实链路（场景 {scenario}）：{subprocess.list2cmdline(command)}")
+        completed = subprocess.run(command, cwd=str(REPO_ROOT))
+        if completed.returncode != 0:
+            print(
+                f"!! demo 场景 {scenario} 失败（退出码 {completed.returncode}），不导出",
+                file=sys.stderr,
+            )
+            return 5
+
+    print(f"2) 读源日志并筛出这三个 run：{SOURCE_LOG}")
+    rows = [row for row in _read_source_log() if str(row.get("run_id") or "") in run_ids]
+    if not rows:
+        print(f"!! 源日志里没有这些 run 的记录：{sorted(run_ids)}", file=sys.stderr)
+        return 4
+
+    producers = producer_names()
+    kept = [row for row in rows if str(row.get("event") or "") in producers]
+    dropped = sorted({str(row.get("event")) for row in rows} - producers)
+    print(f"3) 事件筛选：三个 run 共 {len(rows)} 条 → 保留 {len(kept)} 条")
+    if dropped:
+        print(f"   丢掉非本仓库事件（第三方 logger 记录）：{', '.join(dropped)}")
+
+    # --- 出口闸门 1：凭据形状（与 JSONL 导出同一道闸门）--------------------------------
+    flat = "\n".join(json.dumps(row, ensure_ascii=False) for row in kept)
+    leaks = scan_credentials(flat)
+    if leaks:
+        print(
+            f"!! 拒绝写盘：保留的事件里命中凭据形状 {leaks}。\n"
+            "   这是脱敏缺陷，不是演示数据的问题——先把 redact 修好，再重跑本脚本。",
+            file=sys.stderr,
+        )
+        return 3
+
+    # --- 出口闸门 2：三个场景必须各自留下真实的事件流 -----------------------------------
+    by_run = _node_names_by_run(kept)
+    absent = [run_id for run_id in sorted(run_ids) if not by_run.get(run_id)]
+    if absent:
+        print(f"!! 这些 run 没有任何 node.trace：{absent}（场景没跑到图上）", file=sys.stderr)
+        return 4
+    success_run = MOCK_RUNS[0][0]
+    missing_nodes = [name for name in EXPECTED_NODES if name not in by_run[success_run]]
+    if missing_nodes:
+        print(f"!! 成功场景的链路不完整：缺少这些节点的 node.trace：{missing_nodes}", file=sys.stderr)
+        return 4
+    failure_run = MOCK_RUNS[-1][0]
+    failure_rows = [
+        row for row in kept if row.get("run_id") == failure_run and row.get("event") == "collect.failed"
+    ]
+    if not failure_rows or failure_rows[0].get("level") != "error":
+        print(
+            f"!! 失败场景里没有 level=error 的 collect.failed（实际 {failure_rows}）："
+            "前端 fixture 的 error 态就失去依据了",
+            file=sys.stderr,
+        )
+        return 4
+
+    # --- 落盘：`/api/logs` 的响应形状（items 按 seq DESC，next_cursor 为 null） ---------
+    ordered = sorted(kept, key=lambda row: int(row.get("seq") or 0))
+    out.parent.mkdir(parents=True, exist_ok=True)
+    payload = {"items": list(reversed(ordered)), "next_cursor": None}
+    out.write_text(json.dumps(payload, ensure_ascii=False, indent=2) + "\n", encoding="utf-8")
+
+    print(f"4) 写盘：{out}（{len(ordered)} 行，{len(run_ids)} 个 run）")
+    for run_id, scenario, _keep in MOCK_RUNS:
+        print(f"   {run_id} [{scenario}] node.trace={len(by_run[run_id])}")
+    print(f"   事件名：{', '.join(sorted({str(row.get('event')) for row in ordered}))}")
+    print()
+    print("下一步（一致性断言，漂了就红）：")
+    print(f"   python backend/tests/fixtures/demo/check_event_names.py {out.as_posix()}")
+    return main_check(out)
 
 
 def main_check(path: Path) -> int:

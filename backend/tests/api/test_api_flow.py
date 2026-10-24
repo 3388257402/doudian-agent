@@ -321,7 +321,7 @@ async def test_logs_show_interrupted_node_trace_and_desc_paging(api: ApiHarness)
     assert warning_level.status_code == 200
     warn_items = warning_level.json()["items"]
     # warn 档：异常明细（gmv_drop_day 是 warn）+ 采集层降级（上游没给件数，成本会偏乐观）。
-    # 按 `data.kind` 取明细（v1.5.2）：同一个 event 名下有两种 schema，不能靠"有没有 rule_id"猜。
+    # 按 `data.kind` 取明细（v1.5.1）：同一个 event 名下有两种 schema，不能靠"有没有 rule_id"猜。
     assert "gmv_drop_day" in [
         item["data"]["rule_id"] for item in warn_items if item["data"].get("kind") == "detail"
     ]

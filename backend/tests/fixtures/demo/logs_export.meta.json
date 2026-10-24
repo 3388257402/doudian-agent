@@ -1,12 +1,16 @@
 {
-  "generated_at": "2026-10-24T11:05:31.082330+00:00",
-  "run_id": "demo-export-fixture",
+  "generated_at": "2026-10-24T21:07:01.389474+00:00",
+  "run_id": "demo-export-20261024-210654",
   "source_log": "G:\\SN\\doudian-agent\\data\\demo\\logs\\app.jsonl",
   "command": "python backend/tests/fixtures/demo/export_event_log.py",
-  "demo_command": "python backend/tests/fixtures/demo/run_demo.py --run-id demo-export-fixture",
+  "demo_command": "python backend/tests/fixtures/demo/run_demo.py --run-id demo-export-20261024-210654",
   "clock": "2026-10-23T12:00:00Z（演示固定时钟，与离线夹具的业务日对齐）",
-  "events": 9,
+  "events": 15,
   "event_names": [
+    "anomaly.detected",
+    "collect.done",
+    "collect.units_degraded",
+    "metrics.computed",
     "node.trace"
   ],
   "nodes": [

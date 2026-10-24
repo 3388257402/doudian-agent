@@ -27,14 +27,17 @@
 `loss_making` 是最贵的一例——它只告警、不给 `approval_request`（审批台看不见），落在
 `state.audit` 里（日志页看不见），一次"这批货在亏本卖"的判定就这样消失了。
 
-因此 `metrics.computed` / `anomaly.detected` / `sku_costs.unmatched`（以及采集层的降级留痕）
-**同时**写两处：`state.audit`（原样，不动）+ JSONL 汇（走 `app.observability.logging` 的 sink
-与统一脱敏）。这不是往 `node.trace` 里加键——`data` 的键集合（§7.6.1）一个字都没改，是**新事件**。
+因此 `metrics.computed` / `anomaly.detected` / `sku_costs.unmatched`（以及采集层的降级留痕与
+`collect.done` / `collect.failed` 两个结果事件）**同时**写两处：`state.audit`（原样，不动）+
+JSONL 汇（走 `app.observability.logging` 的 sink 与统一脱敏）。这不是往 `node.trace` 里加键
+——`data` 的键集合（§7.6.1）一个字都没改，是**新事件**。
 
-只桥接这三个（外加采集降级）而不是全部 audit 事件：其余事件（`action.proposed` /
-`approval.decided` / `action.executed` / `effect.registered` / `run.finished`）本来就各有
-**表级出口**（`approval_request` / `action_log` / `effect_snapshot` / `agent_traces`），
-再抄一份进 JSONL 只会让日志翻倍而不增加任何可查性。判据是"有没有别的出口"，不是"是不是审计"。
+只桥接上面这几个事件（含采集降级与 `collect.done` / `collect.failed`）而不是全部 audit 事件：
+其余事件（`action.proposed` / `approval.decided` / `action.executed` / `effect.registered` /
+`run.finished`）本来就各有**表级出口**（`approval_request` / `action_log` / `effect_snapshot` /
+`agent_traces`），再抄一份进 JSONL 只会让日志翻倍而不增加任何可查性。判据是"有没有别的出口"，
+不是"是不是审计"。采集的两个**结果**事件属于例外里必须补的那一类：它们**没有任何表级出口**，
+而"这一轮采集到底成功了没有、为什么失败"恰恰是日志页最该回答的问题。
 
 ## 副作用与状态
 
@@ -197,7 +200,7 @@ def _log_audit(
     重放与重复：节点被重试/重放时这会多写一条（与 `node.trace` 的行为一致——一次真实执行
     一条）。审计去重靠 `state.audit` 的 `event_id`，日志是事件流，不做去重。
 
-    ## 写盘失败：旁路失败不许改变业务结论（v1.5.2）
+    ## 写盘失败：旁路失败不许改变业务结论（v1.5.1）
 
     JSONL 是**旁路**：它的人类可读副本 + `/api/logs` 的查询入口。磁盘满 / 句柄失效（`OSError`）
     时若让异常逃出本函数，它会从节点一路逃到 `POST /api/agent/run` → **整轮 500**；而
@@ -248,7 +251,7 @@ def _degradation_summary(kind: str, items: Sequence[Mapping[str, Any]]) -> dict[
     为什么只留前 5 条：一次上游改字段可能让几百条订单行同时降级，整块塞进审计/日志会让
     "哪几种写法出现了"这个真正的问题被淹掉；而前 5 条已经足够看出形态（`missing` / `non_positive`）。
 
-    为什么必须显式给出 `sample_limit` / `samples_truncated`（v1.5.3）：`count` 是**全量**，
+    为什么必须显式给出 `sample_limit` / `samples_truncated`（v1.5.1）：`count` 是**全量**，
     `samples` 只有前 5 条。只写 `samples` 会让读者以为"一共就这几条"，把"400 行被拒"读成
     "1 行被拒"——恰好是这类审计最需要说清的规模。`samples_truncated` 明确"还有更多没贴"。
     """
@@ -277,7 +280,7 @@ def _shift_business_date(day: str, offset_days: int) -> str:
 
 
 class _BadBusinessDate(ValueError):
-    """**行级**业务日期解析不出来（`strict` 模式专用，v1.5.3）。
+    """**行级**业务日期解析不出来（`strict` 模式专用，v1.5.1）。
 
     `_business_date_of` 的非 strict 行为是"解析不出来就回退 `fallback`"，那是给窗口下界、
     `summary` 作用域这类**非行级**调用点用的（它们回退到今天是有界、可解释的）。订单行不行：
@@ -296,7 +299,7 @@ def _business_date_of(value: Any, *, fallback: str, strict: bool = False) -> str
     无时区的时间戳按 **Asia/Shanghai** 解释：抖店开放平台的 `create_time` 字段就是北京时间，
     把它当 UTC 会让"昨晚 23:30 的单"落到错误的一天，指标与规则一起错。
 
-    ## `strict` 只给**行级**路径用（v1.5.3）
+    ## `strict` 只给**行级**路径用（v1.5.1）
 
     `strict=False`（默认，既有行为**一字不改**）：解析不出来 / 类型不认识 → 返回 `fallback`。
     `strict=True`：除了 `None`（"没给日期"，不是"给了垃圾"）仍然回退 `fallback` 之外，
@@ -415,11 +418,11 @@ def _order_units(
       是有界、可解释的降级；
     - **不能降级成"1 件"**：类型不对（float / 字符串 / bool）→ 仍然 `ValueError`。那是
       "上游改了字段类型"，静默取 1 会把"每单都只买一件"永久藏起来。
-    - 但**不是**"继续打死整轮"（v1.5.2）：这个 `ValueError` 由 :func:`_read_order_row` 接住，
+    - 但**不是**"继续打死整轮"（v1.5.1）：这个 `ValueError` 由 :func:`_read_order_row` 接住，
       该行**整行拒绝**、记一条 `collect.row_rejected` 审计，其他行照常算——这是"逐行拒绝"
       与"按 1 件降级"两种降级的分界线：**能猜出含义的按 1 件；猜不出含义的整行不参与指标。**
 
-    ## 样本 schema（v1.5.2：`missing` 与 `non_positive` 统一，且都带 `order_id`）
+    ## 样本 schema（v1.5.1：`missing` 与 `non_positive` 统一，且都带 `order_id`）
 
     只给页内下标 `order[3]` 的话，跨 run / 重试就没法定位到底是哪一单（下标会变）；
     所以样本统一是 `{order_id, where, keys, key, value, reason}` 六个键：`missing` 的
@@ -465,7 +468,7 @@ def _order_units(
 def _as_list_raw(payload: Any, names: Sequence[str]) -> list[Any]:
     """从上游 `data` 里取出条目列表的**原始元素**（不过滤元素形状）。
 
-    为什么订单侧必须拿原始元素（v1.5.3）：`{"shop_order_list": ["x", 1, None]}` 里的三个元素
+    为什么订单侧必须拿原始元素（v1.5.1）：`{"shop_order_list": ["x", 1, None]}` 里的三个元素
     是"上游确实给了、但一个都不是对象"的行。旧实现由 :func:`_as_list` 直接丢掉它们，于是
     聚合结果是 `gmv=0 / orders=0`，只有一条 `collect.done`——"看到了但没解析出来"被伪装成
     "今天没卖东西"。订单侧要把它们按 `row_rejected(reason="not_an_object")` 计入拒绝率，
@@ -721,7 +724,7 @@ def _summary_uv(summary: Mapping[str, Any]) -> int | None:
     但"有值却不是非负整数"必须当场炸：静默丢掉会让"上游改了形状"永远表现成
     "这家店没有访客数据"——把一次数据结构变更伪装成正常的无数据，正是 §5.3 要防的那类错。
 
-    ## 为什么抛的是**整批**契约错而不是裸 `ValueError`（v1.5.3）
+    ## 为什么抛的是**整批**契约错而不是裸 `ValueError`（v1.5.1）
 
     裸 `ValueError` 会逃出 `_aggregate_orders` → `collect` → 图把 run 标 `failed` 后 re-raise
     → `POST /api/agent/run` **500**。这与 F1b 已经确立的分级自相矛盾：整批形状错（订单容器、
@@ -806,7 +809,7 @@ class _RowRejected(ValueError):
 
 
 class _AllRowsRejected(_BatchContractError):
-    """**看到了订单行，但一行都没被接受**（v1.5.3）：按整批不可用处理。
+    """**看到了订单行，但一行都没被接受**（v1.5.1）：按整批不可用处理。
 
     这是 P1 那一档缺口的修复：逐行拒绝让"整批契约坏"（F1b）不再 500 了，但退化成了
     "每一行都坏 → 静默 0 单 0 元"。实测两行 `pay_amount` 都是字符串时，结果是
@@ -845,7 +848,7 @@ _ORDER_LIST_KEYS: tuple[str, ...] = ("shop_order_list", "orders", "order_list")
 def _require_orders_container(payload: Any) -> None:
     """整批契约校验：`data` 必须是订单列表（裸 list，或带列表字段的映射），否则抛错。
 
-    为什么必须校验（v1.5.2 的根因）：`_as_list` 对"形状不认识"的输入返回 `[]`，于是
+    为什么必须校验（v1.5.1 的根因）：`_as_list` 对"形状不认识"的输入返回 `[]`，于是
     `data=None` / `{"oops": 1}` 会被静默聚合成"今天 0 单 0 元"。那不是"缺数据"，而是
     **把一次上游改结构伪装成生意归零**——所有基于 "gmv 掉了" 的规则都会静默失效，
     而没有任何一处会红（§5.3 的"缺数据不许补零"同一类事故）。
@@ -936,7 +939,7 @@ def _read_order_row(
         day = _business_date_of(
             item.get("create_time") or item.get("pay_time"),
             fallback=window_end,
-            # strict：行级日期解析不出来就**整行拒绝**，绝不回退成"今天"（v1.5.3）。
+            # strict：行级日期解析不出来就**整行拒绝**，绝不回退成"今天"（v1.5.1）。
             # 非 strict 的回退行为只留给窗口下界 / uv 作用域这类非行级调用点。
             strict=True,
         )
@@ -973,7 +976,7 @@ def _read_order_row(
 
     sku_id = item.get("sku_id")
     if sku_id is not None:
-        # 只接受 str / int（v1.5.3）：`str({"a": 1})` 会得到 "{'a': 1}" 这种字符串并被当成
+        # 只接受 str / int（v1.5.1）：`str({"a": 1})` 会得到 "{'a': 1}" 这种字符串并被当成
         # 一个真实 SKU 名写进 `by_sku`——成本表永远匹配不上它，`cost_coverage_ratio` 被
         # 拉低而人不明所以。dict/list/bool/float 一律整行拒绝（猜不出它想指哪个 SKU）。
         if isinstance(sku_id, bool) or not isinstance(sku_id, (str, int)):
@@ -1055,11 +1058,11 @@ def _aggregate_orders(
       `order_count` / `paid_order_count`（GMV 口径不变，那是另一件事），只是无法参与"金额/件数"
       这条比率。这也是**偏乐观**的方向（少算成本 → 少报亏本）——与本仓"宁可漏报，不可误报"
       的分级一致，且这条漏报是可查的（log 里有 `collect.zero_revenue_paid`）。
-    - 样本带 `units` / `unit_cost_cents`（v1.5.2，`cost_table` 给了才有）：只有件数没有单价时
+    - 样本带 `units` / `unit_cost_cents`（v1.5.1，`cost_table` 给了才有）：只有件数没有单价时
       "漏了多少钱"仍然算不出来，人只能看到"有 N 行没进成本口径"却无法排序该先修哪一单。
     - `revenue <= 0` 也可能来自**负金额**——那种行不进这里，而是整行拒绝（见下面第 3 条）：
 
-    ## 第三条：**行级脏数据整行拒绝**（v1.5.2；这是"脏数据不许打死整轮"的根治）
+    ## 第三条：**行级脏数据整行拒绝**（v1.5.1；这是"脏数据不许打死整轮"的根治）
 
     分界线（也是本仓对"降级 vs 硬失败"的判据）：
 
@@ -1071,12 +1074,12 @@ def _aggregate_orders(
       `summary.uv` 形状不对）→ :func:`_require_orders_container` / :func:`_summary_uv` 抛
       :class:`_BatchContractError`，由 `collect` 记错并把 run 标 `failed`。绝不降级成
       "今天 0 单 0 元"：那会把一次上游改结构伪装成"生意归零"，所有规则都会因为指标为 0 而静默失效。
-    - **看到了行、但一行都没被接受**（`rows_seen > 0 and rows_accepted == 0`，v1.5.3）→ 同样抛
+    - **看到了行、但一行都没被接受**（`rows_seen > 0 and rows_accepted == 0`，v1.5.1）→ 同样抛
       :class:`_AllRowsRejected`（`_BatchContractError` 的子类），走**同一条** failed 路径。
       逐行拒绝若不做这道阈值，"每一行都坏"就会退化成静默的 0 单 0 元——只是把整批契约坏
       降级成逐行契约坏，F1b 要避免的状态一点没变。
 
-    ## 拒绝率必须可观测（v1.5.3）
+    ## 拒绝率必须可观测（v1.5.1）
 
     `rows_seen`（订单列表里的**全部元素**，含非对象元素与窗口外的行）与 `rows_accepted`
     （真正进入任何指标的行）随聚合结果一起返回，`collect.done` 落进审计：只看 `gmv=0` 分不清
@@ -1093,7 +1096,7 @@ def _aggregate_orders(
     """
     _require_orders_container(payload)
     # 取**原始元素**而不是 `_as_list`（后者会丢掉非对象元素）：那些元素也是"看到了但没解析
-    # 出来"的行，必须计入拒绝率（v1.5.3）。
+    # 出来"的行，必须计入拒绝率（v1.5.1）。
     raw_rows = _as_list_raw(payload, _ORDER_LIST_KEYS)
     buckets: dict[str, dict[str, Any]] = {}
     #: 降级留痕（调用方负责变成审计条目；本函数是纯聚合，不碰日志/DB）
@@ -1148,14 +1151,14 @@ def _aggregate_orders(
                 degraded=staged_degraded,
             )
         except _RowRejected as exc:
-            # 行级拒绝（v1.5.2）：这一行整行不进任何指标，但**必须留痕**，否则就是静默少算。
+            # 行级拒绝（v1.5.1）：这一行整行不进任何指标，但**必须留痕**，否则就是静默少算。
             row_rejected.append(
                 {"order_id": order_id, "where": where, "reason": exc.reason, "error": str(exc)}
             )
             continue
         except ValueError as exc:
             # 没有显式分级的**数据**解析错也走同一条降级（带异常类型名，避免"看不出是什么错"）。
-            # 只接 ValueError（v1.5.3）：本文件数据侧（`_money` / `_order_units` / `_is_refunded`）
+            # 只接 ValueError（v1.5.1）：本文件数据侧（`_money` / `_order_units` / `_is_refunded`）
             # 只抛 ValueError；接住 TypeError 等于把我们自己代码的 bug 降级成"数据脏"。
             row_rejected.append(
                 {
@@ -1206,7 +1209,7 @@ def _aggregate_orders(
             bucket["refund_order_count"] += 1
             bucket["refund_amount_cents"] += row["refund_amount"]
 
-    # v1.5.3：看到了行，但**一行都没被接受** → 与整批契约坏走同一条路径（failed，不 500）。
+    # v1.5.1：看到了行，但**一行都没被接受** → 与整批契约坏走同一条路径（failed，不 500）。
     # 不做这道阈值，"每一行都坏"就会退化成静默的 0 单 0 元——那是 F1b 要避免的状态，
     # 只是从"整批契约坏"降级成了"逐行契约坏"。全部落在窗口外同样不算"今天没卖东西"。
     if rows_seen > 0 and rows_accepted == 0:
@@ -1241,7 +1244,7 @@ def _aggregate_orders(
         "units_degraded": units_degraded,
         "zero_revenue_paid": zero_revenue_paid,
         "row_rejected": row_rejected,
-        # 拒绝率（v1.5.3）：`collect.done` 的审计靠这两个数把"0 单 0 元"归因清楚。
+        # 拒绝率（v1.5.1）：`collect.done` 的审计靠这两个数把"0 单 0 元"归因清楚。
         "rows_seen": rows_seen,
         "rows_accepted": rows_accepted,
         **today,
@@ -1268,6 +1271,41 @@ def _audit_cost_table() -> dict[str, int] | None:
         return None
 
 
+#: `collect.failed` 的 `reason` 取值域（稳定分类，写进 JSONL 的 `data.reason` 与 `message`）。
+#:
+#: 为什么必须是**三个**互斥值而不是一句自然语言：`collect` 的失败在日志页上曾经只剩一条
+#: `node.trace` 的 `outcome=error`，而"上游接口挂了"与"这批订单全被拒"在那一行里长得一模一样
+#: ——运营据此要么去重启服务，要么去查数据，方向完全相反。分类是给人**分流**用的。
+_COLLECT_FAIL_BATCH_CONTRACT = "batch_contract"
+_COLLECT_FAIL_ALL_ROWS_REJECTED = "all_rows_rejected"
+_COLLECT_FAIL_ORDERS_UNAVAILABLE = "orders_unavailable"
+
+
+def _collect_failure_message(
+    reason: str, *, rows_seen: int, rows_rejected: int, reject_reasons: Mapping[str, int]
+) -> str:
+    """`collect.failed` 的人读文案：`reason=...` 原样出现在句子里，日志页与 grep 一眼可辨。
+
+    `data.reason` 是给机器/筛选用的事实，`message` 是给人看的一句话；两者必须表达同一个分类，
+    否则"红行文案说接口挂了、data 却写 all_rows_rejected"就会变成新的自相矛盾。
+    """
+    if reason == _COLLECT_FAIL_ALL_ROWS_REJECTED:
+        return (
+            f"采集失败（reason={reason}）：上游给了 {rows_seen} 行订单，"
+            f"但一行都没通过校验（整行被拒 {rows_rejected} 行，按原因：{dict(reject_reasons)}），"
+            "本轮没有产出任何指标"
+        )
+    if reason == _COLLECT_FAIL_BATCH_CONTRACT:
+        return (
+            f"采集失败（reason={reason}）：订单响应不满足契约"
+            "（data / 订单列表字段 / summary 形状不对），整批不可用，本轮没有产出任何指标"
+        )
+    return (
+        f"采集失败（reason={reason}）：订单列表接口没取到数据"
+        "（上游错误已记在 errors 里），本轮没有订单数据，也没有任何指标"
+    )
+
+
 @traced("collect")
 async def collect(state: AgentState, config: RunnableConfig) -> dict[str, Any]:
     """采集：店铺信息 + 商品列表 + 近 8 个业务日的订单聚合（§3.3 `RawSnapshot`）。
@@ -1290,7 +1328,7 @@ async def collect(state: AgentState, config: RunnableConfig) -> dict[str, Any]:
     `state.audit`（`collect.units_degraded` / `collect.zero_revenue_paid`）与 JSONL——
     后者是它们唯一的人类出口（没有 approval_request、也没有 action_log 行）。
 
-    ## 四种数据问题的分级（v1.5.2 分三档，v1.5.3 补上"全被拒"那一档）
+    ## 四种数据问题的分级（三批改动都并入契约 v1.5.1，因此这里只讲语义、不再分批次号）
 
     上一版只处理了"件数缺失/非正"和"0 元单"两种**能猜出含义**的降级，而
     `product_count: "3"` / `pay_amount: "199.00"` 这类**猜不出含义**的形状错仍然从 `collect`
@@ -1302,14 +1340,25 @@ async def collect(state: AgentState, config: RunnableConfig) -> dict[str, Any]:
     3. **整批契约坏了 → 硬失败**（不 500）：`data` 不是映射/列表、订单列表字段不是 list、
        一个已知列表字段都没有、`summary.uv` 形状不对 → 记一条错误 + `failed` 走 `finalize`，
        绝不静默给出"0 单 0 元"；
-    4. **看到了行但一行都没被接受 → 同样硬失败**（v1.5.3）：`rows_seen > 0 且
+    4. **看到了行但一行都没被接受 → 同样硬失败**（v1.5.1）：`rows_seen > 0 且
        rows_accepted == 0`（全部被拒 / 全部不是对象 / 全部在窗口外）→ :class:`_AllRowsRejected`，
        与第 3 档**同一条** `_BatchContractError` 路径。没有这一档，"每一行都坏"就会退化成
        零告警的 0 单 0 元——F1b 要避免的状态只是从"整批"挪到了"逐行"。
 
     只要出现任一降级/拒绝（`units_degraded` / `zero_revenue_paid` / `row_rejected`），
     `source["partial"]` 就必须是 True：这次采集不是完整的一份，raw 快照里要能看出来
-    （v1.5.3 修掉了"行级拒绝后 partial 仍为 False"）。
+    （v1.5.1 修掉了"行级拒绝后 partial 仍为 False"）。
+
+    ## 两个出口都要有"这一轮采集怎么了"（成功与失败各一条）
+
+    `collect.done`（info）与 `collect.failed`（error）**都**进 JSONL 汇，`data` 里都带
+    `rows_seen` / `rows_accepted` / `rows_rejected`（+ 失败时的 `reason` / `reject_reasons` /
+    `row_reject_samples`）。两个方向都要写：
+
+    - 只写失败会让人以为"没红就是正常"：一次**正常**采集在前端/日志页上是沉默的，而沉默
+      既可能是"跑完了没事"，也可能是"根本没跑"——这两件事在排障里完全不是一回事；
+    - 只写成功则相反：整批契约坏与全行被拒又退回"只有一条 `node.trace` 的 `outcome=error`"，
+      与"上游 503"无法区分（`reason` 就是为这条分叉而存在的）。
 
     审计是**旁路**：`_log_audit` 的写盘失败不会打断本节点（见该函数的 docstring）。
     """
@@ -1365,12 +1414,15 @@ async def collect(state: AgentState, config: RunnableConfig) -> dict[str, Any]:
     units_degraded: list[dict[str, Any]] = []
     zero_revenue_paid: list[dict[str, Any]] = []
     row_rejected: list[dict[str, Any]] = []
-    #: 拒绝率（v1.5.3）：`rows_seen` 是上游给的**行数**（含非对象元素/窗口外的行），
+    #: 拒绝率（v1.5.1）：`rows_seen` 是上游给的**行数**（含非对象元素/窗口外的行），
     #: `rows_accepted` 是真正进入指标的行数。两者进 `collect.done` / `collect.failed`，
     #: 否则"gmv=0"分不清"今天没卖东西"和"给的行全没解析出来"。
     rows_seen = 0
     rows_accepted = 0
     reject_reasons: dict[str, int] = {}
+    #: 失败分类（写进 `collect.failed` 的 `data.reason`）。**三档互斥**，默认是"接口没取到数据"：
+    #: 订单请求本身失败时不会有任何异常对象可分类，只能靠这个标记说明"这不是数据脏"。
+    failure_reason = _COLLECT_FAIL_ORDERS_UNAVAILABLE
     try:
         response = await client.search_orders(
             start_time=f"{window_start} 00:00:00", end_time=f"{today} 23:59:59", page=0, size=100
@@ -1380,6 +1432,8 @@ async def collect(state: AgentState, config: RunnableConfig) -> dict[str, Any]:
             raise
         _record(exc, what="订单列表")
         source["partial"] = True
+        # 非可重试的上游错误（4xx / business / signature / auth）→ `order_summary` 保持 None。
+        # 分类留在上面的默认值上：它与"整批契约坏""全行被拒"是**不同**的处置方向。
     else:
         _note_call(source, "order.searchList", response)
         try:
@@ -1392,15 +1446,16 @@ async def collect(state: AgentState, config: RunnableConfig) -> dict[str, Any]:
                 cost_table=_audit_cost_table(),
             )
         except _BatchContractError as exc:
-            # 整批不可用：`data`/列表字段/`summary.uv` 形状坏了，**或**（v1.5.3）看到了行但
+            # 整批不可用：`data`/列表字段/`summary.uv` 形状坏了，**或**（v1.5.1）看到了行但
             # 一行都没被接受（`_AllRowsRejected`）。两种都记一条具体错误，`order_summary`
             # 保持 None → 下面统一走"订单数据缺失"的硬失败分支（status=failed → finalize）。
             # 绝不继续用"0 单"把一次上游改结构/整批脏行伪装成"今天没卖东西"。
             #
             # 这里**不**捕获普通 `ValueError`：数据侧只抛 ValueError 的地方已经由
             # `_read_order_row` 转成行级拒绝；逃到这里的 ValueError 是我们自己代码的 bug，
-            # 不许被降级成"数据脏"（v1.5.3 收窄，见 P2）。
+            # 不许被降级成"数据脏"（v1.5.1 收窄，见 P2）。
             if isinstance(exc, _AllRowsRejected):
+                failure_reason = _COLLECT_FAIL_ALL_ROWS_REJECTED
                 message = f"订单行全部被拒绝，无法聚合成指标：{exc}"
                 rows_seen = exc.rows_seen
                 rows_accepted = exc.rows_accepted
@@ -1409,6 +1464,7 @@ async def collect(state: AgentState, config: RunnableConfig) -> dict[str, Any]:
                 # 与 `reject_reasons` 都从这里来），否则失败分支只剩一句"不可用"。
                 row_rejected = list(exc.row_rejected)
             else:
+                failure_reason = _COLLECT_FAIL_BATCH_CONTRACT
                 message = f"订单数据结构不合法，无法聚合：{exc}"
             errors.append(
                 make_agent_error(
@@ -1442,22 +1498,48 @@ async def collect(state: AgentState, config: RunnableConfig) -> dict[str, Any]:
                 retryable=False,
             )
         )
+        # 拒绝样本与 `collect.row_rejected` 共用同一个上限与前缀语义：`rows_rejected` 是全量，
+        # `row_reject_samples` 只是现场前几条。不复用 `_degradation_summary` 的输出结构是因为
+        # 这里的 `data` 以"这一轮采集的整体结果"为主，样本只是它的一个子字段。
+        reject_samples = [dict(item) for item in row_rejected[:_DEGRADATION_SAMPLE_LIMIT]]
+        failed_data: dict[str, Any] = {
+            "window": {"start": window_start, "end": today},
+            "source": source,
+            # 失败原因必须**一眼可辨**：`batch_contract`（上游改了结构/形状坏）与
+            # `all_rows_rejected`（行都在、全被拒）与 `orders_unavailable`（接口没取到数）
+            # 是三个不同的处置方向，只靠一条 `node.trace(outcome="error")` 分不开。
+            "reason": failure_reason,
+            # 失败也必须带拒绝率：`gmv=0` 与"一行都没解析出来"在 trace 上是同一行摘要，
+            # 只有这几个数能把"生意归零"和"数据不可用"分开。
+            "rows_seen": rows_seen,
+            "rows_accepted": rows_accepted,
+            "rows_rejected": len(row_rejected),
+            "reject_reasons": dict(reject_reasons),
+            "row_reject_samples": reject_samples,
+            "row_reject_samples_truncated": len(row_rejected) > len(reject_samples),
+        }
+        # 双出口：`state.audit`（checkpoint，可回放）+ JSONL 汇（`/api/logs` 的唯一数据源）。
+        # 只写前者 = 整批失败在日志页上不存在，运营只能看见一条和"上游 503"同形的红行。
+        _log_audit(
+            state,
+            node="collect",
+            event="collect.failed",
+            level="error",
+            message=_collect_failure_message(
+                failure_reason,
+                rows_seen=rows_seen,
+                rows_rejected=len(row_rejected),
+                reject_reasons=reject_reasons,
+            ),
+            data=failed_data,
+        )
         return {
             "errors": _errors(state, errors),
             "audit": _audit(
                 state,
                 node="collect",
                 event="collect.failed",
-                data={
-                    "window": {"start": window_start, "end": today},
-                    "source": source,
-                    # 失败也必须带拒绝率：`gmv=0` 与"一行都没解析出来"在 trace 上是同一行摘要，
-                    # 只有这两个数能把"生意归零"和"数据不可用"分开（v1.5.3）。
-                    "rows_seen": rows_seen,
-                    "rows_accepted": rows_accepted,
-                    "rows_rejected": len(row_rejected),
-                    "reject_reasons": dict(reject_reasons),
-                },
+                data=failed_data,
             ),
             "status": RunStatus.FAILED.value,
         }
@@ -1470,24 +1552,39 @@ async def collect(state: AgentState, config: RunnableConfig) -> dict[str, Any]:
         order_summary=order_summary,
         source=source,
     )
+    done_data: dict[str, Any] = {
+        "window": raw["window"],
+        "products": len(products),
+        "methods": list(source["methods"]),
+        "partial": bool(source["partial"]),
+        # 拒绝率：分母=上游给的行数，分子=真正进入指标的行数。与
+        # `rows_rejected`（整行被拒的条数）一起构成"这一轮采集到底发生了什么"的汇总。
+        "rows_seen": rows_seen,
+        "rows_accepted": rows_accepted,
+        # 整行被拒的条数在这里也出现一次：`collect.done` 是"这一轮采集到底发生了什么"的
+        # 汇总入口，读者不必先去翻 `collect.row_rejected` 才知道今天有几行没进指标。
+        "rows_rejected": len(row_rejected),
+    }
     audits = _audit(
         state,
         node="collect",
         event="collect.done",
-        data={
-            "window": raw["window"],
-            "products": len(products),
-            "methods": list(source["methods"]),
-            "partial": bool(source["partial"]),
-            # 拒绝率（v1.5.3）：分母=上游给的行数，分子=真正进入指标的行数。与
-            # `rows_rejected`（整行被拒的条数）一起构成"这一轮采集到底发生了什么"的汇总。
-            "rows_seen": rows_seen,
-            "rows_accepted": rows_accepted,
-            # 整行被拒的条数在这里也出现一次：`collect.done` 是"这一轮采集到底发生了什么"的
-            # 汇总入口，读者不必先去翻 `collect.row_rejected` 才知道今天有几行没进指标。
-            "rows_rejected": len(row_rejected),
-        },
+        data=done_data,
         at=raw["collected_at"],
+    )
+    # 成功也要落盘：只有失败落盘会让"正常"变成沉默，而"沉默"既可能是"跑完没事"，
+    # 也可能是"这一轮根本没跑"——排障时这两件事的下一步完全不同。
+    partial_text = "true" if source["partial"] else "false"
+    _log_audit(
+        state,
+        node="collect",
+        event="collect.done",
+        level="info",
+        message=(
+            f"采集完成：上游给 {rows_seen} 行订单，{rows_accepted} 行进入指标，"
+            f"{len(row_rejected)} 行整行被拒（partial={partial_text}）"
+        ),
+        data=done_data,
     )
     # 采集层的两次**容错**必须留痕（v1.5.1）。它们不产生 approval_request、不进 action_log，
     # 所以除了 `state.audit` 之外还必须写一条 JSONL：否则"这次为什么漏报亏本"在日志页上
@@ -1527,11 +1624,11 @@ async def collect(state: AgentState, config: RunnableConfig) -> dict[str, Any]:
             data=data,
         )
     if row_rejected:
-        # 行级拒绝（v1.5.2）：这些行**整行**没进指标。审计必须把这件事说出来，否则
+        # 行级拒绝（v1.5.1）：这些行**整行**没进指标。审计必须把这件事说出来，否则
         # "GMV 比昨天少了一截"就永远无法归因到"上游有几行脏数据被跳过了"。
         data = _degradation_summary("row_rejected", row_rejected)
         data["excluded_from_metrics"] = True
-        # 文案必须自证"样本只是样本"（v1.5.3）：`count` 是全量，`samples` 只有前 N 条。
+        # 文案必须自证"样本只是样本"（v1.5.1）：`count` 是全量，`samples` 只有前 N 条。
         # 只写"样本见 data.samples"会让读者把"看到 5 条"当成"一共就 5 条"。
         sample_note = f"仅前 {data['sample_limit']} 条样本" + (
             "（其余已截断）" if data["samples_truncated"] else ""
@@ -1790,7 +1887,7 @@ async def detect_anomalies_node(state: AgentState, config: RunnableConfig) -> di
             )
         )
     anomalies: list[Anomaly] = evaluation.anomalies
-    #: `kind` 是**同一 event 名下两种 schema 的判别键**（v1.5.2）：`anomaly.detected` 既写一条
+    #: `kind` 是**同一 event 名下两种 schema 的判别键**（v1.5.1）：`anomaly.detected` 既写一条
     #: 汇总、又给每条异常写一条明细。过去消费方只能靠"data 里有没有 rule_id"来猜两种形状
     #: （明细没有 `count`、汇总没有 `rule_id`），猜错的代价是 `.get()` 满天飞 + 静默把汇总当明细。
     #: 这与同文件 `collect.*` 事件已有的风格一致（它们的 `data.kind` 是 `units` /

@@ -6,7 +6,8 @@
 1. `compute_metrics_node` 把 `cost_table` 传进 `compute_metrics`（**两条分支各一次**：
    "今天的桶已在 by_date 里" 与 "用 raw 现算"）；
 2. 成本表坏掉时的 `ConfigError` 分支（节点记 CONFIG 错并让 run 失败，而不是降级成"没有成本"）；
-3. 审计条目写进 JSONL 汇（`metrics.computed` / `anomaly.detected` / `sku_costs.unmatched`）。
+3. 审计条目写进 JSONL 汇（`metrics.computed` / `anomaly.detected` / `sku_costs.unmatched`，
+   以及采集的 `collect.done` / `collect.failed` 与三种降级留痕）。
 
 第 3 条是**根因**级的：`state.audit` 只在 checkpoint 里，而 `/api/logs` 只读 JSONL。
 两处都不写 = `loss_making` 这类"只告警、不产生 approval_request"的规则**没有任何出口**
@@ -41,6 +42,7 @@ from .conftest import (
     FIXED_NOW,
     SHOP_ID,
     TODAY,
+    DoudianBusinessError,
     FakeDoudianClient,
     FakeResponse,
     decisions_for,
@@ -271,7 +273,7 @@ async def test_detected_anomaly_is_written_to_the_jsonl_sink(
     assert "rule_id" not in update["audit"][0]["data"]
 
     # (b) JSONL 里有一行**明细**（不是只有 count/rule_ids 的汇总）。
-    #     按 `kind` 区分两种 schema（v1.5.2）：不再用"data 里有没有 rule_id"来猜，
+    #     按 `kind` 区分两种 schema（v1.5.1）：不再用"data 里有没有 rule_id"来猜，
     #     那种猜法一旦上游给明细补上 `count` 就会静默把明细当汇总（或反过来）。
     rows = sink.read(run_id=RUN_ID, event_prefix="anomaly.")
     summary_rows = [row for row in rows if row["data"].get("kind") == "summary"]
@@ -491,7 +493,7 @@ async def test_collect_reports_zero_revenue_paid_rows(
 
 
 # --------------------------------------------------------------------------------------
-# 5) 行级脏数据（类型不对/负金额）：整行拒绝 + 审计，**不许**打死整轮（v1.5.2 F1）
+# 5) 行级脏数据（类型不对/负金额）：整行拒绝 + 审计，**不许**打死整轮（v1.5.1 F1）
 # --------------------------------------------------------------------------------------
 
 
@@ -687,7 +689,174 @@ async def test_collect_fails_hard_when_the_whole_order_batch_is_malformed(
 
 
 # --------------------------------------------------------------------------------------
-# 6) 审计写盘失败：旁路失败不许弄死整轮（v1.5.2 F2）
+# 5c) 采集的"整批失败"与"成功"都必须**在 JSONL 里**（不是只在 state.audit 里）
+# --------------------------------------------------------------------------------------
+#
+# 缺陷形态（这一组的存在理由）：`collect.failed` / `collect.done` 过去只进 `state.audit`
+# （checkpoint），而 `/api/logs` 只读 JSONL。于是：
+#
+# - 整批契约坏、全行被拒这两种**最重要的失败**在日志页上只剩一条 `node.trace` 的
+#   `outcome=error`，与"上游 503"长得一模一样 —— 运营分不出"这批订单全被拒"和"接口挂了"；
+# - 正常采集则完全不落盘，日志页上的"沉默"既可能是跑完没事，也可能是根本没跑。
+#
+# 所以这里断言的是"**文件里真的出现了**那一行"，以及 `reason` 能把两条失败路径分开。
+
+
+async def test_collect_failed_batch_contract_lands_in_the_sink_with_its_own_reason(
+    monkeypatch: pytest.MonkeyPatch,
+    runtime: Any,
+    sink: JsonlLogSink,
+    fake_client: FakeDoudianClient,
+) -> None:
+    """整批契约坏 → JSONL 里一条 `collect.failed`，`level=error` 且 `reason=batch_contract`。
+
+    `reason` 是给人**分流**用的：`batch_contract` 说明上游把结构改了（去查上游），
+    `all_rows_rejected` 说明行都在但都被拒（去查数据），"接口没取到数"则是第三档。
+    三种处置方向完全不同，所以它们不能共用一句"采集失败"。
+    """
+
+    async def _malformed(**_kwargs: Any) -> FakeResponse:
+        return FakeResponse(data={"oops": 1})
+
+    monkeypatch.setattr(fake_client, "search_orders", _malformed)
+
+    update = await collect.__wrapped__(_state(), _config(runtime))  # type: ignore[attr-defined]
+    assert update.get("status") == RunStatus.FAILED.value
+
+    rows = sink.read(run_id=RUN_ID, event_prefix="collect.failed")
+    assert len(rows) == 1, [row["event"] for row in sink.read(run_id=RUN_ID)]
+    row = rows[0]
+    assert row["event"] == "collect.failed"
+    assert row["level"] == "error", "整批失败必须是红行，否则 /api/logs?level=error 找不到它"
+    assert row["node"] == "collect"
+    assert row["data"]["reason"] == "batch_contract"
+    # 整批都没解析出"行"：分母/分子都是 0，样本为空——它们说清"这次连行都没看到"，
+    # 而不是把 0 当成"拒绝了 0 行"（那是另一档：看到了行但全被拒）。
+    assert row["data"]["rows_seen"] == 0
+    assert row["data"]["rows_accepted"] == 0
+    assert row["data"]["rows_rejected"] == 0
+    assert row["data"]["reject_reasons"] == {}
+    assert row["data"]["row_reject_samples"] == []
+    assert "reason=batch_contract" in row["message"], row["message"]
+    # 真的落盘了（不是只在内存返回值里）
+    assert '"reason":"batch_contract"' in Path(sink.path).read_text(encoding="utf-8")
+
+
+async def test_collect_failed_all_rows_rejected_lands_in_the_sink_with_its_own_reason(
+    runtime: Any, sink: JsonlLogSink, fake_client: FakeDoudianClient
+) -> None:
+    """全行被拒 → 同一事件名、**不同** `reason=all_rows_rejected`，且带拒绝率与样本。
+
+    两条失败路径共用 `event="collect.failed"` 但 `reason` 不同：`event` 决定"这是一次采集
+    失败"，`reason` 决定"该找谁"。把两者合并成一句话，就等于让运营自己去猜。
+
+    同时钉住样本的**上限与全量的区别**：`rows_rejected` 是全量（7），`row_reject_samples`
+    只有前 5 条且 `row_reject_samples_truncated=True`——只贴样本不说截断会把 7 行读成 5 行。
+    """
+    fake_client.orders = [
+        {
+            "order_id": f"o_bad_{index}",
+            "sku_id": "sku_a",
+            # 金额是"元"为单位的字符串：猜不出含义 → 整行拒绝（不是降级）。
+            "pay_amount": "199.00",
+            "product_count": 1,
+            "create_time": f"{TODAY} 09:00:00",
+        }
+        for index in range(7)
+    ]
+
+    update = await collect.__wrapped__(_state(), _config(runtime))  # type: ignore[attr-defined]
+    assert update.get("status") == RunStatus.FAILED.value
+
+    rows = sink.read(run_id=RUN_ID, event_prefix="collect.failed")
+    assert len(rows) == 1, [row["event"] for row in sink.read(run_id=RUN_ID)]
+    row = rows[0]
+    assert row["level"] == "error"
+    assert row["data"]["reason"] == "all_rows_rejected"
+    assert row["data"]["rows_seen"] == 7
+    assert row["data"]["rows_accepted"] == 0
+    assert row["data"]["rows_rejected"] == 7
+    assert row["data"]["reject_reasons"] == {"bad_pay_amount": 7}
+    samples = row["data"]["row_reject_samples"]
+    assert len(samples) == 5, "样本上限是 5 条（与 collect.row_rejected 同一个口径）"
+    assert row["data"]["row_reject_samples_truncated"] is True
+    assert samples[0]["order_id"] == "o_bad_0"
+    assert samples[0]["reason"] == "bad_pay_amount"
+    assert "reason=all_rows_rejected" in row["message"]
+    assert "7 行" in row["message"]
+
+
+async def test_collect_failed_orders_unavailable_is_distinguishable_from_data_failures(
+    runtime: Any, sink: JsonlLogSink, fake_client: FakeDoudianClient
+) -> None:
+    """订单接口本身失败（不可重试的上游业务错）→ `reason=orders_unavailable`。
+
+    这一档是"运营分不出'这批订单全被拒'和'接口挂了'"的**另一半**：三档失败共用
+    `event="collect.failed"`，靠 `reason` 分开。少了这一条，接口故障会被写成
+    `batch_contract`（去查上游结构），而真正该做的是先修接口/权限。
+    """
+    fake_client.fail(
+        "order.searchList", DoudianBusinessError("无权限访问订单列表", retryable=False)
+    )
+
+    update = await collect.__wrapped__(_state(), _config(runtime))  # type: ignore[attr-defined]
+    assert update.get("status") == RunStatus.FAILED.value
+
+    rows = sink.read(run_id=RUN_ID, event_prefix="collect.failed")
+    assert len(rows) == 1
+    row = rows[0]
+    assert row["level"] == "error"
+    assert row["data"]["reason"] == "orders_unavailable"
+    assert row["data"]["rows_seen"] == 0
+    assert "reason=orders_unavailable" in row["message"]
+
+
+async def test_collect_done_is_written_to_the_sink_with_the_partial_flag(
+    runtime: Any, sink: JsonlLogSink, fake_client: FakeDoudianClient
+) -> None:
+    """正常采集 → `collect.done`（info）；有行被丢 → 同一条事件里 `partial=True`。
+
+    成功也要落盘：不落盘的话"没红"就不再是"跑完了"，而只是"没写"——`/api/logs?event=collect.`
+    应该是"这一轮采集怎么了"的入口，而不是只有出事时才有内容的事故记录。
+    `partial` 与 `rows_rejected` 必须一起给：前者说"这份数据不完整"，后者说"少了多少行"。
+    """
+    update = await collect.__wrapped__(_state(), _config(runtime))  # type: ignore[attr-defined]
+    assert update.get("status") != RunStatus.FAILED.value
+
+    done = sink.read(run_id=RUN_ID, event_prefix="collect.done")
+    assert len(done) == 1
+    assert done[0]["level"] == "info"
+    assert done[0]["data"]["rows_seen"] == 8  # history_then_today()：7 天历史 + 今天
+    assert done[0]["data"]["rows_accepted"] == 8
+    assert done[0]["data"]["rows_rejected"] == 0
+    assert done[0]["data"]["partial"] is False
+
+    # 第二轮：混进一行金额是字符串的脏数据 → 仍然成功（只丢这一行），但 partial 必须翻成 True。
+    fake_client.orders = [
+        *fake_client.orders,
+        {
+            "order_id": "o_bad",
+            "sku_id": "sku_a",
+            "pay_amount": "199.00",
+            "product_count": 1,
+            "create_time": f"{TODAY} 23:00:00",
+        },
+    ]
+    second = await collect.__wrapped__(_state(), _config(runtime))  # type: ignore[attr-defined]
+    assert second.get("status") != RunStatus.FAILED.value
+    assert second["raw"]["source"]["partial"] is True
+
+    done = sink.read(run_id=RUN_ID, event_prefix="collect.done")
+    assert len(done) == 2, "每次真实执行都要留一条（日志是事件流，不做去重）"
+    latest = done[0]  # `read()` 按 seq DESC
+    assert latest["data"]["rows_seen"] == 9
+    assert latest["data"]["rows_accepted"] == 8
+    assert latest["data"]["rows_rejected"] == 1
+    assert latest["data"]["partial"] is True
+
+
+# --------------------------------------------------------------------------------------
+# 6) 审计写盘失败：旁路失败不许弄死整轮（v1.5.1 F2）
 # --------------------------------------------------------------------------------------
 
 

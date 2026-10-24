@@ -19,6 +19,15 @@ import argparse
 import sys
 from pathlib import Path
 
+# Windows 控制台默认是 GBK，脚本里的 `✓` / `✗` 一打印就抛
+# `UnicodeEncodeError: 'gbk' codec can't encode character '\u2713'`，
+# 于是**检查本身通过了、退出码却是 1**——一个自检脚本报假红，比不报更坏
+# （有人会因此去"修"根本没坏的东西，或者干脆把检查关掉）。
+# 这里显式切 UTF-8；`errors="replace"` 保证在更奇怪的终端里也不炸。
+if hasattr(sys.stdout, "reconfigure"):
+    sys.stdout.reconfigure(encoding="utf-8", errors="replace")
+    sys.stderr.reconfigure(encoding="utf-8", errors="replace")
+
 HERE = Path(__file__).resolve().parent
 if str(HERE) not in sys.path:
     sys.path.insert(0, str(HERE))

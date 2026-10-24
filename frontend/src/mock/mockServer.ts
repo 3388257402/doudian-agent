@@ -481,25 +481,40 @@ function handleRunAgent(req: ApiRequest, trace: string): TransportResponse {
     created_at: nowIso(),
   };
   state.approvals.push(approval);
+  // 这两条日志的**事件名与 data 形状必须来自 backend/app 的真实生产者**，mock 不许自造：
+  // 过去这里是 `collect.started` / `approval.requested`，而后端从来没有发过这两个事件名
+  // （`check_event_names.py` 会因此判 mock fixtures 漂移）。现在换成一条真实事件 +
+  // 一条真实的 `node.trace`：
+  //   · `collect.done`（`nodes.collect`，info）：采集跑完时的汇总，带 rows_seen / rows_accepted /
+  //     rows_rejected / partial。假后端没有真的拉订单，所以三个计数都是 0（=「一行没给」，
+  //     是合法状态，不是"假装成功"）。
+  //   · `node.trace`（`tracing.traced`，interrupted）：HITL 挂起是**正常控制流**，
+  //     `output_digest`/`error` 必须为 null（§7.6.1），日志页据此显示「等待审批」而不是红色。
   appendLog({
     level: "info",
-    event: "collect.started",
+    event: "collect.done",
     run_id: runId,
     trace_id: newTrace,
     shop_id: shopId,
     node: "collect",
-    message: `run started (dry_run=${body["dry_run"] === true ? "true" : "false"})`,
-    data: { trigger: body["trigger"] ?? "manual", dry_run: body["dry_run"] === true },
+    message: `mock：采集完成（dry_run=${body["dry_run"] === true ? "true" : "false"}，假后端没有真的拉订单）`,
+    data: { rows_seen: 0, rows_accepted: 0, rows_rejected: 0, partial: false },
   });
   appendLog({
     level: "info",
-    event: "approval.requested",
+    event: "node.trace",
     run_id: runId,
     trace_id: newTrace,
     shop_id: shopId,
     node: "approval_gate",
-    message: "挂起等待人工审批（1 条动作）",
-    data: { proposals: 1, notifier: "dry_run" },
+    message: "node interrupted (awaiting human decision)",
+    data: {
+      outcome: "interrupted",
+      duration_ms: 12.1,
+      input_digest: fakeHex(16),
+      output_digest: null,
+      error: null,
+    },
   });
 
   const response: RunResponse = {

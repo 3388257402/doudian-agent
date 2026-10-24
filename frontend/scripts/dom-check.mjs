@@ -10,7 +10,7 @@
 // 依赖：本机 Chrome（可用 CHROME_PATH 覆盖）。不引 puppeteer —— 只用 CDP 的少数几个方法。
 
 import { spawn, spawnSync } from "node:child_process";
-import { existsSync, mkdirSync, writeFileSync } from "node:fs";
+import { existsSync, mkdirSync, readFileSync, writeFileSync } from "node:fs";
 import { resolve } from "node:path";
 
 // 看门狗：自检卡住（Chrome 起不来 / CDP 无响应）时必须自己退出，不能挂在那儿。
@@ -24,6 +24,18 @@ const BASE_URL = process.env.DOM_CHECK_URL ?? "http://localhost:5173";
 const PORT = Number(process.env.DOM_CHECK_PORT ?? 9334);
 const ROOT = resolve(import.meta.dirname, "..");
 const OUT_DIR = resolve(ROOT, ".verify");
+
+// 日志 fixtures 是**导出的**（backend/tests/fixtures/demo/export_event_log.py --mock-out），
+// 所以要断言的条数/三态计数/耗时都从这份 JSON 派生，而不是写成常量：常量会在下一次重导
+// 之后悄悄过期，而"页面少渲染了一行"这种缺陷就藏在一个过期的数字后面。
+const LOGS_FIXTURE = JSON.parse(readFileSync(resolve(ROOT, "mock/logs.json"), "utf8"));
+const LOG_TRACE_ROWS = LOGS_FIXTURE.items.filter((item) => item.event === "node.trace");
+
+/** 与 `src/lib/format.ts` 的 `formatDuration` 同一口径（本脚本是纯 Node，不经过 bundler，不能直接 import .ts）。 */
+function formatDuration(ms) {
+  if (ms === null || ms === undefined || !Number.isFinite(ms) || ms < 0) return "—";
+  return ms < 1000 ? `${ms.toFixed(1)} ms` : `${(ms / 1000).toFixed(2)} s`;
+}
 
 const CHROME_CANDIDATES = [
   process.env.CHROME_PATH,
@@ -387,14 +399,21 @@ async function checkDashboard(cdp) {
 async function checkLogs(cdp) {
   const { send } = cdp;
 
-  assertEqual("日志：fixtures 的 38 条日志全部渲染", await evaluate(send, "document.querySelectorAll('.log-row').length"), 38);
   assertEqual(
-    "日志：node.trace 三态数量（ok 14 / 等待审批 2 / error 1）",
+    "日志：fixtures 的每条日志都渲染了（条数取自 mock/logs.json）",
+    await evaluate(send, "document.querySelectorAll('.log-row').length"),
+    LOGS_FIXTURE.items.length,
+  );
+  const outcomeCounts = ["ok", "interrupted", "error"].map(
+    (outcome) => LOG_TRACE_ROWS.filter((row) => row.data?.outcome === outcome).length,
+  );
+  assertEqual(
+    `日志：node.trace 三态数量（ok ${outcomeCounts[0]} / 等待审批 ${outcomeCounts[1]} / error ${outcomeCounts[2]}）`,
     await evaluate(
       send,
       "['outcome-ok','outcome-interrupted','outcome-error'].map((c) => document.querySelectorAll('.log-row.'+c).length)",
     ),
-    [14, 2, 1],
+    outcomeCounts,
   );
   assertEqual(
     "日志：interrupted 显示为「等待审批」而不是 error",
@@ -402,7 +421,7 @@ async function checkLogs(cdp) {
       send,
       "[...document.querySelectorAll('.log-row.outcome-interrupted .pill')].map((e) => e.textContent).join(',')",
     ),
-    "info,等待审批,info,等待审批",
+    Array(outcomeCounts[1]).fill("info,等待审批").join(","),
   );
   assertEqual(
     "日志：interrupted 行的背景是黄色（computed style，不是红色）",
@@ -415,12 +434,15 @@ async function checkLogs(cdp) {
     "rgba(248, 113, 113, 0.07)",
   );
   assertEqual(
-    "日志：耗时列读 data.duration_ms（42.7 ms / 3.01 s 都出现过，非 trace 行显示 —）",
+    "日志：耗时列逐行读 data.duration_ms（非 node.trace 行显示 —）",
     await evaluate(
       send,
-      "(() => { const t = [...document.querySelectorAll('.log-row')].map((r) => r.querySelector('.col-duration').textContent); return [t.includes('42.7 ms'), t.includes('3.01 s'), t.includes('—')]; })()",
+      "[...document.querySelectorAll('.log-row')].map((r) => r.querySelector('.col-duration').textContent)",
     ),
-    [true, true, true],
+    // 行序 = /api/logs 的 seq DESC（mock 假后端与真后端同一排序），fixtures 本身就是 DESC。
+    LOGS_FIXTURE.items.map((item) =>
+      item.event === "node.trace" ? formatDuration(item.data?.duration_ms) : "—",
+    ),
   );
   assertEqual(
     "日志：run 摘要按 run 聚合，出问题的 run 排最前（§7.6.1 步数不变量）",
@@ -428,10 +450,11 @@ async function checkLogs(cdp) {
       send,
       "[...document.querySelectorAll('.run-summary-table tbody tr')].map((tr) => tr.querySelector('code').textContent + '/' + tr.children[1].textContent)",
     ),
+    // 三个 run 都是真实 demo 跑出来的（collect-failure 2 步 / 成功含审批重放 9 步 / 挂起未裁决 5 步）。
     [
-      "run_20261023T080000Z_5e6f7a8b/1",
-      "run_20261023T142530Z_9f3c1a7b/8",
-      "run_20261023T090000Z_1a2b3c4d/8",
+      "run_20261023T080000Z_5e6f7a8b/2",
+      "run_20261023T142530Z_9f3c1a7b/9",
+      "run_20261023T090000Z_1a2b3c4d/5",
     ],
   );
   assertEqual(

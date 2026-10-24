@@ -369,7 +369,7 @@ def test_order_units_defaults_to_one_and_records_every_degradation() -> None:
     `_aggregate_orders` 把现场记进 `degraded`，`collect` 据此写 warn 审计——没有这条留痕的话，
     "为什么这次没报亏本"在日志里完全无法解释。
 
-    v1.5.2 的样本 schema（缺件数与件数非正**统一**，且都带 `order_id`）：
+    v1.5.1 的样本 schema（缺件数与件数非正**统一**，且都带 `order_id`）：
     `{order_id, where, keys, key, value, reason}`。只给页内下标 `order[3]` 的话，换个 run /
     重试之后就无法回到具体哪一单（下标会变），审计也就没法"事后定位"。
     """
@@ -483,7 +483,7 @@ def test_zero_revenue_paid_row_is_kept_out_of_the_cost_margin() -> None:
     GMV 口径不变：这一行仍然是"已支付"（`paid_order_count` +1、`gmv_cents` +0）——那是另一件事，
     不能为了成本口径好看而把它从订单数里删掉。
 
-    v1.5.2：样本补 `order_id` / `units` / `unit_cost_cents`（`cost_table` 传了才有）。只报"有 N 行
+    v1.5.1：样本补 `order_id` / `units` / `unit_cost_cents`（`cost_table` 传了才有）。只报"有 N 行
     没进成本口径"是没法排序的——`units × unit_cost_cents` 才是"这一行漏了多少成本"。
     """
     aggregate = _aggregate_orders(

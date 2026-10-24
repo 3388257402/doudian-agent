@@ -117,7 +117,22 @@ npm run verify:dom         # 另开一个终端、dev 起着；headless Chrome �
 | `alerts.json` | 3 条待审批，跨 2 个 thread（演示"整批裁决"）；字段集与 §7.3 一致（没有 `approval_id`） |
 | `metrics.json` | 13 个点（缺 `2026-10-18` 一天，演示"缺数据不补零"）。刻意保留的四种口径：`2026-10-09` 的 `gross_margin=null` + `cost_coverage_ratio=0`（未配置成本）、`2026-10-14` 的 `gross_margin=0`（不赚不亏，上屏 `0.00%`）、`2026-10-16` 的 `cost_coverage_ratio=1`（全覆盖，不补口径提示）、`2026-10-11` 的 `uv` / `cvr=null`（分母为 0）。`refund_rate` **每天都有值**（fixtures 里没有 `refund_rate=null` 的天）；**字段集恰好等于 §12 的 `MetricPoint`** |
 | `metrics.extended.json` | 同上 + `inventory_units`（契约外，只在 Mock 扩展开关打开时回给前端）；**没有 `cost_cents`**——那条自算路径已删除 |
-| `logs.json` | 38 条，覆盖 3 个 run：成功（8 步）、挂起后恢复（8 步，含 `approval_gate` 的 `interrupted` 与恢复各一条）、`collect` 失败（1 步，`outcome=error`）。每条 `node.trace` 都按 §7.6.1 带 `outcome`/`duration_ms`/`input_digest`/`output_digest`/`error`，`level↔outcome` 映射合规 |
+| `logs.json` | **29 条，来自三次真实 demo 运行**（`backend/tests/fixtures/demo/export_event_log.py --mock-out` 导出，不手写）：成功（9 条 `node.trace` = 8 个节点 + 审批恢复重放，含 `approval_gate` 的 `interrupted` 与恢复各一条）、挂起后无人裁决（5 条，停在 `approval_gate`）、整批契约坏（2 条：`collect` 的 `error` + `finalize` 的 `ok`）。每条 `node.trace` 都按 §7.6.1 带 `outcome`/`duration_ms`/`input_digest`/`output_digest`/`error`，`level↔outcome` 映射合规 |
+
+**`mock/logs.json` 是从一次（准确的说是三次）真实 demo 运行导出的，不要手写**：改了后端的事件名 /
+`data` 字段就重导，命令是
+
+```powershell
+.\.venv\Scripts\python.exe backend\tests\fixtures\demo\export_event_log.py --mock-out
+# 断言：文件里的每个事件名都必须在 backend/app 有生产者（漂了就 exit 1）
+.\.venv\Scripts\python.exe backend\tests\fixtures\demo\check_event_names.py frontend\mock\logs.json
+```
+
+手写那几条"看起来对"的日志，就是 `approval.requested` / `collect.started` 这类**后端根本不发**的
+事件名混进 fixtures 的来路（前端会照着它们渲染出一套现实里不存在的日志）。重导一次之后，
+`node.trace` 的三态、`anomaly.detected` 的 `kind` 两种形态、`metrics.computed` 的
+`date`/`history_days`/`gross_margin`/`cost_coverage_ratio`、`collect.done`/`collect.failed`
+的分类（`reason`）全都与后端同源。
 
 ## 验证（不靠肉眼）
 
@@ -170,7 +185,7 @@ frontend/
 │  ├─ alerts.json               # 3 条待审批，跨 2 个 thread
 │  ├─ metrics.json              # §7.5 同形（含 gross_margin / cost_coverage_ratio）
 │  ├─ metrics.extended.json     # + inventory_units（契约外，开关驱动；不含 cost_cents）
-│  └─ logs.json                 # 38 条，3 个 run，覆盖 ok/interrupted/error 三态
+│  └─ logs.json                 # 29 条（导出），3 个真实 run，覆盖 ok/interrupted/error 三态
 ├─ scripts/
 │  ├─ verify.mjs                # 自检驱动（§12 逐字 diff + esbuild 打包套件）
 │  ├─ verify-suite.ts           # 32 条契约断言（纯 Node；+verify.mjs 的 §12 逐字 diff = 33）

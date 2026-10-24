@@ -1,6 +1,6 @@
 # CONTRACT.md — 抖店智能运营 Agent 契约（单一事实源）
 
-- 版本：**1.5.0**（冻结；**v1.5.0 = 成本/毛利率落地，纯增量**——§3.3 `MetricsSnapshot` 新增 `gross_margin` / `cost_coverage_ratio`（**店铺级**成本口径）、§5.3 `compute_metrics(..., cost_table=…)` 由"已入册未实现"转为**已实现**并新增数据面 `order_summary["by_sku"]`、§8.3.3 `ALLOWED_NAMES` 新增这两个名字且冻结「SKU 侧必须叫 `sku_gross_margin`」、§8.3 新增 `loss_making` 规则（**只告警不给动作**）、§8.5 补成本表实现细节并把"启动期交叉校验"改写为**运行期审计**；**未完成项见 §13 的 1.5.0 行**；v1.3.1 补 §4.7 规则 5c2 与 §7.6.1 的 `error.type`；v1.3.2 登记 `app/api/queries.py` 的只读边界与 §7.5 数据源；**v1.4.0 合并此前未登记的两批增量**——原拟 1.3.3 的 **§7.6.2 脱敏两层与「必须测通道」**（并入本版，不再单独计版本）+ 正文里**已存在但 §13 未登记**的 **SKU 维度与成本表**条文（§3.3 / §5.1 / §5.3.1 / §5.4 / §8.3.3 / §8.5 / §10.3 / §11 的 `v1.4.0` 标注自此有 §13 依据），并结清「正文标 1.4.0、版本行停在 1.3.x」的欠账；**纯增量**：不改既有签名（新增参数全部 keyword-only 带默认值）、不改表列、不改 JSON 键、不改错误码，见 §13）
+- 版本：**1.5.1**（冻结；**v1.5.1 = 审计事件登记（§7.6.3），纯增量**——把 `backend/app/agent/nodes.py` 已经在写、契约里却没有位置的 6 个审计事件（`metrics.computed`、`anomaly.detected` 的 `summary` 与 `detail` 两形态、`collect.row_rejected`、`collect.units_degraded`、`collect.zero_revenue_paid`、`sku_costs.unmatched`）按**代码实际字段**登记进 §7.6，并补采集层**行级判定表**、`samples` 截断语义与 `source.partial` 的含义；**`node.trace` 键集合一个字都没改**，`/api/logs` 的 `event` 仍是自由字符串（前端不需要改）；v1.5.0 = 成本/毛利率落地，纯增量——§3.3 `MetricsSnapshot` 新增 `gross_margin` / `cost_coverage_ratio`（**店铺级**成本口径）、§5.3 `compute_metrics(..., cost_table=…)` 由"已入册未实现"转为**已实现**并新增数据面 `order_summary["by_sku"]`、§8.3.3 `ALLOWED_NAMES` 新增这两个名字且冻结「SKU 侧必须叫 `sku_gross_margin`」、§8.3 新增 `loss_making` 规则（**只告警不给动作**）、§8.5 补成本表实现细节并把"启动期交叉校验"改写为**运行期审计**；**未完成项见 §13 的 1.5.0 行**；v1.3.1 补 §4.7 规则 5c2 与 §7.6.1 的 `error.type`；v1.3.2 登记 `app/api/queries.py` 的只读边界与 §7.5 数据源；**v1.4.0 合并此前未登记的两批增量**——原拟 1.3.3 的 **§7.6.2 脱敏两层与「必须测通道」**（并入本版，不再单独计版本）+ 正文里**已存在但 §13 未登记**的 **SKU 维度与成本表**条文（§3.3 / §5.1 / §5.3.1 / §5.4 / §8.3.3 / §8.5 / §10.3 / §11 的 `v1.4.0` 标注自此有 §13 依据），并结清「正文标 1.4.0、版本行停在 1.3.x」的欠账；**纯增量**：不改既有签名（新增参数全部 keyword-only 带默认值）、不改表列、不改 JSON 键、不改错误码，见 §13）
 - 维护者：spec-lead（唯一有权修改本文件的人）
 - 适用方：agent-core / platform / frontend 三方**并行开发**
 - 冻结规则：本文件中的**路径、名称、签名、字段名、枚举值、JSON 键、错误码**均为契约正文。任何一方需要偏离，必须先提给 spec-lead 改本文件并升版本，**不得**在自己代码里"先这么写"。
@@ -1893,6 +1893,7 @@ Query：
 - 数据来源：JSONL 日志汇（`settings.observability.log_file`，默认 `data/logs/app.jsonl`）。行结构就是上面 `items[]` 的元素（`seq` 由写入端分配）。
 - 排序：`seq DESC`。`next_cursor` 为最后一条 `seq` 的字符串形式，无更多则 `null`。
 - 日志汇是**启动时**从文件末尾续上 `seq`（读取最后一行 `seq` +1）；文件不存在则从 1 开始。
+- `event` 是**自由字符串**，不是封闭枚举：服务端只做**前缀**过滤、**不校验**枚举值（未知事件名照样原样返回）。已登记的形状只有两类：`node.trace` 见 §7.6.1，业务审计事件见 §7.6.3。
 - 脱敏是**两层**（v1.3.3；v1.5.0 键名层补 `password`）：`data` 里的敏感**键名**（`app_secret`/`access_token`/`sign`/`authorization`/`cookie`/`password`，大小写不敏感）整个值替换为 `"***"`，**且** `message` 与 `data` 里的**自由文本**还要做值级 scrub（`access_token=xxx` 这类）——只做键名层时 `message` 完全不受保护，而上游错误原文恰好写在那里。完整语义、已知边界与测试要求见 **§7.6.2**。
 
 #### 7.6.1 节点级 trace 的事件形状（`event="node.trace"`，冻结 v1.2.0）
@@ -2025,6 +2026,128 @@ HITL 挂起（`outcome="interrupted"`，**这是正常控制流，不是故障**
 1. 脱敏的验收**必须包含通道级断言**：调用真实的 `JsonlLogSink.write(event, message=…, data=…)`，**读回落盘文件**断言明文串不出现（`SECRET not in sink.path.read_text()`）。只测 `redact()` / `redact_any()` **不算验收**——把 `write()` 里那行 `_scrub_text` 删掉，函数级用例仍然全绿，这正是本事故的同一个失效模式（测被调函数，不测通道）。
 2. **反向验证必须真做**（改完就跑，不是写在文档里）：删掉 `write()` 里对 `message` 的 `_scrub_text(...)` → `test_sink_write_scrubs_message` 必须变红；把 `data` 的 `redact_any(...)` 换成原样透传 → `test_sink_write_scrubs_data_values` / `test_sink_write_scrubs_dict_key` 必须变红。**一条"删掉实现仍然全绿"的测试等于没有测试。**
 3. 两份文件都要在（命令见 §10.3）：`backend/tests/platform/test_platform_redaction_channel.py`（通道级）与 `backend/tests/platform/test_platform_redaction_scrub.py`（函数级对抗：复合键、`Bearer` 整段吞、JSON 合法性、误伤回归）。
+
+#### 7.6.3 审计事件（JSONL，v1.5.1 新增登记）
+
+**为什么有这一节（根因，不是措辞补充）**：`backend/app/agent/nodes.py` 的 `_log_audit(...)` 已经在往同一个 JSONL 汇写 6 个事件名、7 个调用点，而 §7.6 只登记过 `node.trace`——也就是说**代码长期在发一种契约里没有位置的事件形状**。这正是本项目反复出事的同一个模式（`adapters.py`、`queries.py` 都是"树里没有的文件自己长出来"：没有位置的东西不会被审查，坏了也没人知道它坏了）。本节把这些形状按**代码实际字段**登记下来；它不是新发明的形状，而是把已经在生产路径上写出的形状补记为契约。
+
+**与 `node.trace` 的分工（硬边界）**
+
+| | `node.trace`（§7.6.1） | 审计事件（本节） |
+|---|---|---|
+| 回答的问题 | 这个节点**执行**了吗、多久、成功/挂起/失败 | 业务上**发生了什么事实**：指标算完 / 发现异常 / 成本对不上 / 行被拒 |
+| 写入者 | 只有 `app/agent/tracing.py` 的 `traced()` | 只有 `app/agent/nodes.py` 的 `_log_audit(...)`（内部调 `JsonlLogSink.write`） |
+| `data` 键集合 | **冻结 5 键**（`outcome`/`duration_ms`/`input_digest`/`output_digest`/`error`） | 每个事件名各自一套（见下表）；**不带** `outcome`/`duration_ms`/`*_digest` |
+| 条数 | 每个节点**每次实际执行**恰好一条 | 按事实发生：可能 0 条，也可能一轮多条（`anomaly.detected` 的 detail 行） |
+| 到达 | 同一个 JSONL 汇、同一个 `/api/logs` | 同左 |
+
+- 两类事件**同处 `/api/logs` 的同一个响应**，靠 `event` 名区分（`node.trace` vs 本节的点分名）。`/api/logs?event=` 是**前缀**匹配，所以 `event=anomaly.` 一次拿到 summary + detail，`event=collect.` 拿到采集层全部。
+- **`node.trace` 的键集合没有被本节改动**：`tracing.py` 写入的 `data` 仍然恰好是那 5 个键，`nodes.py` 不写 `node.trace`。审计事件是**新增的行**，不是往 `node.trace` 里加键。因此 §4.7 的不变量「`count(event=="node.trace") == agent_traces.step_count`」照旧只看 `node.trace`，审计事件再多也不影响它。
+- 顶层键仍是 §7.6 的 10 个；`node` 由 `_log_audit` 填成节点名（`collect` / `compute_metrics` / `detect_anomalies`），`run_id` / `trace_id` / `shop_id` 取自 state（可为 `null`）。
+
+**事件表（按代码实际字段填；v1.5.1）**
+
+| `event` | `level` | 触发条件（代码判据） | `data` 键 | 消费者 |
+|---|---|---|---|---|
+| `metrics.computed` | `info`（恒） | `compute_metrics` 成功算出当日指标（每轮 1 条；run 已被判死时不写） | `date`（业务日 `YYYY-MM-DD`）、`gmv_cents`、`history_days`（含今天，最多 8）、`gmv_7d_avg_cents`（可为 `null`）、`gross_margin`、`cost_coverage_ratio`（后两个 `float` 或 `null`，**绝不填 0**） | 运营："这天算出了什么"；`loss_making` 的唯一解释入口（`gross_margin` 是 `null` 还是 `0.0` 决定它该不该响）；qa；demo 导出 |
+| `anomaly.detected`（`kind="summary"`） | `info`（恒） | `detect_anomalies` 跑完（每轮 1 条，**0 命中也有**） | `kind="summary"`、`count`、`rule_ids`、`skipped`、`dropped` | 汇总："今天命中几条、跳过几条、截断几条" |
+| `anomaly.detected`（`kind="detail"`） | 由 `severity` 派生：`critical`→`error`、`warn`→`warn`、`info`→`info` | 每条命中异常 1 条（截断后最多 `agent.max_anomalies` 条） | `kind="detail"`、`anomaly_id`、`rule_id`、`metric`、`observed`、`threshold`、`comparator`、`severity`、`window`、`detected_at` | 告警流与排障：alert-only 规则（如 `loss_making`）在人类入口上的**唯一**可见通道（§8.3 的已知缺口） |
+| `collect.units_degraded` | `warn` | 有订单行**件数缺失/非正**（且该行最终被接受，已支付 + 有 `sku_id` + 成交额 > 0），按 1 件计 | `kind="units"`、`count`、`reasons`、`sample_limit`、`samples_truncated`、`samples` | 排障："这次为什么漏报亏本"（方向**偏乐观**，§5.3 有算例） |
+| `collect.zero_revenue_paid` | `warn` | 有**已支付 + 有 `sku_id` + 成交额 ≤ 0** 的订单行（不进成本口径，但仍进 GMV/订单数） | `kind="zero_revenue_paid"`、`count`、`reasons`、`sample_limit`、`samples_truncated`、`samples` | 同上；`samples[].unit_cost_cents` 用来估"漏了多少成本" |
+| `collect.row_rejected` | `warn` | 有订单行**整行被拒**（字段类型/负数金额/件数非 int/`sku_id` 形状错/元素不是对象），且**不是**"全行被拒"那一档（见下表） | `kind="row_rejected"`、`count`、`reasons`、`sample_limit`、`samples_truncated`、`samples`、`excluded_from_metrics`（恒 `true`） | 归因"GMV 为什么少一截"；qa 钉住"整行不进任何指标" |
+| `sku_costs.unmatched` | `warn` | 本次**商品列表非空**且成本表里有 `sku_id` 不在商品列表中（商品列表为空时**不报**：那会是一串假警报） | `sku_ids`（升序去重）、`count` | 成本配置漂移告警（§8.5）：只记不阻断 |
+
+补充规则（每条都是代码事实，不是建议）：
+
+- **`metrics.computed` 的 `data` 里没有 `computed_at`**：业务日看 `data.date`，写入时刻看行级 `ts`（sink 的写入时间）。不要用 `ts` 反推"指标是哪一刻算的"并当成契约值。
+- **`reasons` 恒出现**，但 `zero_revenue_paid` 的样本里**没有** `reason` 字段（样本形状见下），所以该事件的 `reasons` **恒为 `{"unknown": count}`**。**不要**拿它做分类——这一档没有分类可言（每行都是"已支付但成交额为 0"）。
+- **`anomaly.detected` 的 summary `skipped` 只有规则 id**：跳过原因不进 JSONL，只在 `state.audit` 的 `errors[].message` 里（`规则 <id> 求值失败已跳过：<reason>`）。要展示原因，请另开出口，不要指望 JSONL 有它。
+- **`rule_ids` 是截断后真正产出的异常**（长度 == `count`），`dropped` 才是被 `agent.max_anomalies` 丢掉的条数。
+- detail 的 `message` 是人读文案（`<rule.description>（<metric>=<observed>，条件 <comparator>）`）；**机器读取一律用 `data`**。
+
+**`anomaly.detected` 的两种形态（按 `kind` 分支，不许靠"有没有 `rule_id`"猜）**
+
+| 形态 | 必有的键 | **不会**出现的键 |
+|---|---|---|
+| `kind="summary"` | `kind`、`count`、`rule_ids`、`skipped`、`dropped` | `rule_id`、`observed`、`threshold`、`metric`、`anomaly_id`、`severity` |
+| `kind="detail"` | `kind`、`rule_id`、`observed`、`threshold`、`metric`、`anomaly_id`、`severity`、`comparator`、`window`、`detected_at` | `count`、`rule_ids`、`skipped`、`dropped` |
+
+- 消费方**必须按 `data.kind` 分支**（`/api/logs` 的消费方、前端、qa、导出脚本一视同仁）。**禁止**用"`data` 里有没有 `rule_id`"区分——那是 v1.5.2 之前的临时做法：明细没有 `count`、汇总没有 `rule_id`，靠 `.get()` 兜底只会把汇总行静默当明细（或反之），而且**一改代码就悄悄错**。
+- 缺 `kind` 的同名事件行（例如只写了 `anomaly_ids` 的旧夹具）**不是本节定义的形状**：不得按 summary 硬读，按"未知形状"原样显示或跳过。
+- `observed` / `threshold` 可为 `null`（规则求值时该指标缺失）；`window ∈ {"day", "7d"}`；`comparator` 是规则 `when` 的**来源表达式原文**（如 `"gmv_cents < gmv_7d_avg_cents * 0.7"`），不是算子枚举，**不许**拿它做 `==`/`<` 之类的语义解析。
+
+**行级契约（v1.5.1：一行脏不许打死一轮，也不许静默少算）**
+
+判定表（判据、结果、JSONL 可见性三列必须一起读）：
+
+| 情形 | 代码判据 | 结果 | 这一档在 JSONL 上的样子 |
+|---|---|---|---|
+| 一行解析失败（字段类型错 / 负数金额 / 件数非 int / `sku_id` 形状错 / 元素不是对象） | `_read_order_row` 抛 `_RowRejected`（未分级的 `ValueError` → `reason="unclassified"`） | **整行拒绝**：该行**不进入任何指标**（GMV / 订单数 / `by_sku` / 退款一律不进），其余行照常算；`source.partial=true` | `collect.row_rejected`（warn，`count` + `reasons` + ≤5 条样本） |
+| 能猜出含义的脏值（件数缺失/非正；已支付但成交额 ≤ 0） | `_order_units` / `_aggregate_orders` 的**有界降级** | **有界降级**：件数按 1 件；0 元单不进成本口径（但进 GMV / 订单数）；`source.partial=true` | `collect.units_degraded` / `collect.zero_revenue_paid`（warn） |
+| **整批契约坏**（`data` 不是映射或列表、订单列表字段不是 list、一个已知列表字段都没有、`summary.uv` 形状不对） | `_BatchContractError` | **硬失败**：记一条 `errors` + `status=failed`，走 §4.2 的 `collect --(fail)--> finalize`；**不抛到 API（不出 500）**；**绝不降级成 0 单 0 元** | **没有** `collect.*` 事件；只有该节点的 `node.trace`：`outcome="error"`、`error.type="NodeDeclaredFailure"`（§4.7 规则 5c2） |
+| **全行被拒**：`rows_seen > 0 且 rows_accepted == 0`（全部被拒 / 全部不是对象 / 全部落在业务窗口外） | `_AllRowsRejected`（`_BatchContractError` 的子类） | **视同整批失败**：与上一档**同一条**路径（`failed` → `finalize`，不 500） | 同上：**没有** `collect.row_rejected`（该分支在写降级事件之前就 return 了），只有 `node.trace` 的 `error` |
+| **零行**（订单列表真的是空的，"今天没卖东西"） | `rows_seen == 0` | **正常成功**：指标为 0，继续走规则/审批/执行 | `metrics.computed`（`gmv_cents=0`）+ 各节点 `node.trace`；`collect.*` 一条都不出 |
+
+- **顺序也是契约**：窗口判定**先于**金额解析——窗口外的行既不算脏、也不进指标（`rows_seen` 计入、`rows_accepted` 不计入），把它算成"脏行"只会让拒绝计数虚高。
+- **行级拒绝必须原子**：先校验成值、再累加到桶里。不存在"订单数 +1 了但金额没加"的半行（旧实现就是这样留下半行并最终 500）。
+- **拒绝率只进 state.audit**：`rows_seen`（上游给的元素个数，含非对象元素与窗口外的行）与 `rows_accepted`（真正进入指标的行数）在 `state.audit` 的 `collect.done` / `collect.failed` 里，**不在 JSONL**（见本节末）。所以"0 单 0 元"与"一行都没解析出来"在 JSONL 上要靠 `node.trace` 的 `outcome` 区分，而不是靠这两个数——除非将来把它们登记进 JSONL（先改本节、再改代码，同一份提交）。
+
+**`samples` 的截断语义（`count` 是全量）**
+
+- `count` 是**全量**条数；`samples` 最多前 `sample_limit`（当前 **5**）条；`samples_truncated` 说明后面还有没贴出来的。
+- **`count` 的口径边界（v1.5.1 明确）**：`rows_seen` / `count` 是**本次采集看到的行数**，而采集目前只取第一页（`page=0, size=100`）。所以"全行被拒 → failed"这条判据是**页级**的：第一页 100 行全坏、而后面还有好行时，这一轮会 failed。这是刻意的（宁可让人知道第一批就不可用，也不要静默少算 150 行），但**不许**把 `rows_seen` 说成"当天订单总数"。
+
+- **禁止**把 `samples` 的长度当成规模（"看到 5 条样本" ≠ "只有 5 行被拒"）。判断规模只许用 `count`；读样本必须同时读 `sample_limit` 与 `samples_truncated`，**不许**假定 5 这个魔法数（它会变）。
+- `message` 里那句"仅前 N 条样本（其余已截断）"只是给 grep/人看的一致性文案，**不是**第二份事实源。
+- 样本 schema（逐键，三种事件各一套）：
+
+| 事件 | `samples[]` 的键 |
+|---|---|
+| `collect.units_degraded` | `order_id`（`str` 或 `null`）、`where`（`"order[i]"`）、`keys`（候选件数字段清单）、`key`（命中字段，`missing` 时为 `null`）、`value`（非法值，`missing` 时为 `null`）、`reason`（`"missing"` / `"non_positive"`） |
+| `collect.zero_revenue_paid` | `order_id`、`where`、`sku_id`、`units`（`int` 或 `null`，尽力值）、`unit_cost_cents`（`int` 或 `null`，成本表读不到就 `null`） |
+| `collect.row_rejected` | `order_id`（`str` 或 `null`）、`where`、`reason`（`bad_create_time` / `bad_pay_amount` / `bad_units` / `bad_refund_amount` / `bad_sku_id` / `not_an_object` / `unclassified`）、`error`（原始异常原文，含字段路径） |
+
+**`source.partial`（`raw.source.partial`）**
+
+- 语义是**"这份指标不完整"**，**不是**"出错了"。任一降级/拒绝（`units_degraded` / `zero_revenue_paid` / `row_rejected`）、任一非重试的采集失败（店铺信息 / 商品列表 / 订单列表）、整批契约坏，都必须置 `true`。
+- 反向**不成立**：`partial=false` 不等于"数据没问题"——窗口外的行不置位，本表没覆盖的上游语义变化也不置位。
+- **已知的设计债（v1.5.1，不许读成"已经好了"）**：这一个 bool 目前同时承载三种后果——①整块数据缺失（店铺/商品/订单调用失败）、②某行被降级（缺件数按 1 件）、③某行被拒。三者的处置完全不同，但压成了一个字段。后果不是当前 bug 而是**未来的陷阱**：一旦有规则开始用 `partial` 判断"数据够不够算指标"，对那些不返回 `product_count` 的店，它会**恒为 true**，等于永远"数据不够"。要拆就拆成 `missing_blocks` / `degraded_rows` / `rejected_rows` 三个维度，且必须先改本节再改代码。
+- 现状：它只在 checkpoint 的 `raw` 快照里（`collect.done` 的 `partial` 键是 `state.audit` 里的副本），**没有任何 REST 响应或 JSONL 事件暴露它**。登记它是为了统一口径；**不许**把它说成"运营已经能看到"。
+
+**脱敏（与 `node.trace` 同一条通道，同两层）**
+
+- 这些事件走**同一个** sink：`JsonlLogSink.write` 落盘前对 `message` 做值级 scrub、对 `data` 走 `redact_any`（键名层 + 值级层，§7.6.2）。
+- 因此 `data` 里出现 `password` / `access_token` / `sign` / `authorization` / `cookie` 这类**键名**时，整个值被遮成 `"***"`；`message`、`samples[].error` 这类**自由文本**里的 `access_token=…`、`password=…` 也按值级层遮。
+- 审计事件**不得**自建 logger 或绕过 sink（`_log_audit` 存在的理由之一就是复用这两层，而不是 new 一个 logger）。
+- 写盘失败是**旁路失败**：`_log_audit` 接住异常并打一条 stdlib `logging` warning（带 `event` 名与异常类型，缺陷因此仍可见），业务结论不受影响；`state.audit` 那一份仍随节点返回值进 checkpoint，**不会**因为日志写不进去而丢。
+
+**`trace.reconcile`（已登记，归属 §4.7）**
+
+这是本节之外唯一一个**已经进 JSONL** 的旁路事件，之前一直没登记（审查发现）：`tracing.py` 在启动对账（`reconcile_step_count`）改动 `step_count` 时会写一条，`level="warn"`，`data` 形如 `{log_count, before, after}`。
+
+- 它**不是**审计事件，而是 §4.7 那条"`count(node.trace) == step_count`"不变量的**校准留痕**：出现它就说明进程重启后对账发现了两边不一致。
+- 消费者看到它应当理解为"有一次自动校准"，而不是"有业务异常"。**看到它就该去查为什么日志行数与 `step_count` 曾经不一致**（常见原因：日志文件被手工截断、或某次写入部分失败）。
+- 它的字段定义以 `tracing.py` 为准，本节不重复；改它的形状必须同时改 §4.7 与本节。
+
+**`collect.done` / `collect.failed`（v1.5.1 起进 JSONL，已登记）**
+
+这两个是采集层的**结果**事件，`v1.5.1` 之前只进 `state.audit`，于是"整批契约坏 / 全行被拒"在 `/api/logs` 上只剩一句 `node.trace` 的 `outcome=error`——**和"上游 503"长得一模一样**，运营分不出"这批数据不能用"和"接口挂了"。现在两者都走 sink：
+
+| 事件 | level | 关键 `data` |
+|---|---|---|
+| `collect.done` | `info` | `window`/`source`/`products`/`methods`/`rows_seen`/`rows_accepted`/`rows_rejected`/`partial` |
+| `collect.failed` | `error` | 同上 + `reason` + `reject_reasons` + `row_reject_samples`(≤5) + `row_reject_samples_truncated` |
+
+`collect.failed.data.reason` 是**三档互斥**的枚举，消费者按它分流，不许靠 `message` 文本猜：
+- `batch_contract` —— 整批结构坏（不是 dict / 缺订单列表字段 / `summary` 形状不对），一行都没读到；
+- `all_rows_rejected` —— 行都在，但一行都没通过校验（`rows_accepted == 0` 且 `rows_seen > 0`）；
+- `orders_unavailable` —— 订单接口根本没取到数（网络/鉴权/业务错误），**不是数据坏**。缺这一档就会把"接口挂了"写成"数据坏"。
+
+**本节未登记的事件（故意的，不是漏了）**
+
+`nodes.py` 仍在往 `state.audit` 写这些事件，但它们**不进** JSONL，所以不在上表：`action.proposed`、`approval.decided`、`action.executed`、`effect.registered`、`run.finished`。判据是"**有没有别的人类出口**"（`nodes.py` 模块 docstring 的原话）：它们分别有表级出口（`approval_request` / `action_log` / `effect_snapshot` / `agent_traces`）或已有 `node.trace`，再抄一份进 JSONL 只会让日志翻倍而不增加可查性。把 `event=approval.decided` 写进本节，会制造一个 `/api/logs?event=approval.decided` **永远查不到**的空承诺——这正是本项目反复返工的那类"文档声称的属性在代码里不成立"。要让它们进 JSONL，**先改本节、再改代码**，同一份提交。
+
+反过来也要防一手：`frontend/mock/logs.json` 与 `frontend/src/mock/mockServer.ts` 里的 `collect.started` / `approval.requested` 在 `backend/app` 里**没有生产者**——它们是 mock 自造的事件名，不是"未登记的审计事件"，**不许**照它们反推实现。
 
 ### 7.7 `GET /api/healthz`（非契约必需，但三方都要用）
 
@@ -2192,7 +2315,7 @@ rules:
 
 **`loss_making` 为什么没有 `actions`（v1.5.0，ADR-021）**：`gross_margin` 是**店铺级加权**指标，它**指不出具体是哪件货在亏**。现有三种动作类型（`price_update` / `stock_update` / `coupon_create`）都要求一个**确定的 `target`**，而店铺级异常只能靠 `target_from` 去挑（`top_gmv_sku` / `lowest_stock_sku`）——那是**猜**。猜错的代价不对称：给"GMV 最高"的好货降价或下架，等于用一次误报去伤害店里最赚钱的商品，且**不可回滚**（价格改了、库存清零了，已经成交的订单收不回来）。所以本规则**只告警、不动手**（`actions` 缺省 = 只报警不动手，见上表）。等 §5.3.1 的 SKU 级 `skus` 落地后，这条规则应改为 **SKU 级**并对亏损 SKU 出 `price_update`（**提价**，不是降价）或停售——那时目标不再需要猜。
 
-**已知缺口（必须登记，不许读成"运营已经能看到"）**：alert-only 的异常（命中了无 `actions` 规则的 `Anomaly`）**不出现在 `/api/alerts`**——该端点读的是 `approval_request` 表，只有**产生了审批行**的异常才可见（§7.3）。因此运营**从审批台看不到** `loss_making`。当前唯一可见通道是 `/api/logs`：`anomaly.detected`（含 `rule_ids`）与 `metrics.computed`（含 `gross_margin` / `cost_coverage_ratio`）。**需要一个独立的告警出口**（把 `Anomaly` 直接暴露成可读告警流），那属于**设计债**，不是本次实现——见 §13 的 1.5.0 未完成项。
+**已知缺口（必须登记，不许读成"运营已经能看到"）**：alert-only 的异常（命中了无 `actions` 规则的 `Anomaly`）**不出现在 `/api/alerts`**——该端点读的是 `approval_request` 表，只有**产生了审批行**的异常才可见（§7.3）。因此运营**从审批台看不到** `loss_making`。当前唯一可见通道是 `/api/logs`：`anomaly.detected`（summary 含 `rule_ids`；每条命中异常另有 `kind="detail"` 的明细行，带 `observed` / `threshold` / `severity`，形状见 §7.6.3）与 `metrics.computed`（含 `gross_margin` / `cost_coverage_ratio`）。**需要一个独立的告警出口**（把 `Anomaly` 直接暴露成可读告警流），那属于**设计债**，不是本次实现——见 §13 的 1.5.0 未完成项。
 
 #### 8.3.1 文法（EBNF，冻死）
 
@@ -2697,7 +2820,15 @@ export interface LogsResponse {
 | 1.3.2 | 2026-10-24 | ①**§0.1 登记 `app/api/queries.py`**（归属 API 层 / platform）并冻结边界：**只读**（仅 `SELECT`）、禁 `INSERT/UPDATE/DELETE`、禁触达 `step_count`、禁绕过 `tracing.py` 的仓储写 run 摘要、禁业务判断；登记理由是两条**冻结签名覆盖不到的读路径**（§5.8 的 `list_by_status` 不含行 `id` ↔ §7.3 的 `next_cursor`；§4.7 的 run 仓储只按 `(shop_id, run_id)` 取单行 ↔ §7.5 的 `/api/metrics` 需要 run 枚举）；②**§5.8 / §7.3** 补读路径说明：列表/游标允许经 `queries.py` 做 keyset 分页（`created_at DESC, id DESC` + `id < before_id`），**写路径不变**；③**§7.5** 补数据源说明：数据源是 checkpoint state（契约没有指标表），缺数据 `404`、**不补零**；④**§5.3** 补 `uv` 的来源与作用域判据（**公式未改**）：`collect` 只在能确认"这段汇总就是当天"时写 `order_summary["uv"]`，否则 `None`（不摊派、不补零），`uv` 有值但非非负整数 → `ValueError` | 全部（agent-core：`nodes.py` 的 `collect` 写 `order_summary.uv`；platform：`queries.py` 的只读边界 + `/api/metrics` 的 checkpoint 数据源；qa：`test_collect_uv.py` 钉住"有 uv / 无 uv / 作用域不明 / 声明作用域 / 非法值"五条边界；frontend：**无需改动**，`uv`/`cvr` 仍可为 `null`；reviewer：新增 `queries.py` 的两条 grep 可查项） |
 | 1.3.3 | 2026-10-24 | **（已并入 1.4.0：本行保留作留痕，内容不删不改，不再单独计版本；当前版本见本表末行 1.4.0）** ①**新增 §7.6.2「脱敏的两层与边界」**：**键名层**（`redact_keys` 命中的 dict 键名，整个值递归替换为 `"***"`）与**值级层**（自由文本里 `key=value` / `key: value` / `"key":"value"` 的**值**替换，键集 = `DEFAULT_SCRUB_KEYS` ∪ `redact_keys`）**在同一次递归里完成**，统一入口 `redact_any`（`redact` 降为**兼容别名**）；写明"两层为什么都要"（键名层对 `str` 是 no-op，而消息原文恰好写在 `message` 里）、两种分隔符与五种值形态、`_`/`-` 互通、`:` 形态裸值的上界、**已知不覆盖 5 条**、`stderr` 经 `_ScrubbingFormatter` 先 format 再 scrub；②**§10.3 新增通道级测试要求**（`test_platform_redaction_channel.py`，含**反向验证**：删掉 `write()` 里的 scrub 后必须变红）；③§7.6 原有的脱敏条目**补全**（补 `cookie`、补"值级层也要"、加 §7.6.2 指针）；④DECISIONS 新增 **ADR-020**（脱敏必须两层，且必须测通道），记 5 条被否方案并在附 A 补 4 行 | platform（`observability/logging.py`：两层同调、`write()` 对 `message`/`data` 走统一入口、`stderr` 走 `_ScrubbingFormatter`）；qa（通道级 + 反向验证两份用例）；agent-core 与 frontend：**无需改动**——JSONL 顶层键、`/api/logs` 响应形状、§12 的 `LogItem` 一字未动；reviewer：新增"声称已脱敏"的可查项（每一处都要能指到 §7.6.2 的某一层或某条已知不覆盖） |
 | 1.4.0 | 2026-10-24 | **合并此前未登记的两批增量**：原拟 **1.3.3** 的「§7.6.2 脱敏的两层与边界 + 必须测通道」并入本版（不再单独计版本），以及正文里**早已存在、§13 却从未登记**的「SKU 维度 + 成本表」条文（§0.2 / §1.1 / §3.3 / §4.1 / §5.1 / §5.3.1 / §5.4 / §8.3.3 / §8.5 / §10.3 / §11 的 `v1.4.0` 标注自此有 §13 依据）；同时结清"正文标 `v1.4.0`、§13 无 1.4.0 行、版本行停在 1.3.x"的欠账。**纯增量：不改既有签名（新增参数全部 keyword-only 带默认值）、不改表列、不改 JSON 键、不改错误码、不改路由。** **① 已落地（契约正文与代码同时成立，可按下面的锚点复核）**：(a) **§7.6.2「脱敏的两层与边界」**（:1936-1976）有正文；代码侧 `backend/app/observability/logging.py` 有统一入口 `redact_any`（21 处引用）、`DEFAULT_REDACT_KEYS`（5 键，含 `cookie`）与 `DEFAULT_SCRUB_KEYS`（6 处引用），两份用例齐备——`backend/tests/platform/test_platform_redaction_channel.py`（通道级：调真实 `JsonlLogSink.write` 后**读回落盘文件**断言明文不出现）与 `test_platform_redaction_scrub.py`（函数级对抗）。(b) **§5.3 的 `uv` 来源与作用域判据**（:1194；**归属 §5.3，不是 §5.3.1**）有正文；代码侧 `backend/app/agent/nodes.py` 的 `_summary_uv` / `_declared_uv_scope` / `_day_uv` 落地了"判不出作用域就写 `None`（不摊派、不补零）、有值但非非负整数抛 `ValueError`"，`backend/tests/agent_core/test_collect_uv.py` 在。(c) **`app/api/queries.py` 的只读边界登记**（§0.1 目录树 :80、边界与可检查形态 :140-153）有正文；文件存在，两条 grep 实测均为 **0**（无 `.add(`/`.delete(`/`.flush(`/`.commit(`；无 `step_count` 赋值或自增）。(d) **`DoudianClient` 的 `redact_keys` keyword-only 参数**（§5.1 签名 :1015、语义与理由 :1056-1067）有正文；代码侧 `doudian_client.py` 的 `__init__` 已收该参数（:357），`create_doudian_client` 显式传 `settings.observability.redact_keys`（:842）。(e) **补正一处漏改**：§5.1 的 `DEFAULT_REDACT_KEYS` 逐字块补上 `cookie`（原块只有 4 键，而 §7.6.2 的键名层、`backend/config/settings.yaml` 与代码一直是 5 键——1.3.3 补 §7.6 时漏了这一个块）。**② 已入册、代码未实现（不得读作"已落地"）**：(f) **`total_budget_s`**（§5.1 签名 :1014、语义 :1056）**正文有、代码无**：`grep -rn "total_budget_s" backend/` 为 0，`DoudianClient.__init__` 目前只落了 `redact_keys` 一个 v1.4.0 参数。(g) **SKU 级成本归属与毛利率未实现**：`grep -rn "gross_margin" backend/` 为 **0**，`grep -rn "cost" backend/`（`*.py`+`*.yaml`，排除 `__pycache__`）为 **0**，`SkuSnapshot` 为 **0**；`backend/config/sku_costs.yaml` 不存在，`backend/tests` 里没有 `test_sku_metrics.py` / `test_sku_anomalies.py`。因此下面这些**只有契约条文**：`SkuSnapshot`（§3.3 :377-382，含 `gross_margin` / `cost_cents`）、`MetricsSnapshot.skus`（§3.3 :373）、`Anomaly.sku_id`（§3.3 :402；代码 `backend/app/agent/state.py` 的 `Anomaly` 至今没有这个键）、`compute_metrics(..., cost_table=…)`（§5.3.1 :1171 起）、§5.4 的**两轮求值**（:1241 起）、§8.3.3 的 SKU 名字集合（:2196-2207）、§8.5 的 `config/sku_costs.yaml`（:2241 起）。(h) 因此 **`loss_making` 规则不存在**——正文与代码都没有：`grep -rn "loss_making" backend/` 为 0，`backend/config/rules.yaml` 里没有该规则。README 的「已知限制」第 4 条有对应说明（`README.md:277-279`，其中"SKU 级成本归属未实现"一句与本节一致）；但该条同时把成本口径写成"店铺级加权"、称需自维护 `config/sku_costs.yaml`，而仓库里**该文件与该口径的实现同样不存在**——本行只按 grep 事实登记，**README 不在本次可改文件范围**（`docs/` 外），留给下一轮单独修。 | 全部（**platform**：脱敏两层、`write()` 对 `message`/`data` 走统一入口、`stderr` 走 `_ScrubbingFormatter` 均已落地；**agent-core**：`uv` 作用域判据已落地，但 §3.3 / §5.1 `total_budget_s` / §5.3.1 / §5.4 / §8.3.3 / §8.5 的 SKU 与成本条目是**待实现项**，不是既有能力；**frontend**：**无需改动**——§12 净改动为零、`/api/metrics` 仍店铺级；**qa**：脱敏两份用例已登记，`test_sku_metrics.py` / `test_sku_anomalies.py` 随 SKU 条目一并待实现；**reviewer**：新增可查项——正文里每一处 `v1.4.0` 标注都要能在本行找到落点，且"已入册未实现"不得被读成"已实现"） |
-| 1.5.0 | 2026-10-24 | **成本/毛利率落地（纯增量）**：把 v1.4.0 里"已入册、代码未实现"的**成本表 + 店铺级毛利率**真正实现，并把三处"写不出来 / 做不到 / 会误伤"的条文改成可执行形态。**① 已落地**：(a) **§3.3 `MetricsSnapshot` 新增 `gross_margin` / `cost_coverage_ratio`**（`float` 或 `None`，**店铺级**口径）；(b) **§5.3 `compute_metrics(..., cost_table=…)` 由"已入册未实现"转为已实现**，补两条公式（只对有成本 SKU 加权；覆盖率 = 有成本成交额 / 全店 GMV；分母 0 → `None`；**覆盖率不裁剪**，`> 1` 用于暴露上游汇总与明细对不上）+ 6 条数据形状错误的 `ValueError` 边界；(c) **新增数据面 `order_summary["by_sku"] = {sku_id: {gmv_cents: int, units: int}}`**：只统计**已支付**订单行、无 `sku_id` 的已支付行只进 GMV 分母（计为未覆盖）、**退款单仍计入**、件数缺失按 1 件（**偏乐观**：成本被少算 → 毛利率偏高 → 只会**漏报**亏损，不会误报；算例见 §5.3 边界表）、件数非 int / 负数 → `ValueError`；(d) **§8.3.3 `ALLOWED_NAMES` 新增 `gross_margin` / `cost_coverage_ratio`（店铺级）**，店铺级名字 13→15（12 个指标名 + 3 个派生量，并更正原文"12+3=15"的计数错误）、SKU 轮命名空间 23→25 键；(e) **§8.3 `rules.yaml` 新增 `loss_making`**：`severity=critical`、`metric=gross_margin`、条件含 `cost_coverage_ratio >= 0.6`、**无 `actions`（只告警）**；(f) **§8.5 补实现细节**：顶层 `version` / `effective_from` / `costs`、值 `int > 0`、键 `^[A-Za-z0-9_-]{1,64}$`、**重复键 → `ConfigError`**（PyYAML 默认静默取后者，加载器自检）、空值 / 0 / 负数 / float / 字符串 / bool → `ConfigError`、非 UTF-8 → `ConfigError`、**文件缺失 → 记 warn、视为空表**；(g) **§7.5 `MetricPoint` 新增两个可选字段**（默认 `null`，老 checkpoint 无这两个键仍通过校验）。**② 三条裁定（ADR-021）**：(h) **命名冲突**——`gross_margin` 被**店铺级**占用，而 §8.3.3 的 SKU 名字集合里原本也写着它，现冻结硬规则：**SKU 轮次落地时 SKU 侧必须命名 `sku_gross_margin`**，两集合互斥断言触发时必须报**明确错误**并指向本条，**不允许静默失败**；(i) **`loss_making` 无 `actions` 的取舍**——店铺级加权毛利率**指不出具体 SKU**，现有动作类型都要求确定 `target`，用"GMV 最高 SKU"去猜会给好货降价 / 下架，所以**只告警不给动作**；(j) **§8.5 的"启动期校验成本键能在 `raw.products` 里对上"物理上做不到**（启动期没有 `raw`），改写为**运行期在 `compute_metrics` 节点审计 `sku_costs.unmatched`**（只记不阻断；商品列表为空时不报）。**③ 未完成项（不得读作已完成）**：(k) **前端 TS 类型已同步（原"未同步"已结清）**——`frontend/src/api/types.ts` 的 `MetricPoint` 已加 `gross_margin?: number | null` / `cost_coverage_ratio?: number | null`，§12 的逐字块在同一次提交里改完（`verify.mjs` 的 §12 diff 绿）；看板的毛利率已改为**零计算读后端字段**，契约外字段 `cost_cents` 与那套 `(GMV−退款−成本)/(GMV−退款)` 公式**已删除**，并加了"只给 cost_cents 时必须算不出数"的反向断言锁死回潮；(l) **alert-only 的 anomaly 不出现在 `/api/alerts`**——该端点读 `approval_request` 表，只有**产生了审批行**的异常才可见，因此运营**从审批台看不到** `loss_making`，当前唯一可见通道是 `/api/logs` 的 `anomaly.detected`（含 `rule_ids`）与 `metrics.computed`（含两个成本字段）；**需要一个独立的告警出口，属于设计债，不是本次实现**。**代码锚点**：`backend/app/services/costs.py`（新）、`backend/config/sku_costs.yaml`（新）、`backend/app/services/metrics.py`、`backend/app/agent/state.py`、`backend/app/agent/nodes.py`、`backend/app/services/rules.py`、`backend/app/services/anomalies.py`、`backend/app/main.py`、`backend/app/schemas.py`、`backend/config/rules.yaml`、`backend/tests/platform/test_platform_gross_margin.py`（**34 用例全绿**）。 | 全部（agent-core：成本表加载器 + 毛利率 / 覆盖率公式 + `by_sku` 归集 + 未匹配审计；platform：lifespan 加载成本表、`MetricPoint` 两个默认 `null` 的字段；qa：`test_platform_gross_margin.py` 34 例；**frontend：无需改动**——§12 净改动为零，但**看板口径已对齐（`types.ts` + §12 逐字块 + 看板取值 + `verify-suite.ts` 断言同一次提交完成；基线 verify 的 27/28 红也已修，根因是 §12 正文内嵌围栏标记），属未完成项 (k)**；reviewer：新增可查项——正文里每一处 `v1.5.0` 标注都要能在本行找到落点，且"未完成项"不得被读成"已实现"） |
+| 1.5.0 | 2026-10-24 | **成本/毛利率落地（纯增量）**：把 v1.4.0 里"已入册、代码未实现"的**成本表 + 店铺级毛利率**真正实现，并把三处"写不出来 / 做不到 / 会误伤"的条文改成可执行形态。**① 已落地**：(a) **§3.3 `MetricsSnapshot` 新增 `gross_margin` / `cost_coverage_ratio`**（`float` 或 `None`，**店铺级**口径）；(b) **§5.3 `compute_metrics(..., cost_table=…)` 由"已入册未实现"转为已实现**，补两条公式（只对有成本 SKU 加权；覆盖率 = 有成本成交额 / 全店 GMV；分母 0 → `None`；**覆盖率不裁剪**，`> 1` 用于暴露上游汇总与明细对不上）+ 6 条数据形状错误的 `ValueError` 边界；(c) **新增数据面 `order_summary["by_sku"] = {sku_id: {gmv_cents: int, units: int}}`**：只统计**已支付**订单行、无 `sku_id` 的已支付行只进 GMV 分母（计为未覆盖）、**退款单仍计入**、件数缺失按 1 件（**偏乐观**：成本被少算 → 毛利率偏高 → 只会**漏报**亏损，不会误报；算例见 §5.3 边界表）、件数非 int / 负数 → `ValueError`；(d) **§8.3.3 `ALLOWED_NAMES` 新增 `gross_margin` / `cost_coverage_ratio`（店铺级）**，店铺级名字 13→15（12 个指标名 + 3 个派生量，并更正原文"12+3=15"的计数错误）、SKU 轮命名空间 23→25 键；(e) **§8.3 `rules.yaml` 新增 `loss_making`**：`severity=critical`、`metric=gross_margin`、条件含 `cost_coverage_ratio >= 0.6`、**无 `actions`（只告警）**；(f) **§8.5 补实现细节**：顶层 `version` / `effective_from` / `costs`、值 `int > 0`、键 `^[A-Za-z0-9_-]{1,64}$`、**重复键 → `ConfigError`**（PyYAML 默认静默取后者，加载器自检）、空值 / 0 / 负数 / float / 字符串 / bool → `ConfigError`、非 UTF-8 → `ConfigError`、**文件缺失 → 记 warn、视为空表**；(g) **§7.5 `MetricPoint` 新增两个可选字段**（默认 `null`，老 checkpoint 无这两个键仍通过校验）。**② 三条裁定（ADR-021）**：(h) **命名冲突**——`gross_margin` 被**店铺级**占用，而 §8.3.3 的 SKU 名字集合里原本也写着它，现冻结硬规则：**SKU 轮次落地时 SKU 侧必须命名 `sku_gross_margin`**，两集合互斥断言触发时必须报**明确错误**并指向本条，**不允许静默失败**；(i) **`loss_making` 无 `actions` 的取舍**——店铺级加权毛利率**指不出具体 SKU**，现有动作类型都要求确定 `target`，用"GMV 最高 SKU"去猜会给好货降价 / 下架，所以**只告警不给动作**；(j) **§8.5 的"启动期校验成本键能在 `raw.products` 里对上"物理上做不到**（启动期没有 `raw`），改写为**运行期在 `compute_metrics` 节点审计 `sku_costs.unmatched`**（只记不阻断；商品列表为空时不报）。**③ 完成情况（逐条按实际状态；"未完成"不得读作"已完成"，"已结清"也不许留在"未完成"里）**：(k) **已结清**（原列在"未完成项"里是归类错误，v1.5.1 更正）：**前端 TS 类型已同步（原"未同步"已结清）**——`frontend/src/api/types.ts` 的 `MetricPoint` 已加 `gross_margin?: number | null` / `cost_coverage_ratio?: number | null`，§12 的逐字块在同一次提交里改完（`verify.mjs` 的 §12 diff 绿）；看板的毛利率已改为**零计算读后端字段**，契约外字段 `cost_cents` 与那套 `(GMV−退款−成本)/(GMV−退款)` 公式**已删除**，并加了"只给 cost_cents 时必须算不出数"的反向断言锁死回潮；(l) **未完成（设计债）**：**alert-only 的 anomaly 不出现在 `/api/alerts`**——该端点读 `approval_request` 表，只有**产生了审批行**的异常才可见，因此运营**从审批台看不到** `loss_making`，当前唯一可见通道是 `/api/logs` 的 `anomaly.detected`（summary 含 `rule_ids`，**detail 行还带 `observed` / `threshold` / `severity`**，形状见 §7.6.3）与 `metrics.computed`（含两个成本字段）；**需要一个独立的告警出口，属于设计债，不是本次实现**。**代码锚点**：`backend/app/services/costs.py`（新）、`backend/config/sku_costs.yaml`（新）、`backend/app/services/metrics.py`、`backend/app/agent/state.py`、`backend/app/agent/nodes.py`、`backend/app/services/rules.py`、`backend/app/services/anomalies.py`、`backend/app/main.py`、`backend/app/schemas.py`、`backend/config/rules.yaml`、`backend/tests/platform/test_platform_gross_margin.py`（**34 用例全绿**）。 | 全部（agent-core：成本表加载器 + 毛利率 / 覆盖率公式 + `by_sku` 归集 + 未匹配审计；platform：lifespan 加载成本表、`MetricPoint` 两个默认 `null` 的字段；qa：`test_platform_gross_margin.py` 34 例；**frontend：无需改动**——§12 净改动为零，但**看板口径已对齐（`types.ts` + §12 逐字块 + 看板取值 + `verify-suite.ts` 断言同一次提交完成；基线 verify 的 27/28 红也已修，根因是 §12 正文内嵌围栏标记），**(k) 已结清**（v1.5.1 更正：原文把它列进"未完成项"是归类错误）**；reviewer：新增可查项——正文里每一处 `v1.5.0` 标注都要能在本行找到落点，且"未完成项"不得被读成"已实现"） |
+| 1.5.1 | 2026-10-25 | **审计事件登记（纯增量）**：§7.6 新增 **7.6.3「审计事件（JSONL）」**，把 `nodes.py` 已在写、契约里却没有位置的形状补登记。**① 已登记（正文与代码同时成立）**：(a) 与 `node.trace` 的分工表（谁写、`data` 键集合、条数、靠 `event` 名区分；`node.trace` 仍只由 `tracing.py` 写、键集合未改）；(b) 7 行事件表：`metrics.computed`（`info`，`date` / `gmv_cents` / `history_days` / `gmv_7d_avg_cents` / `gross_margin` / `cost_coverage_ratio`）、`anomaly.detected` 的 `kind="summary"`（`info`，`count` / `rule_ids` / `skipped` / `dropped`）与 `kind="detail"`（`level` 由 `severity` 派生 `critical→error` / `warn→warn` / `info→info`，`anomaly_id` / `rule_id` / `metric` / `observed` / `threshold` / `comparator` / `severity` / `window` / `detected_at`）、`collect.units_degraded` / `collect.zero_revenue_paid` / `collect.row_rejected`（均 `warn`：`kind` / `count` / `reasons` / `sample_limit` / `samples_truncated` / `samples`，`row_rejected` 另有 `excluded_from_metrics=true`）、`sku_costs.unmatched`（`warn`：`sku_ids` / `count`）；(c) **`anomaly.detected` 两形态的硬规则**：消费方按 `data.kind` 分支，**禁止**用"有没有 `rule_id`"猜（临时做法作废）；明细行带 `observed` / `threshold` / `severity`，因此 §8.3 "alert-only 规则的唯一可见通道"由"只有 `rule_ids`"升级为"有明细"；(d) **采集层行级判定表**（一行脏 → 整行拒绝且不进任何指标；能猜出含义 → 有界降级；整批契约坏 → 硬失败不 500；全行被拒（`rows_seen>0` 且 `rows_accepted==0`）→ 视同整批失败；零行 → 正常成功），并写明"整批坏与全行被拒在 JSONL 上**没有** `collect.*` 事件，只有 `node.trace` 的 `outcome="error"`"；(e) `samples` 截断（`count` 是全量、`sample_limit` 当前 5、`samples_truncated`）与三种事件的样本 schema；(f) `source.partial` 的语义（"这份指标不完整"≠"出错了"，且**目前不在任何 REST / JSONL 出口**）；(g) 脱敏沿用 §7.6.2 两层，并写明"写盘失败是旁路失败"；同时明确 **`collect.done` / `collect.failed` / `action.proposed` / `approval.decided` / `action.executed` / `effect.registered` / `run.finished` 仍只进 `state.audit`、不进 JSONL**（登记它们等于许一个 `/api/logs` 永远查不到的空承诺）。**② 顺带更正（v1.5.0 行）**：把 1.5.0 行的 (k)（前端 TS 类型已同步）从"未完成项"里移出并标"已结清"（原文与实际不符），(l) 的"唯一可见通道"补上明细行指针。**③ 未修（属前端夹具，不在本次范围）**：`frontend/mock/logs.json` 的 `anomaly.detected`（`data` 只有 `anomaly_ids`、无 `kind`）与 `metrics.computed`（缺 `date` / `history_days` / 两个成本字段）仍是旧形状，按 §7.6.3 属**不合规夹具**；`frontend/mock/logs.json` 里还有 `collect.started` / `approval.requested` 两个 backend **没有生产者**的事件名（`frontend/src/mock/mockServer.ts` 同样在写这两个），因此 `python backend/tests/fixtures/demo/check_event_names.py frontend/mock/logs.json` 现在是**红**的（exit 1） | 全部（platform：`/api/logs` 原样透传、`event` 前缀匹配不变，**不按事件名做分支**；agent-core：新事件必须走 `_log_audit`（不得自建 logger），`node.trace` 不得加键；frontend：非 trace 行仍按 `level` 展示、按 `event` 前缀过滤，**若渲染 `anomaly.detected` 必须按 `data.kind` 分支**；qa：`test_node_audit_sink.py` / `test_collect_row_contract.py` 已覆盖，新增形状沿用"读回落盘文件"的验收方式；reviewer：新增可查项——正文里每一处 event 名都要能在 `nodes.py` 找到 `_log_audit` 调用点，反之亦然） |
+
+**1.5.1 的兼容性**：**纯增量，不改任何既有签名 / 表列 / 错误码 / 路由 / `node.trace` 键集合**。具体：
+- **`/api/logs` 不新增参数、响应形状不变**：`event` 本来就是自由字符串（§7.6 的 Query 表），新增事件名只是新的取值；服务端只做前缀过滤，**不需要**枚举校验。前端不改代码也能显示这些行——非 `node.trace` 行按 `level` 上色、`outcome` 列显示"—（非节点 trace）"，未知事件名原样显示。
+- **`node.trace` 一字未动**：`data` 仍是 5 键、`outcome` 仍是三态、`message` 仍是三种取值；§4.7 的不变量与 `reconcile_step_count` 行为不变，旧日志无需回填。
+- **旧行仍合法**：本节只是把**已经在写**的形状登记下来，不要求历史 JSONL 里有这些事件——没有 `metrics.computed` 的旧 run 照样能读、能回放。
+- **行为变化为零**：代码侧没有一行为本节而改（本节是"补登记"，不是"新实现"）。若正文与代码不一致，以代码为准并**改本节**——不许反过来让实现去追一个从没人写过的形状。
+- **需要同步的只有夹具**：`frontend/mock/logs.json` 里那两条旧形状行是**演示数据**，不是接口契约；修它们是"让 mock 别骗人"，不影响线上读取逻辑。
 
 **1.5.0 的未完成项 (m)：`total_budget_s` 已入册、代码未实现。** §5.1 的签名里列了它、§1083 要求装配点显式传它、§9.2 规定了它的行为，但 `backend/app/services/doudian_client.py` 里**没有这个参数**（`grep total_budget_s backend` = 0）。v1.5.0 期间曾试做一版，因**未接线**（`create_doudian_client` 从未传它，生产路径恒为 `None`，功能是死代码）被整版回退；同时那次实现还有三处与 §9.2 不符（截止起算点、令牌桶/信号量等待未计入、错误类别选错）。要真做必须先补齐：接线 + 起算点对齐 + `_send` 内等待计入 + 新增 `ErrorCategory.BUDGET`（不占用 `CONFIG`）+ 相等边界用 `>=` + 测试能证明"第 N+1 次尝试前就被掐掉"。**在那之前，任何文档/看板/简历都不得声称"有单次调用总预算"。**
 
