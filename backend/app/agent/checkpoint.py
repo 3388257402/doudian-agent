@@ -12,13 +12,47 @@ from __future__ import annotations
 
 from collections.abc import AsyncIterator
 from contextlib import asynccontextmanager
+from enum import Enum
 from pathlib import Path
 from typing import Any
 
+import aiosqlite
 from langgraph.checkpoint.base import BaseCheckpointSaver
+from langgraph.checkpoint.serde.jsonplus import JsonPlusSerializer
 
 from app.config import Settings, get_settings
 from app.errors import ConfigError
+
+
+def _build_serde() -> JsonPlusSerializer:
+    """构造带 allowlist 的 checkpoint 序列化器（把 `app.enums.*` 显式登记）。
+
+    为什么必须显式登记：LangGraph 对未知类型的反序列化目前只打 warning
+    （`Deserializing unregistered type app.enums.Verdict ... will be blocked in a
+    future version`），下个版本会直接拒绝。我们的 state 里合法地存着 `Verdict` /
+    `Attribution` 这类枚举，不登记的结果是**升级 LangGraph 那天 HITL 恢复全线炸**，
+    而且炸在最不该炸的地方（人已经批了，图恢复不起来）。
+
+    为什么动态枚举而不是硬编码两个类名：枚举清单会随 state 演进增长，硬编码的
+    allowlist 迟早漏一个，漏的那个仍然要等到恢复时才暴露。这里按"模块里所有 Enum"
+    生成，新增枚举自动覆盖。
+
+    **登记的是类型对象本身，不是 `(模块名, 名字)` 配对**：配对形式的名字取自命名空间，
+    于是 `from enum import StrEnum` 这种"导入进来的类"也会被收进白名单（reviewer 实测
+    误收 `('app.enums', 'StrEnum')`），而且将来一句 `from x import SomeEnum`（转发枚举是
+    常见重构）就会悄悄扩表——没人会记得那是一条安全边界。直接传类型由 langgraph 自己取
+    `__module__/__qualname__`，配合 `__module__ == "app.enums"` 过滤，只登记本模块定义的枚举。
+    """
+    import app.enums as enums_module
+
+    allowed = tuple(
+        value
+        for value in vars(enums_module).values()
+        if isinstance(value, type)
+        and issubclass(value, Enum)
+        and value.__module__ == "app.enums"
+    )
+    return JsonPlusSerializer(allowed_msgpack_modules=allowed)
 
 _active_saver: BaseCheckpointSaver[str] | None = None
 
@@ -37,7 +71,14 @@ async def checkpoint_saver(settings: Settings | None = None) -> AsyncIterator[Ba
 
         path = Path(checkpoint.path)
         path.parent.mkdir(parents=True, exist_ok=True)
-        async with AsyncSqliteSaver.from_conn_string(str(path)) as saver:
+        # 用 `aiosqlite.connect` + 显式 `serde`，而不是 `from_conn_string(...)`：
+        # 后者只能传 conn_string，构造 `AsyncSqliteSaver(conn)` 时用的是默认 serde，
+        # 于是每次反序列化都会为 `app.enums.*` 打一条
+        # "Deserializing unregistered type ... will be blocked in a future version" 警告。
+        # 我们的 checkpoint 里合法地存着 `Verdict` / `Attribution` 等枚举（state 结构的一部分），
+        # 所以要把它们显式登记进 allowlist——不登记不是"现在没事"，是"下个版本直接坏"。
+        async with aiosqlite.connect(str(path)) as conn:
+            saver = AsyncSqliteSaver(conn, serde=_build_serde())
             await saver.setup()
             yield saver
         return
@@ -47,7 +88,11 @@ async def checkpoint_saver(settings: Settings | None = None) -> AsyncIterator[Ba
             raise ConfigError("checkpoint.type=postgres 但 checkpoint.url 为空")
         from langgraph.checkpoint.postgres.aio import AsyncPostgresSaver
 
-        async with AsyncPostgresSaver.from_conn_string(checkpoint.url) as saver:
+        # 同一个 serde 也要传给 Postgres 分支：只修 sqlite 等于"开发环境不告警、
+        # 生产环境照旧告警"——那是最难被发现的一类不彻底（`from_conn_string` 接受 serde）。
+        async with AsyncPostgresSaver.from_conn_string(
+            checkpoint.url, serde=_build_serde()
+        ) as saver:
             await saver.setup()
             yield saver
         return

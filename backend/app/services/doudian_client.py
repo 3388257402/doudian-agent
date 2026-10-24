@@ -676,7 +676,17 @@ class DoudianClient:
         """指数退避 + 抖动；429 带 `Retry-After` 时以它为准（上限 `backoff_max_s`）。"""
         cfg = self._rate_limit
         if isinstance(exc, DoudianRateLimitedError) and exc.retry_after is not None:
-            return min(float(exc.retry_after), cfg.backoff_max_s)
+            # `Retry-After` 必须**两头夹**：上限挡"上游给 3600 我们真等一小时"，
+            # 下限挡"上游给 -1 或非法值"。后者是 review 实测出的真 bug：
+            # 不做下限时 `sleep(-1)` 会让注入时钟倒退，退避等于不存在，
+            # 重试全速打完、限流被彻底绕过。负数/NaN 一律按 0 处理（立刻重试，至少不倒退）。
+            try:
+                retry_after = float(exc.retry_after)
+            except (TypeError, ValueError):
+                retry_after = cfg.backoff_base_s
+            if retry_after != retry_after or retry_after < 0:  # NaN 或负数
+                return 0.0
+            return min(retry_after, cfg.backoff_max_s)
         base = min(cfg.backoff_max_s, cfg.backoff_base_s * (2 ** (attempts - 1)))
         return base + random.uniform(0.0, 0.1 * base)
 
