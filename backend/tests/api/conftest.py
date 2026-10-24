@@ -144,6 +144,12 @@ class MockUpstream:
         self.fail_status: dict[str, int] = {}
         #: method 集合：返回 HTTP 200 但 `err_no != 0`（business，不可重试 → run 降级为 failed）
         self.business_error: set[str] = set()
+        #: `order.searchList` 的**整批替换**（None = 用默认的近 7 天夹具）。用来验证
+        #: "整批行都脏"在 HTTP 边界上也是 202 + `status=failed`，不是 500/502。
+        self.orders_override: list[dict[str, Any]] | None = None
+        #: 追加到默认行**之后**的额外行：验证"脏行混在好行里"时基线 GMV/规则不受影响
+        #: （脏行整行拒绝，不进任何指标），run 仍然正常成功。
+        self.extra_orders: list[dict[str, Any]] = []
 
     def handler(self, request: httpx.Request) -> httpx.Response:
         self.requests.append(request)
@@ -164,7 +170,8 @@ class MockUpstream:
         if method == "shop.getShopInfo":
             return _ok(request, {"shop_id": SHOP_ID, "shop_name": "示例旗舰店"})
         if method == "order.searchList":
-            return _ok(request, {"orders": _orders()})
+            rows = _orders() if self.orders_override is None else list(self.orders_override)
+            return _ok(request, {"orders": rows + list(self.extra_orders)})
         if method == "product.listV2":
             return _ok(request, {"products": _products()})
         if method in {"product.editPrice", "product.editStock"}:

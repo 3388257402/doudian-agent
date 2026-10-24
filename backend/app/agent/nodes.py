@@ -286,8 +286,9 @@ class _BadBusinessDate(ValueError):
     `summary` 作用域这类**非行级**调用点用的（它们回退到今天是有界、可解释的）。订单行不行：
     把一行的垃圾 `create_time` 回退成"今天"，等于凭空造出一笔当日成交——实测
     `create_time="2026-13-45 99:99:99"` 会得到 `gmv=555 / orders=1`，与"猜不出含义就整行拒绝"
-    正好相反。所以行级路径用 `strict=True`，由 :func:`_read_order_row` 转成
-    `_RowRejected(reason="bad_create_time")`；越界时间戳（Windows 上 `fromtimestamp` 抛
+    正好相反。所以行级路径用 `strict=True`，由 :func:`_row_business_date`（它按
+    `create_time` → `pay_time` 逐字段尝试）汇总成 `_RowRejected(reason="bad_create_time")`；
+    越界时间戳（Windows 上 `fromtimestamp` 抛
     `OSError`、其他平台可能是 `ValueError`/`OverflowError`）也在这里被统一成该异常，
     不再从节点逃出去变成 `POST /api/agent/run` 的 500。
     """
@@ -896,11 +897,100 @@ def _best_effort_units(item: Mapping[str, Any], *, where: str) -> int | None:
 
     为什么要单独一条路：`_order_units` 对类型错会抛 `ValueError`，而 0 元单本来就不参与
     成本口径，若因为"样本想多带一个字段"把整行拒掉，等于让旁路信息反过来改变业务结论。
+
+    ## 这里**故意**保留 `TypeError`（不是漏改）
+
+    本仓的硬边界是"我们自己的代码 bug 不许被降级成数据脏"（见 :func:`_read_order_row`
+    的 `except ValueError` 与 `_aggregate_orders` 里只接 `ValueError` 的那一段）。那条边界
+    针对的是**业务结论**：一行的 `pay_amount`/件数解析出错若被写成"脏行"，指标会静默少算。
+
+    这个函数不产生任何业务结论——它的返回值只进 `collect.zero_revenue_paid` 的审计样本
+    （`units` 字段，让人事后估算"漏了多少成本"）。所以这里的取舍相反：
+
+    - 收窄成只接 `ValueError` → 一个 `TypeError`（只可能来自我们自己）会从"想给样本多带
+      一个字段"这条旁路逃出去，**整轮采集直接失败**，当天所有指标一起没有；
+    - 保留 `TypeError` → 最坏情况是"这条样本的 `units` 是 `null`"，指标一个数都不变。
+
+    即：**旁路样本的完整性不许反过来决定业务结论的成败**。这是唯一一处故意保留
+    `TypeError` 的地方；`_read_order_row` / `_aggregate_orders` 里的 `except` 都已收窄到
+    `ValueError`，两处口径不同是有意的，不是忘了改。
     """
     try:
         return _order_units(item, where=where)
     except (ValueError, TypeError):
         return None
+
+
+#: 一行订单的**业务日期**候选字段（按此顺序逐字段尝试；抖店不同接口给其中一个，也可能两个都给）
+_ORDER_DATE_KEYS: tuple[str, ...] = ("create_time", "pay_time")
+
+#: :func:`_read_order_row` **实际读取**的订单字段名（行级契约的"已知字段"名单）。
+#:
+#: 名单必须与 `_read_order_row` 的读取点**同源**，否则"一行什么都没有"的判据会随时间腐烂：
+#: 加了一个读取字段却忘了加进名单，就会把"只带这个字段的真实订单"判成 `no_known_fields`。
+#: 因此这里直接展开 `_ORDER_DATE_KEYS` / `_ORDER_UNIT_KEYS`，而不是再抄一份字面量。
+_KNOWN_ORDER_ROW_KEYS: frozenset[str] = frozenset(
+    {
+        "order_id",  # `_order_id_of`
+        "sku_id",
+        "refund_status",  # `_is_refunded`
+        "pay_amount_cents",
+        "pay_amount",  # `_first_int`
+        "refund_amount_cents",
+        "refund_amount",  # `_first_int`
+        *_ORDER_DATE_KEYS,  # `create_time` / `pay_time`
+        *_ORDER_UNIT_KEYS,  # `product_count` / `goods_count` / `quantity`
+    }
+)
+
+
+def _row_business_date(item: Mapping[str, Any], *, where: str, window_end: str) -> str:
+    """一行的业务日期：`create_time` → `pay_time` **逐字段尝试**，全都不是日期才整行拒绝。
+
+    ## 三个必须分开的情况
+
+    1. **键不存在 / 值是 `None`**：真·缺日期 → 回退 `window_end`，不拒绝整行
+       （"上游这条链路没给我们日期"是缺数据，不是脏数据）；
+    2. **键存在但值是 falsy**（`False` / `0` / `""`）：**不是**"没给日期"，是"给了一个不可能是
+       日期的值"。旧实现 `item.get("create_time") or item.get("pay_time")` 在 strict 判定
+       **之前**就把 falsy 折成了 `None`，而 strict 只对"给了垃圾"生效、对 `None` 仍回退当日
+       → 实测 `create_time=False` / `0` / `""` 都变成"今天成交 + GMV 全额计入"，即上一轮声称
+       修掉的那个现象。falsy 不该走回退这条路，也不该当成"缺键"，按**该字段不可用**处理；
+    3. **键存在、值不是 falsy、但解析不出来**（`"0000-00-00 00:00:00"` / 越界时间戳 / 乱码）：
+       这个字段不可用，**试下一个**字段；两个都不可用才 `_RowRejected(bad_create_time)`。
+
+    ## 为什么第 3 条要逐字段尝试，而不是"第一个字段坏就整行拒"
+
+    实测 `create_time="0000-00-00 00:00:00"` 配一个合法的 `pay_time` 时，旧实现整行被丢：
+    GMV 少算，可这一行其实有可用日期。日期在这两个字段上是**同义**的（都表示这单哪天成交），
+    一个不可用不等于另一个也不可用；全都不可用才真的"猜不出这单是哪天的"。
+
+    失败时抛 :class:`_RowRejected`（`reason="bad_create_time"`），`error` 带上每个尝试过的字段
+    与原因——"上游到底把哪个字段改坏了"不必再猜。
+    """
+    attempts: list[str] = []
+    for key in _ORDER_DATE_KEYS:
+        if key not in item or item[key] is None:
+            continue
+        value = item[key]
+        if not value:
+            # falsy ≠ 缺日期：`0` 是 1970-01-01、`""` 是空文本、`False` 是 bool——没有一个能
+            # 表示"这单哪天成交"。折成 None 就会回退成今天，凭空造出一笔当日成交。
+            attempts.append(f"{where}.{key}={value!r}（falsy 值，不是日期）")
+            continue
+        try:
+            return _business_date_of(value, fallback=window_end, strict=True)
+        except _BadBusinessDate as exc:
+            attempts.append(f"{where}.{key}：{exc}")
+            continue
+    if attempts:
+        raise _RowRejected(
+            "业务日期不合法（"
+            + "；".join(attempts)
+            + f"）：{'/'.join(_ORDER_DATE_KEYS)} 都不是可用的日期，整行拒绝（不回退今天）",
+            reason="bad_create_time",
+        )
+    return window_end
 
 
 def _read_order_row(
@@ -921,9 +1011,16 @@ def _read_order_row(
 
     ## 校验顺序（顺序本身是契约）
 
+    0. **"这一行到底是不是一行订单"**：一个已知订单字段都没有（`{}` / `{"foo": 1}`）→
+       `_RowRejected(reason="no_known_fields")`。必须在**日期之前**判：这种行没有
+       `create_time`/`pay_time`，走到日期那一步会回退成"今天"，于是被当成一笔 0 元当日订单
+       计入 `order_count`——实测 `{"shop_order_list": [{}, {}, {}]}` 得到
+       `order_count=3 / gmv=0 / rows_rejected=0 / partial=False` 且**零告警**，正是批层
+       "一个已知字段都没有"判据（`_require_orders_container`）在行层的缺失。
     1. 业务日期 → 窗口外的行直接 `None`（既不算错、也不进指标；上游会多给窗口外的单）。
        窗口判定**先于**金额解析：窗口外的行本来就不参与任何指标，把它算成"脏行"只会让
-       审计里的拒绝计数虚高。
+       审计里的拒绝计数虚高。日期的字段级细节（falsy / 逐字段尝试 / 全都不可用才拒绝）
+       见 :func:`_row_business_date`。
     2. 支付金额：必须是整数分、且**非负**（负数不是"退款/冲正"的表达方式，退款在
        `refund_amount` 里；负金额只会让 GMV 凭空变小）。
     3. 件数（仅对"已支付 + 有 sku + 成交额 > 0"的行）：缺失/非正按 1 件（降级），
@@ -933,18 +1030,25 @@ def _read_order_row(
     返回的 dict 是**纯值**，累加只发生在 :func:`_aggregate_orders` 的提交段：
     `{order_id, day, paid, revenue, sku_id, units, zero_revenue, refunded, refund_amount,
     best_effort_units}`。
+
+    ## 异常口径
+
+    本函数只把**数据形状**错转成 :class:`_RowRejected`（它继承 `ValueError`），并且只接
+    `ValueError`：`TypeError` 之类只可能来自我们自己代码的 bug，必须照常传播出去，不许被
+    写成"这一行脏、跳过"。见 `_aggregate_orders` 里那段 `except ValueError` 的注释。
     """
-    order_id = _order_id_of(item)
-    try:
-        day = _business_date_of(
-            item.get("create_time") or item.get("pay_time"),
-            fallback=window_end,
-            # strict：行级日期解析不出来就**整行拒绝**，绝不回退成"今天"（v1.5.1）。
-            # 非 strict 的回退行为只留给窗口下界 / uv 作用域这类非行级调用点。
-            strict=True,
+    if not _KNOWN_ORDER_ROW_KEYS.intersection(item):
+        # "一个已知字段都没有" ＝ 这不是一行订单，而不是"一笔 0 元订单"。行层的判据必须与批层
+        # 同源（`_require_orders_container` 判的是"一个已知**列表**字段都没有"），否则
+        # `[{}, {}, {}]` 会被静默聚合成"3 单 0 元"——零告警的生意归零。
+        known = "、".join(sorted(_KNOWN_ORDER_ROW_KEYS))
+        raise _RowRejected(
+            f"{where} 没有任何一个已知订单字段（实际键：{sorted(str(key) for key in item)}；"
+            f"已知字段：{known}）：这不是一行订单数据，不能当成一笔 0 元订单计入 order_count",
+            reason="no_known_fields",
         )
-    except _BadBusinessDate as exc:
-        raise _RowRejected(f"业务日期不合法：{exc}", reason="bad_create_time") from exc
+    order_id = _order_id_of(item)
+    day = _row_business_date(item, where=where, window_end=window_end)
     if not (window_start <= day <= window_end):
         return None
 
@@ -1086,10 +1190,12 @@ def _aggregate_orders(
     "今天没卖东西"和"上游给的行全被拒了"，而这两个状态的处置完全不同。
 
     `row_rejected` 的样本也是 `{order_id, where, reason, error}`：`reason` 是稳定分类
-    （`bad_create_time` / `bad_pay_amount` / `bad_units` / `bad_refund_amount` / `bad_sku_id` /
-    `not_an_object` / `unclassified`），`error` 保留原始异常原文（含字段路径），这样"上游改了
-    哪个字段"不用猜。"不是对象"的元素（`["x", 1, None]`）也算一行：它不是"没给数据"，是
-    "给了但没解析出来"，不能像 :func:`_as_list` 那样被静默丢掉。
+    （`no_known_fields` / `bad_create_time` / `bad_pay_amount` / `bad_units` /
+    `bad_refund_amount` / `bad_sku_id` / `not_an_object` / `unclassified`），`error` 保留原始
+    异常原文（含字段路径），这样"上游改了哪个字段"不用猜。"不是对象"的元素（`["x", 1, None]`）
+    也算一行：它不是"没给数据"，是"给了但没解析出来"，不能像 :func:`_as_list` 那样被静默丢掉。
+    `no_known_fields` 是同一件事在**对象内部**的形态（`{}` / `{"foo": 1}`）：行是对象，但一个
+    订单字段都没有，同样不能当成"一笔 0 元订单"（见 :func:`_read_order_row` 第 0 条）。
 
     `cost_table` 只用于**审计样本**里的 `unit_cost_cents`（让事后能算出 0 元单漏了多少成本），
     不参与本函数的任何累计口径——所以它缺省可以是 `None`。
@@ -1336,7 +1442,9 @@ async def collect(state: AgentState, config: RunnableConfig) -> dict[str, Any]:
 
     1. **能猜出含义 → 有界降级**（件数按 1 件、0 元单不进成本口径），照常算指标；
     2. **一行的数据脏、猜不出含义 → 整行拒绝**：跳过该行并记 `collect.row_rejected`
-       （warn，带 `count` + 最多 5 条样本 + 按原因计数），其余行照常算；
+       （warn，带 `count` + 最多 5 条样本 + 按原因计数），其余行照常算。"这一行一个已知订单
+       字段都没有"（`{}` / `{"foo": 1}`）也在这一档，原因写作 `no_known_fields`——它**不是**
+       "一笔 0 元订单"，见 :func:`_read_order_row` 第 0 条；
     3. **整批契约坏了 → 硬失败**（不 500）：`data` 不是映射/列表、订单列表字段不是 list、
        一个已知列表字段都没有、`summary.uv` 形状不对 → 记一条错误 + `failed` 走 `finalize`，
        绝不静默给出"0 单 0 元"；
@@ -1353,7 +1461,8 @@ async def collect(state: AgentState, config: RunnableConfig) -> dict[str, Any]:
 
     `collect.done`（info）与 `collect.failed`（error）**都**进 JSONL 汇，`data` 里都带
     `rows_seen` / `rows_accepted` / `rows_rejected`（+ 失败时的 `reason` / `reject_reasons` /
-    `row_reject_samples`）。两个方向都要写：
+    `row_reject_samples`）。`collect.row_rejected` 也带同一对**分母**（`rows_seen` /
+    `rows_accepted`，v1.5.2）：否则日志页上的"7 行被拒"分不清是 7/7 还是 7/100。两个方向都要写：
 
     - 只写失败会让人以为"没红就是正常"：一次**正常**采集在前端/日志页上是沉默的，而沉默
       既可能是"跑完了没事"，也可能是"根本没跑"——这两件事在排障里完全不是一回事；
@@ -1628,6 +1737,11 @@ async def collect(state: AgentState, config: RunnableConfig) -> dict[str, Any]:
         # "GMV 比昨天少了一截"就永远无法归因到"上游有几行脏数据被跳过了"。
         data = _degradation_summary("row_rejected", row_rejected)
         data["excluded_from_metrics"] = True
+        # **分母**必须跟着分子一起出现（v1.5.2）：只写 `count`（被拒条数）时，日志页上的
+        # "7 行被拒"分不清是 7/7（整批脏）还是 7/100（个别脏）。`rows_seen` / `rows_accepted`
+        # 与 `collect.done` / `collect.failed` 同一个口径（上游给的行数 vs 进入指标的行数）。
+        data["rows_seen"] = rows_seen
+        data["rows_accepted"] = rows_accepted
         # 文案必须自证"样本只是样本"（v1.5.1）：`count` 是全量，`samples` 只有前 N 条。
         # 只写"样本见 data.samples"会让读者把"看到 5 条"当成"一共就 5 条"。
         sample_note = f"仅前 {data['sample_limit']} 条样本" + (

@@ -16,6 +16,18 @@
 契约：**看到了行但一行都没解析出来 ≠ 今天没卖东西**。全被拒走 `_BatchContractError` 同一条
 路径（`status=failed`，不 500）；部分被拒保持 warn + `source["partial"]=True`；拒绝率
 （`rows_seen` / `rows_accepted`）进 `collect.done` 的审计。
+
+v1.5.2 补的四个洞（都在同一个"行级契约"上，因此并进本文件而不是另开一套夹具）：
+
+5. **falsy `create_time` 被算成今天**：`item.get("create_time") or item.get("pay_time")` 在 strict
+   判定**之前**折掉 falsy 值，而 strict 对 `None` 仍然回退当日 → `False` / `0` / `""` 都变成
+   "今天成交 + GMV 全额计入"（上一轮声称修掉的那个现象，换了个形状回来）。
+6. **日期只看第一个字段**：`create_time="0000-00-00 00:00:00"` 配合法 `pay_time` 时整行被丢
+   （GMV 少算）——"逐字段尝试"是同一个上游的另一个出口。
+7. **行级"一个已知字段都没有"零告警**：`[{}, {}, {}]` → `order_count=3 / gmv=0 /
+   rows_rejected=0 / partial=False`。批层有该判据，行层没有 → `no_known_fields`。
+8. **代码 bug 被降级成数据脏**：把 `except ValueError` 变异成 `except Exception` 时全部用例照旧
+   通过——`TypeError` 那条硬边界此前没有任何测试守护。
 """
 
 from __future__ import annotations
@@ -23,6 +35,7 @@ from __future__ import annotations
 from typing import Any
 
 import pytest
+from app.agent import nodes
 from app.agent.nodes import collect
 from app.enums import RunStatus
 from app.observability.logging import JsonlLogSink
@@ -218,6 +231,10 @@ async def test_partially_rejected_rows_stay_a_warning_with_partial_source(
     data = _rejected(update)[0]["data"]
     assert data["count"] == 1
     assert data["reasons"] == {"bad_pay_amount": 1}
+    # 分母必须跟着分子：只看 `count=1` 分不清"1/2"还是"1/1000"（v1.5.2）。
+    assert data["rows_seen"] == 2
+    assert data["rows_accepted"] == 1
+    assert data["excluded_from_metrics"] is True
 
     done = _done(update)
     assert done["rows_seen"] == 2
@@ -464,3 +481,188 @@ async def test_accepted_rows_with_units_degradation_mark_the_source_partial(
     done = _done(update)
     assert done["rows_seen"] == done["rows_accepted"] == 1
     assert done["partial"] is True
+
+
+# ======================================================================================
+# v1.5.2：falsy 日期 / 逐字段尝试 / 行级"一个已知字段都没有" / 代码 bug 不许降级成数据脏
+# ======================================================================================
+
+
+@pytest.mark.parametrize("falsy_value", [False, 0, ""], ids=["false", "zero", "empty-string"])
+async def test_falsy_create_time_is_rejected_instead_of_counted_as_today(
+    runtime: Any,
+    sink: JsonlLogSink,
+    fake_client: FakeDoudianClient,
+    falsy_value: Any,
+) -> None:
+    """`create_time` 是 falsy（`False` / `0` / `""`）→ `bad_create_time`，**绝不**回退今天。
+
+    旧实现 `item.get("create_time") or item.get("pay_time")` 在 strict 判定**之前**就把 falsy
+    折成了 `None`，而 strict 对 `None` 仍然回退 `window_end` → 这一行变成"今天的成交"、金额
+    全额进 GMV（独立审查实测 `gmv=555 / orders=1`）。falsy 与"缺键 / 显式 `None`"是两件事：
+    前者是"给了一个不可能是日期的值"（脏数据，整行拒绝），后者才是"没给日期"（缺数据，保持回退）。
+
+    这里用一行坏 + 一行好：坏行被拒（金额 555 分不进 GMV），好行照常算，run 不 failed。
+    """
+    fake_client.orders = [
+        {
+            "order_id": "o_falsy_time",
+            "sku_id": "sku_a",
+            "pay_amount": 555,
+            "product_count": 1,
+            "create_time": falsy_value,
+        },
+        _good_row(),
+    ]
+
+    update = await collect.__wrapped__(_state(), _config(runtime))  # type: ignore[attr-defined]
+
+    assert update.get("status") != RunStatus.FAILED.value
+    summary = update["raw"]["order_summary"]
+    assert summary["gmv_cents"] == 9_900, "falsy 日期那行的 555 分不许被算进今天"
+    assert summary["order_count"] == 1, "它也不许被算成今天的一笔订单"
+
+    data = _rejected(update)[0]["data"]
+    assert data["reasons"] == {"bad_create_time": 1}
+    sample = data["samples"][0]
+    assert sample["order_id"] == "o_falsy_time"
+    assert sample["reason"] == "bad_create_time"
+    # 文案要自证"这是 falsy，不是缺日期"：否则读日志的人会去追上游为什么"没给时间"
+    assert "falsy" in sample["error"]
+    assert update["raw"]["source"]["partial"] is True
+
+
+async def test_unusable_create_time_falls_back_to_pay_time_instead_of_dropping_the_row(
+    runtime: Any, sink: JsonlLogSink, fake_client: FakeDoudianClient
+) -> None:
+    """`create_time="0000-00-00 00:00:00"` + 合法 `pay_time` → 用 **pay_time 的日期**，不整行拒绝。
+
+    旧实现只拿第一个非空字段（`create_time or pay_time` 取到的正是那个垃圾串），于是在 strict
+    里整行被丢：这一行其实有可用日期，GMV 少算。日期在这两个字段上同义（都表示这单哪天成交），
+    一个不可用就该试下一个，两个都不可用才拒绝。
+
+    用**另一个业务日**（10-20，不是今天）才能证明取到的是 `pay_time` 的日期而不是回退的今天。
+    """
+    fake_client.orders = [
+        {
+            "order_id": "o_pay_time_only",
+            "sku_id": "sku_a",
+            "pay_amount": 555,
+            "product_count": 1,
+            "create_time": "0000-00-00 00:00:00",
+            "pay_time": "2026-10-20 11:00:00",
+        },
+        _good_row(),
+    ]
+
+    update = await collect.__wrapped__(_state(), _config(runtime))  # type: ignore[attr-defined]
+
+    assert update.get("status") != RunStatus.FAILED.value
+    assert _rejected(update) == [], "有可用 pay_time 时不许整行拒绝"
+    summary = update["raw"]["order_summary"]
+    assert summary["gmv_cents"] == 9_900, "这一行的 555 分应落在 10-20 的桶里，不是今天"
+    bucket = summary["by_date"]["2026-10-20"]
+    assert bucket["gmv_cents"] == 555
+    assert bucket["order_count"] == 1
+    assert update["raw"]["source"]["partial"] is False, "没有被拒/降级的行，采集是完整的"
+    done = _done(update)
+    assert (done["rows_seen"], done["rows_accepted"]) == (2, 2)
+
+
+async def test_rows_without_any_known_order_field_go_the_all_rows_rejected_path(
+    runtime: Any, sink: JsonlLogSink, fake_client: FakeDoudianClient
+) -> None:
+    """`{"shop_order_list": [{}, {}, {}]}` → 全行 `no_known_fields` → **failed**，不是"3 单 0 元"。
+
+    旧行为（独立审查实测）：`order_count=3 / gmv=0 / rows_accepted=3 / rows_rejected=0 /
+    partial=False` 且**零告警**。原因是空对象没有 `create_time`/`pay_time`，日期回退今天、
+    金额缺失 → `paid=False`，于是一行"什么都没有"被当成一笔 0 元当日订单。批层有"一个已知
+    **列表**字段都没有"的判据（`_require_orders_container`），行层原本没有对应的一条。
+    """
+    fake_client.orders = [{}, {}, {}]
+
+    update = await collect.__wrapped__(_state(), _config(runtime))  # type: ignore[attr-defined]
+
+    assert update.get("status") == RunStatus.FAILED.value
+    assert "raw" not in update, "一行都没有已知订单字段时不许交出一份全 0 的 raw"
+    messages = [str(item["message"]) for item in update["errors"]]
+    assert any("订单行全部被拒绝" in text for text in messages), messages
+
+    failed = next(entry for entry in update["audit"] if entry["event"] == "collect.failed")
+    data = failed["data"]
+    assert data["reason"] == "all_rows_rejected"
+    assert (data["rows_seen"], data["rows_accepted"], data["rows_rejected"]) == (3, 0, 3)
+    assert data["reject_reasons"] == {"no_known_fields": 3}
+    assert data["source"]["partial"] is True
+
+
+async def test_one_fieldless_row_among_good_rows_is_rejected_not_counted(
+    runtime: Any, sink: JsonlLogSink, fake_client: FakeDoudianClient
+) -> None:
+    """`[{}, good]`：空对象记 `no_known_fields`（不是"一笔 0 元订单"），好行照常算。
+
+    这一条钉住"部分被拒"的形态：`order_count` 只能是 1（不是 2），且拒绝事件必须带分母
+    （`rows_seen=2 / rows_accepted=1`），否则日志页上"1 行被拒"分不清是 1/2 还是 1/1000。
+    """
+    fake_client.orders = [{}, _good_row()]
+
+    update = await collect.__wrapped__(_state(), _config(runtime))  # type: ignore[attr-defined]
+
+    assert update.get("status") != RunStatus.FAILED.value
+    summary = update["raw"]["order_summary"]
+    assert summary["gmv_cents"] == 9_900
+    assert summary["order_count"] == 1, "空对象不许被当成第二笔订单"
+
+    data = _rejected(update)[0]["data"]
+    assert data["reasons"] == {"no_known_fields": 1}
+    sample = data["samples"][0]
+    assert sample["where"] == "order[0]"
+    assert sample["reason"] == "no_known_fields"
+    assert data["rows_seen"] == 2
+    assert data["rows_accepted"] == 1
+    assert update["raw"]["source"]["partial"] is True
+
+
+async def test_internal_type_error_propagates_instead_of_becoming_a_dirty_row(
+    monkeypatch: pytest.MonkeyPatch,
+    runtime: Any,
+    sink: JsonlLogSink,
+    fake_client: FakeDoudianClient,
+) -> None:
+    """我们自己代码抛的 `TypeError` 必须**照常传播**，不许被记成 `row_rejected` 后继续"0 单成功"。
+
+    ## 为什么偏偏用 `TypeError`
+
+    本文件数据侧（`_money` / `_order_units` / `_is_refunded`）对**上游数据形状**只会抛
+    `ValueError`；`TypeError` 只可能来自我们自己的代码（少传/错传参数、把 `None` 当 Mapping、
+    改签名时漏改调用点）。它一旦被 `except Exception` 兜住，就是"代码 bug 被降级成数据脏"：
+    指标静默少算，日志上只多一条"这一行脏"，没有人会去修代码——与"上游改了字段类型"完全
+    无法区分。
+
+    ## 这条用例守护的是哪个变异
+
+    独立审查做过变异：把 `_aggregate_orders` 里的 `except ValueError` 改成 `except Exception`
+    → 旧用例集 321 passed、**零红**。这条边界此前没有测试。变异后本用例会红（`TypeError` 变成
+    `reason="unclassified"` 的行级拒绝，不再传播）。
+
+    ## 为什么只对 `order[...]` 抛
+
+    商品归一化（`_normalize_product`）也走 `_money`，但它在本函数之前执行。若在商品路径就炸，
+    这个用例测到的不是"行级契约"，而是"商品列表炸了"——那样即便 `_aggregate_orders` 被放宽成
+    `except Exception`，用例依然绿，守护就失效了。所以把注入点精确卡在订单行。
+    """
+    real_money = nodes._money
+
+    def _boom(value: Any, *, where: str) -> int:
+        if where.startswith("order["):
+            raise TypeError(f"{where}: 内部调用写错了（不是上游数据形状）")
+        return real_money(value, where=where)
+
+    monkeypatch.setattr(nodes, "_money", _boom)
+    fake_client.orders = [_good_row()]
+
+    with pytest.raises(TypeError):
+        await collect.__wrapped__(_state(), _config(runtime))  # type: ignore[attr-defined]
+
+    # 关键：既没有"这一行被拒"的审计，也没有一条"采集完成（0 单 0 元）"——异常必须照常逃出去。
+    assert sink.read(run_id=RUN_ID, event_prefix="collect.") == []
