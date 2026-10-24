@@ -50,6 +50,7 @@ from app.config import (
 )
 from app.db import create_engine_from_settings, init_db, reset_engine, session_scope
 from app.observability.logging import JsonlLogSink, configure_logging, get_logger
+from app.services.costs import get_sku_costs
 
 __all__ = ["create_app", "lifespan_for", "app"]
 
@@ -93,6 +94,21 @@ class _Lifecycle:
         self.sink = sink
         configure_logging(sink=sink, level=settings.observability.log_level)
         self._log_startup_warnings()
+
+        # 成本表（§8.5）必须在**启动期**加载并完成校验：负数/非 int/重复 sku_id 这类错误
+        # 在这里抛 ConfigError（→ 进程非 0 退出），而不是等第一次跑 Agent 时才表现成
+        # "毛利率算得不对"。文件缺失是正常状态（这家店没配成本）：只记 warn，返回空表，
+        # 于是 gross_margin 恒为 None、loss_making 永不触发——宁可漏报，不可误判为亏本。
+        cost_table = get_sku_costs()
+        logger.info(
+            "SKU 成本表已加载：%d 个 SKU%s",
+            len(cost_table),
+            "" if cost_table else "（未配置：gross_margin 将恒为 None，loss_making 不触发）",
+            extra={
+                "event": "app.sku_costs_loaded",
+                "data": {"skus": len(cost_table)},
+            },
+        )
 
         engine = create_engine_from_settings(settings)
         init_db(engine)  # 建表 + WAL；engine 由 db 模块持有，关机时 reset_engine() 释放

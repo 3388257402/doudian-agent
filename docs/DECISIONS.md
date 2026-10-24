@@ -662,6 +662,62 @@ graph.invoke(Command(resume=resume), config)      # 或 dict(zip(action_ids, dec
 
 ---
 
+## ADR-021 成本口径分两级：先店铺级加权，明确不做"猜 SKU"
+
+**状态**：已决策（v1.5.0，CONTRACT §3.3 / §5.3 / §7.5 / §8.3 / §8.3.3 / §8.5 / §13）
+
+**原方案（v1.4.0 及以前的契约）**：ADR-018 已把 SKU 维度与成本表写进契约，但落地形态是**一步到位到 SKU 级**——`MetricsSnapshot.skus` + 每个 SKU 一条 `SkuSnapshot.gross_margin` + 两轮求值 + SKU 级规则 + SKU 级动作 target。而 v1.4.0 的实际状态是"已入册、代码未实现"：`grep -rn "gross_margin" backend/` 为 **0**，`backend/config/sku_costs.yaml` **不存在**。同时 §8.5 把"成本表的键必须能在 `raw.products` 里对上"写成**启动期 `ConfigError`**。
+
+**问题**
+
+1. **"SKU 级一步到位"把首版能力锁死在一个大改上**。SKU 级要同时具备：`skus` 派生、两轮求值、`Anomaly.sku_id`、`anomaly_id` 含 sku、SKU 级动作 target 解析。任一环没落地，`gross_margin` **一个数都出不来**。而"老板担心有货在亏本卖"这件事，首版真正需要的只是一个**诚实的店铺级信号**：有成本覆盖的那部分成交额，整体是不是在亏。
+2. **店铺级信号有天然的误读风险，必须显式建模**。只对有成本的 SKU 加权时，`gross_margin = -0.5` 可能只代表 **5%** 的成交额。**不把覆盖率一起给出，这个数会被读成"全店在亏"**——一个只覆盖 5% 的数被当成全店结论去动价，就是误伤。
+3. **店铺级结论指不出具体 SKU（这条直接决定了动作面）**。`price_update` / `stock_update` / `coupon_create` 都要求**确定的 `target`**；店铺级异常只能靠 `target_from` 挑（`top_gmv_sku` / `lowest_stock_sku`）——那是**猜**。而猜错的代价**不对称**：给 GMV 最高的好货降价或下架，等于用一次误报去伤害店里最赚钱的商品，且**不可回滚**（价格改了、库存清零了，已成交订单收不回来）。
+4. **§8.5 的启动期校验物理上做不到**。启动期（`app.main` lifespan）根本没有 `raw`——商品列表来自 `collect` 的一次上游调用。要把静态交叉校验放进启动流程，等于让**进程启动依赖抖店可用性**。一条永远无法执行的条款，最后一定变成"没人用的条款"（§8.3.3 的同一个教训）。
+5. **`gross_margin` 这个名字已经被 §8.3.3 的 SKU 名字集合占着**。店铺级要用同名，就必须**现在**处理"同名不同义"，否则规则作者会把为全店调的阈值套到单品上——那不是风格问题，是**让阈值悄悄改变含义**的问题。
+
+**决定**（CONTRACT §3.3 / §5.3 / §7.5 / §8.3 / §8.3.3 / §8.5）
+
+- **成本口径分两级，先做店铺级**：`MetricsSnapshot` 加 `gross_margin` / `cost_coverage_ratio` 两个**店铺级**字段（`float 或 None`），公式只对**有成本的 SKU** 加权：
+  - `covered_revenue = Σ by_sku[s].gmv_cents`（`s ∈ cost_table`）、`covered_cost = Σ cost_table[s] × by_sku[s].units`；
+  - `gross_margin = (covered_revenue − covered_cost) / covered_revenue`；
+  - `cost_coverage_ratio = covered_revenue / gmv_cents`，**不裁剪**（`> 1` 用于暴露上游汇总与明细对不上）。
+- **新增数据面 `order_summary["by_sku"]`**（`collect` 归集，`{sku_id: {gmv_cents, units}}`）：只统计**已支付**订单行；无 `sku_id` 的已支付行**只进 GMV 分母**（计为未覆盖，绝不摊到别的 SKU 上）；**退款单仍计入**成交额与件数；件数缺失按 **1 件**（方向偏保守：只会漏报"亏本"，不会把好货判成亏本）；件数非 `int` / 负数 → `ValueError`。
+- **`None` 严格不是 `0`**：没有 `by_sku` / 一个有成本的 SKU 都没有 / 分母为 0 → `None`；`None` 参与数值比较为 `False` → 规则**不触发**、**不进 skipped**。
+- **`loss_making` 只告警、不给 `actions`**（`severity=critical`、`metric=gross_margin`、条件含 `cost_coverage_ratio >= 0.6`）。理由见问题 3；等 SKU 轮次落地后，这条规则应改为 **SKU 级**并对亏损 SKU 出 `price_update`（**提价**，不是降价）或停售。
+- **命名裁定**：`gross_margin` 归**店铺级**；**SKU 轮次落地时 SKU 侧必须叫 `sku_gross_margin`**。两集合互斥断言一旦触发，**必须报明确错误并指向 §8.3.3 本条**——不允许静默失败、不允许"取其一"式自动改名。
+- **§8.5 的启动期校验改写为运行期审计**：`compute_metrics` 节点在**本次商品列表非空**时记 `sku_costs.unmatched`（**只记不阻断**，一条过期配置不该让当天所有指标都算不出来）；商品列表为空时**不报**（否则每一条成本都会"看起来对不上"，一串假警报把真问题淹掉）。原"启动期 `ConfigError`"条文**删除**。
+- **诚实登记缺口（不许读成"已完成"）**：①**前端 TS 已同步**（v1.5.0 落地后结清，不再是缺口）——`types.ts` 加了两个可选字段、§12 逐字块同一次提交改完、看板改为**零计算读后端字段**，契约外字段 `cost_cents` 与那套 `(GMV−退款−成本)/(GMV−退款)` 公式**已删除**，并加了"只给 `cost_cents` 时必须算不出数"的反向断言锁死回潮；②**alert-only 的 anomaly 当时不出现在 `/api/alerts`**（该端点读 `approval_request` 表，只有产生审批行的异常才可见），因此运营**从审批台看不到** `loss_making`。**这一条后来按根因修了**：审计事件（`anomaly.detected` / `metrics.computed` / `sku_costs.unmatched`）现在**同时落 JSONL sink**，`/api/logs?event=anomaly.` 与 `?level=error` 都能查到；但"面向运营的独立告警出口"仍未做，仍是设计债。
+
+**影响（可验证）**
+
+- `pytest backend/tests/platform/test_platform_gross_margin.py` → **34 passed**（2026-10-24 实测，`exit code 0`）。关键几条：`test_all_skus_costed_margin_matches_hand_calculation`（全店都有成本 → 与手算一致）、`test_partial_cost_only_uses_costed_skus_and_exposes_coverage`（只对部分 SKU 加权且覆盖率可见）、`test_no_cost_at_all_is_none_and_never_triggers_loss_making`（一个成本都没有 → `None` 且规则不触发）、`test_low_coverage_blocks_rule_even_with_very_negative_margin`（覆盖率低时亏得再狠也不报）、`test_coverage_is_not_clamped_so_data_inconsistency_is_visible`（`> 1` 如实给出）、`test_zero_denominators_return_none`、`test_revenue_without_units_is_rejected_not_silently_discounted`。
+- 成本表边界：`test_missing_cost_file_is_not_an_error_but_is_logged`（缺失 → warn + 空表，**不是** `ConfigError`）、`test_bad_cost_file_raises_config_error`（参数化：重复键 / 空值 / 0 / 负数 / float / 字符串 / bool）、`test_non_utf8_cost_file_is_a_config_error`。
+- 数据面：`test_aggregate_orders_groups_revenue_and_units_by_sku`、`test_order_units_defaults_to_one_and_rejects_non_int`、`test_by_sku_flows_from_collect_aggregation_into_metrics`、`test_unmatched_cost_entries_are_reported_but_do_not_block`。
+- 规则形状：`test_loss_making_rule_shape_is_registered`（`severity=critical`、`metric=gross_margin`、**`actions` 为空**）、`test_repo_rules_yaml_still_loads`。
+- 机械可查：`backend/config/rules.yaml` 的 `loss_making` 条目**下面没有 `actions:`**；`grep -rn "sku_gross_margin" backend/app` 在 SKU 轮次落地前为 **0**（名字已冻结、实现未开始）；`grep -rn '__tablename__' backend/app --include=*.py` 仍 **4 行**（成本不进 DB）。
+- 反面对照（最有用的一条）：去掉 `cost_coverage_ratio`、只看 `gross_margin`，则"5% 的成交额在亏 50%"与"全店在亏 50%"在数据上**完全无法区分**——这就是覆盖率字段存在的全部理由。
+
+**为什么这样对生产更好**
+
+告警的价值只取决于两件事：**粒度对不对**、**结论覆盖多大范围**。ADR-018 解决的是第一件（SKU 级事实不能压成店铺级均值），但它的落地形态把首版能力锁在"全部就绪"上；本 ADR 解决的是第二件，并且用**最小可交付的正确子集**解锁首版：店铺级加权 + 覆盖率，能诚实地回答"有成本覆盖的那部分成交整体是不是在亏"，同时**明确拒绝**在没有 SKU 归属的情况下动手。这个"能说不能做"的组合看起来像缺功能，其实是**把不可逆的动作挡在信息不足之外**：改价、下架、清库存都是不可回滚的物理动作，而"是哪件货在亏"在店铺级口径里**根本不存在**——信息不存在时，正确的行为是**不做**，不是**猜一个最像的**（猜错的代价由店里最赚钱的商品承担）。
+
+本 ADR 还固化两条更一般的取向。第一，**结论必须自带作用域**：任何"只覆盖一部分样本"的指标，都要有一个配套的覆盖度字段，否则它一定会被当成全域结论（`gross_margin` + `cost_coverage_ratio` 是这条的第一个实例）。第二，**门禁必须建在数据存在的地方**：§8.5 原条文要求启动期做一次静态交叉校验，但那一刻数据不存在——于是它从"门禁"退化成"信仰条款"；改成运行期审计后，同一个检查第一次真正会执行，而且**只记不阻断**，因为它拦的是"漏报"（过期成本让覆盖率变小），不是"误报"（把好货判成亏本），对漏报的正确处置是**让它可见**，不是**让流水线停下**。
+
+**被否方案**
+
+| 备选 | 否决理由 |
+|---|---|
+| ① **店铺级触发后拿 `top_gmv_sku` 动手**（`price_update` 降价 / `stock_update` 清库存） | 店铺级加权毛利率**指不出是哪件货在亏**。`top_gmv_sku` 是"卖得最多"，与"在亏"**没有任何逻辑关系**——最可能的结果是给店里最赚钱的商品降价或下架。而且这个错误**不可回滚**：价格与库存是真实世界的状态，误伤一次就写进历史。规则宁可只告警，也不许猜目标。 |
+| ② **成本缺失按 0 处理**（"没配成本就当 0 成本"） | 两个方向都错，且反方向是灾难：当 0 成本 → 毛利率 = 1.0（看起来暴利，问题被永久藏起来）；反过来若"缺成本时把 margin 当 0 参与比较" → `0 < 阈值` **直接判亏本**，Agent 去改价/下架**没配成本的正常商品**。缺失的唯一正确表达是 `None`，且 `None` 必须让规则不触发（§8.3.3）。这是本仓反复强调的"最贵的一次误报"。 |
+| ③ **覆盖率低于阈值也触发**（只看 `gross_margin < 0`，不加 `cost_coverage_ratio >= 0.6`） | 少数品的毛利率代表不了全店。覆盖率 10% 时一个 `-0.5` 只说明"这一小撮在亏"，拿它当全店结论就是误伤；而覆盖率 0（一个有成本的 SKU 都没卖）时 `gross_margin` 是 `None`，条件本来就该拦住。两个字段必须成对出现，缺一个都不能下结论。 |
+| ④ **把 `loss_making` 做成直接下架**（`stock_update: {stock: 0}`） | 这是**钱的风险最大、可回滚性最差**的一类动作：下架后流量与权重都要重新积累，误伤一次的代价远超一次漏报。而且它建立在同一个信息缺口上——店铺级结论不知道是哪件货，下架谁都是猜。真正需要下架时，应该由**SKU 级**规则指名道姓地做，并走审批。 |
+| ⑤ **覆盖率裁剪到 `[0, 1]`**（`min(covered_revenue / gmv_cents, 1.0)`） | 覆盖率 `> 1` 是**数据不一致的报警器**（上游汇总与订单明细对不上：分母少算了）。裁剪会让这种不一致彻底消失，只留下一个"看起来 100% 覆盖"的假象——而它恰恰会让 `gross_margin` 被当成全店结论使用，等于把本 ADR 要防的误读亲手做实。 |
+| ⑥ **保留 §8.5 的"启动期 `ConfigError`"，让实现者自己想办法** | 数据在那一刻不存在，唯一的"实现方式"是把上游调用搬进 lifespan，即**让进程启动依赖抖店可用性**（上游抖动 → 服务起不来）。更糟的是它把"漏报"当成"误报"处理：一条过期成本配置会拦掉**当天所有指标**，而它真实的影响只是少了一个 SKU 的毛利率。改成运行期审计 + 只记不阻断，同一个检查第一次真正执行。 |
+| ⑦ **SKU 侧继续用 `gross_margin` 这个名字**（两集合各有一份，靠"上下文"区分） | 同名不同义会让规则作者**无意中把店铺级阈值用到单品上**：一条为全店调的 `gross_margin < 0.0` 套到单品上会把"薄利"判成"亏本"，而误报会驱动真实动作。更隐蔽的是在 SKU 轮里两个名字**同时存在**（店铺级 15 ∪ SKU 级 10 = 25 键），写 `gross_margin` 的 SKU 级规则会对所有 SKU 得到**同一个**店铺级结果——作者以为在逐件判断，实际在重复判断全店。 |
+
+---
+
 ## 附 A：被否掉的备选方案（记录理由，避免重复讨论）
 
 | 备选 | 否决理由 |
@@ -695,6 +751,13 @@ graph.invoke(Command(resume=resume), config)      # 或 dict(zip(action_ids, dec
 | 只做值级层（文本正则），键名层交给它 | 见 ADR-020：`data={"access_token": SECRET}` 是 dict 键，正则只认文本里的 `=`/`:`；要么漏遮，要么先 `json.dumps` 再遮再 `loads`，改变下游看到的值的形态 |
 | 在 `record` 层脱敏 `stderr`（处理 `LogRecord.msg/args`） | 见 ADR-020：`%(message)s` 的最终文本只有 `format()` 之后才存在（还要拼 `asctime`/`levelname` 与 traceback），在 record 层遮的是"还没成为最终文本的东西"，journald 收的仍是明文 |
 | 脱敏测试只测 `redact()`/`redact_any()`，不测通道 | 见 ADR-020：把 `write()` 里那行 scrub 删掉，15 条函数级用例照样全绿——门禁与泄露路径错位，等于没测 |
+| 店铺级毛利率触发后拿 `top_gmv_sku` 去降价/清库存 | 见 ADR-021：店铺级加权毛利率指不出是哪件货在亏，`top_gmv_sku` 是"卖得最多"与"在亏"无逻辑关系；误伤店里最赚钱的商品且不可回滚 |
+| 成本缺失按 0 处理 | 见 ADR-021：当 0 成本 → 毛利率 1.0（问题被藏）；反方向 → `0 < 阈值` 直接判亏本，Agent 去改价下架**没配成本的正常商品** |
+| 覆盖率低于阈值也触发（只看 `gross_margin < 0`） | 见 ADR-021：少数品的毛利率代表不了全店，覆盖率 10% 的 `-0.5` 被当成全店结论就是误伤 |
+| 把 `loss_making` 做成直接下架 | 见 ADR-021：钱的风险最大且不可回滚（下架后流量与权重要重新积累），且仍建立在"不知道是哪件货"的同一个缺口上 |
+| 覆盖率裁剪到 `[0, 1]` | 见 ADR-021：`> 1` 是上游汇总与明细对不上的报警器，裁剪会把它抹成"看起来 100% 覆盖"的假象 |
+| 保留 §8.5 的启动期 `ConfigError` | 见 ADR-021：启动期没有 `raw`，唯一"实现"是把上游调用搬进 lifespan（进程启动依赖抖店可用性）；且它把漏报当误报处理，一条过期配置拦掉全天指标 |
+| SKU 侧继续沿用 `gross_margin` 这个名字 | 见 ADR-021：SKU 轮里两个名字同时存在（27 键），写 `gross_margin` 的 SKU 级规则会对所有 SKU 得到同一个店铺级结果，作者以为在逐件判断 |
 
 ## 附 B：待核实清单（汇总，别假装已解决）
 

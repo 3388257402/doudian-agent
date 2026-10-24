@@ -230,17 +230,33 @@ async function checkDashboard(cdp) {
     await evaluate(send, "[...document.querySelectorAll('.metric-card')].map((e) => e.getAttribute('aria-label'))"),
     ["毛利率", "销量（支付订单数）", "库存周转（日均次数）"],
   );
-  // 默认状态 = 契约 §7.5 的真实形状（无 cost_cents / inventory_units）：
-  // 毛利率与库存周转必须变成"数据源缺字段"提示，只有销量能画。
+  // 默认状态 = 契约 §7.5 的真实形状（无契约外的 inventory_units）：
+  // 毛利率来自契约字段 gross_margin（能画），库存周转必须变成"数据源缺字段"提示。
   assertEqual(
-    "看板：按 §7.5 真实形状返回时，毛利率/库存周转显示为缺字段提示（不画假曲线）",
+    "看板：按 §7.5 真实形状返回时，只有库存周转显示为缺字段提示（不画假曲线）",
     await evaluate(send, "document.querySelectorAll('.gap-box').length"),
+    1,
+  );
+  assertEqual(
+    "看板：此时 2 张图能画（毛利率 + 销量）",
+    await evaluate(send, "document.querySelectorAll('.chart-svg').length"),
     2,
   );
-  assertEqual("看板：此时只有 1 张图能画（销量）", await evaluate(send, "document.querySelectorAll('.chart-svg').length"), 1);
   assertEqual(
-    "看板：缺口提示写明缺哪个字段",
-    await evaluate(send, "document.body.innerText.includes('cost_cents') && document.body.innerText.includes('inventory_units')"),
+    "看板：毛利率卡片显示后端口径与覆盖率提示",
+    await evaluate(
+      send,
+      "document.querySelector('.metric-qualifier') !== null && document.body.innerText.includes('仅覆盖')",
+    ),
+    true,
+  );
+  assertEqual(
+    "看板：缺口提示写明缺哪个字段（只剩 inventory_units）",
+    await evaluate(
+      send,
+      // 只看 .gap-box 自己：页面别处的说明文字会提到"不再读 cost_cents"，那是注释不是缺口
+      "(() => { const g = document.querySelector('.gap-box'); return g !== null && g.innerText.includes('inventory_units') && !g.innerText.includes('cost_cents'); })()",
+    ),
     true,
   );
   assertEqual("看板：7 个次要指标", await evaluate(send, "document.querySelectorAll('.mini-metric').length"), 7);
@@ -248,6 +264,18 @@ async function checkDashboard(cdp) {
     "看板：明确写出「缺数据不补零」",
     await evaluate(send, "document.body.innerText.includes('不补零')"),
     true,
+  );
+  // 缺口 banner 的文案必须与事实一致：成本（gross_margin / cost_coverage_ratio）自契约 v1.5.0 起
+  // 就是契约字段，缺口里只剩库存（inventory_units）。这里曾经写着"没有成本与库存字段"——那是句
+  // 用户可见的假话，而且 .gap-box 的断言（只查 `.gap-box` 存在/含 inventory_units）查不到它。
+  // 所以单独把这段文案钉住：必须讲库存、必须不提成本。
+  assertEqual(
+    "看板：缺口 banner 只讲库存缺字段，不再声称成本字段缺失",
+    await evaluate(
+      send,
+      "(() => { const box = document.querySelector('section.banner-warn[aria-label=\"契约缺口\"]'); if (!box) return 'no-banner'; const hint = box.querySelector('.banner-hint'); if (!hint) return 'no-hint'; const t = hint.innerText; return { hasInventoryGap: t.includes('没有库存字段') && t.includes('inventory_units'), noCostCjk: !t.includes('成本'), noCostAscii: !t.includes('cost'), noGrossMargin: !t.includes('gross_margin'), mentionsMockToggle: t.includes('Mock：扩展字段') }; })()",
+    ),
+    { hasInventoryGap: true, noCostCjk: true, noCostAscii: true, noGrossMargin: true, mentionsMockToggle: true },
   );
 
   // 打开 Mock 扩展开关 → 模拟后端补齐扩展字段，三张图自动恢复。
@@ -284,6 +312,73 @@ async function checkDashboard(cdp) {
       "(() => { const el = document.querySelector('.metric-card .metric-value'); return el ? /(^|\\D)\\d+\\.\\d{2}%/.test(el.innerText) : false; })()",
     ),
     true,
+  );
+
+  // null 口径必须看得见：把区间收窄到唯一一天 gross_margin=null（2026-10-09），卡片要写「未配置成本」。
+  // 这一步是真实渲染验证——只断言 lib 里的 nullLabel 证明不了 React 真的把它画出来了。
+  const narrowed = await evaluate(
+    send,
+    `(() => {
+      const inputs = [...document.querySelectorAll('.filter-bar input[type=date]')];
+      if (inputs.length < 2) return 'no-date-inputs';
+      // React 受控输入：必须走 HTMLInputElement.prototype 的 value setter，否则 React 的 value tracker
+      // 认为值没变，onChange 不会触发（这是受控组件的经典坑）。
+      const setValue = (el, v) => {
+        const setter = Object.getOwnPropertyDescriptor(HTMLInputElement.prototype, 'value').set;
+        setter.call(el, v);
+        el.dispatchEvent(new Event('input', { bubbles: true }));
+      };
+      setValue(inputs[0], '2026-10-09');
+      setValue(inputs[1], '2026-10-09');
+      return 'ok';
+    })()`,
+  );
+  assertEqual("看板：日期区间可收窄到单日（用于验证 null 口径）", narrowed, "ok");
+  await sleep(1500);
+  assertEqual(
+    "看板：gross_margin=null 时卡片写「未配置成本」，不是 0.00% 也不是 —",
+    await evaluate(
+      send,
+      "(() => { const el = document.querySelector('.metric-card .metric-value strong'); return el ? el.innerText.trim() : 'no-card'; })()",
+    ),
+    "未配置成本",
+  );
+
+  // 反面：gross_margin === 0（2026-10-14，不赚不亏）必须真的上屏成 "0.00%"。
+  // 这条是"0 被当成假值"的照妖镜：把 lib 的 num() 改成 `value !== 0` 之后，卡片会变成
+  // 「未配置成本」→ 这里立刻红。只断言 lib 里的值证明不了 React 真的按 0 画了出来。
+  const zeroNarrowed = await evaluate(
+    send,
+    `(() => {
+      const inputs = [...document.querySelectorAll('.filter-bar input[type=date]')];
+      if (inputs.length < 2) return 'no-date-inputs';
+      const setValue = (el, v) => {
+        const setter = Object.getOwnPropertyDescriptor(HTMLInputElement.prototype, 'value').set;
+        setter.call(el, v);
+        el.dispatchEvent(new Event('input', { bubbles: true }));
+      };
+      setValue(inputs[0], '2026-10-14');
+      setValue(inputs[1], '2026-10-14');
+      return 'ok';
+    })()`,
+  );
+  assertEqual("看板：日期区间可收窄到 gross_margin=0 的单日（2026-10-14）", zeroNarrowed, "ok");
+  await sleep(1500);
+  assertEqual(
+    "看板：gross_margin=0 上屏为 0.00%（「不赚不亏」不是「未配置成本」）",
+    await evaluate(
+      send,
+      "(() => { const el = document.querySelector('.metric-card .metric-value strong'); return el ? el.innerText.trim() : 'no-card'; })()",
+    ),
+    "0.00%",
+  );
+  assertEqual(
+    "看板：gross_margin=0 那天仍然带覆盖率前提（0 与 null 是两件事）",
+    await evaluate(
+      send,
+      "(() => { const card = document.querySelector('.metric-card'); if (!card) return 'no-card'; const t = card.innerText; return { qualifier: t.includes('仅覆盖 76.37% 成交额'), noNullLabel: !t.includes('未配置成本') }; })()",
+    ),
+    { qualifier: true, noNullLabel: true },
   );
 
   await saveSnapshot(cdp, "dashboard");

@@ -11,9 +11,9 @@ React 18 + TypeScript + Vite。**不引图表库、不引 UI 库**（折线图�
 | `npm install` | 成功，67 包，56.7s |
 | 依赖 | react/react-dom 18.3.1、typescript 5.6.3、vite 5.4.11、@vitejs/plugin-react 4.3.4 |
 | `npx tsc --noEmit` | 通过（strict + noUncheckedIndexedAccess + verbatimModuleSyntax） |
-| `npm run build` | 通过（`dist/` 约 227 KB JS / 13 KB CSS） |
-| `node scripts/verify.mjs` | 28/28 通过（契约字段自检） |
-| `node scripts/dom-check.mjs` | 39/39 通过（headless Chrome 真实渲染 + 审批闭环 + 轮询定时器） |
+| `npm run build` | 通过（`dist/` JS 241,952 B = vite 报的 234.28 kB；CSS 13,350 B = 13.04 kB；另出 `*.js.map`） |
+| `node scripts/verify.mjs` | 33/33 通过（§12 逐字 diff 1 条 + `verify-suite.ts` 的自检 32 条） |
+| `node scripts/dom-check.mjs` | 46/46 通过（headless Chrome 真实渲染 + 审批闭环 + 轮询定时器） |
 
 ## 可复现命令
 
@@ -22,7 +22,7 @@ cd frontend
 npm install                # 首次
 npm run typecheck          # tsc --noEmit
 npm run build              # tsc --noEmit && vite build → dist/
-npm run verify             # 契约字段自检（含 §12 逐字 diff）→ 28 条断言
+npm run verify             # 契约字段自检（含 §12 逐字 diff）→ 33 条断言
 npm run dev                # http://localhost:5173
 npm run verify:dom         # 另开一个终端、dev 起着；headless Chrome 打开三个页面并断言 DOM
 ```
@@ -40,7 +40,7 @@ npm run verify:dom         # 另开一个终端、dev 起着；headless Chrome �
 
 生产构建请设 `VITE_API_MODE=live`（见 `.env.example`）。
 
-## 契约对齐（docs/CONTRACT.md **v1.2.0**）
+## 契约对齐（docs/CONTRACT.md **v1.5.0**）
 
 | 契约 | 前端位置 |
 |---|---|
@@ -88,20 +88,21 @@ npm run verify:dom         # 另开一个终端、dev 起着；headless Chrome �
 | 效果看板 `#/dashboard` | `GET /api/metrics` | 毛利率 / 销量 / 库存周转为主图 + 7 个次要指标；手写 SVG 折线，`null` 断点不补零。 |
 | 执行日志 `#/logs` | `GET /api/logs` | 节点、耗时（`data.duration_ms`）、状态（`data.outcome` 三态）、摘要（`message`），行可展开看 `data` 全量；顶部有从 `node.trace` 派生的 run 摘要。 |
 
-### 看板与"契约缺口"（这是设计，不是 bug）
+### 看板口径：毛利率来自后端，库存周转仍是契约缺口（这是设计，不是 bug）
 
-`MetricPoint`（§7.5/§12）**没有成本字段、没有库存字段**，所以按契约算不出毛利率与库存周转：
+毛利率与成本覆盖率 **v1.5.0 起是契约字段**（§7.5/§12 的 `gross_margin` / `cost_coverage_ratio`）：后端按**店铺级加权**口径算（只对**有成本的 SKU** 加权），前端**原样展示、不做任何再计算**。
 
-| 指标 | 需要字段 | 契约原样下的表现 |
+| 指标 | 数据来源 | 契约原样下的表现 |
 |---|---|---|
 | 销量 | `paid_order_count` | 正常画 |
-| 毛利率 | `cost_cents`（COGS） | 卡片显示"数据源缺字段"，**不画假曲线** |
-| 库存周转 | `inventory_units` | 同上 |
+| 毛利率 | `gross_margin`（契约字段） | 正常画；`null` → 卡片写「未配置成本」（**不是 0%**，也不是含糊的 `—`） |
+| 毛利率的口径前提 | `cost_coverage_ratio`（契约字段） | 覆盖率 < 1 时卡片写「仅覆盖 X% 成交额」；> 1 如实显示不裁剪；缺失（`null`）时说「未给出」而不猜；恰好 `0` 时说「一个成本都没配（或未按 SKU 归集）」——`0` 不是"覆盖率很小"，而且合规后端在 `coverage=0` 时 `gross_margin` 必为 `null`，这个分支只在后端违约时出现 |
+| 库存周转 | `inventory_units`（**契约外**） | 卡片显示"数据源缺字段"，**不画假曲线** |
 
-`frontend/mock/metrics.json` 是**严格按 §7.5 真实响应同形**的 fixtures（字段集恰好等于 `MetricPoint`，自检里有断言）。扩展字段单独放 `mock/metrics.extended.json`，由**只在 Mock 模式可见**的开关「Mock：扩展字段」驱动：
-关（默认）→ 两张卡变成缺口提示；开 → 模拟后端补齐 `cost_cents`/`inventory_units`，两张图自动恢复，并明确标注"这是契约外扩展字段"。这样"缺口真实存在"和"字段补齐后前端自动好"两件事都能被演示，而不是靠嘴说。
+> **旧口径已删除，不要加回来**：前端曾读契约外扩展字段 `cost_cents`，按 `(GMV − 退款 − 成本) / (GMV − 退款)` 自算毛利率。那与后端的 `gross_margin` **不是同一个数**（一个含退款净额、一个不含），同一个中文名"毛利率"出现两个数，看板上那个数无法被后端任何测试证明。现在只允许有后端口径，不保留开关，也没有"两套口径并存"的分支（`verify-suite.ts` 里有一条反向断言钉死：只给 `cost_cents`、不给 `gross_margin` 时必须一个数都算不出来）。
 
-> 已向 spec-lead 提议在 §7.5/§12 增补这两个字段并升版本（按 §13 变更流程）。版本落地后把 `extension.ts` 合进 `types.ts`。
+`frontend/mock/metrics.json` 是**严格按 §7.5 真实响应同形**的 fixtures（字段集恰好等于 `MetricPoint`，自检里有断言；13 个点里含 1 天 `gross_margin=null` 演示"未配置成本"、1 天 `gross_margin=0` 演示"不赚不亏"、1 天覆盖率 100% 演示"无前提"）。契约外扩展字段单独放 `mock/metrics.extended.json`，由**只在 Mock 模式可见**的开关「Mock：扩展字段」驱动：
+关（默认）→ 库存周转那张卡变成缺口提示；开 → 模拟后端补齐 `inventory_units`，图自动恢复，并明确标注"这是契约外扩展字段"。这样"缺口真实存在"和"字段补齐后前端自动好"两件事都能被演示，而不是靠嘴说。**毛利率不受这个开关影响**（它吃的是契约字段，自检里也有断言）。
 
 ### 执行日志的 run 摘要
 
@@ -114,8 +115,8 @@ npm run verify:dom         # 另开一个终端、dev 起着；headless Chrome �
 | 文件 | 内容 |
 |---|---|
 | `alerts.json` | 3 条待审批，跨 2 个 thread（演示"整批裁决"）；字段集与 §7.3 一致（没有 `approval_id`） |
-| `metrics.json` | 13 天，含 1 天缺数据、1 天 `refund_rate=null`；**字段集恰好等于 §12 的 `MetricPoint`** |
-| `metrics.extended.json` | 同上 + `cost_cents`/`inventory_units`（契约外，只在 Mock 扩展开关打开时回给前端） |
+| `metrics.json` | 13 个点（缺 `2026-10-18` 一天，演示"缺数据不补零"）。刻意保留的四种口径：`2026-10-09` 的 `gross_margin=null` + `cost_coverage_ratio=0`（未配置成本）、`2026-10-14` 的 `gross_margin=0`（不赚不亏，上屏 `0.00%`）、`2026-10-16` 的 `cost_coverage_ratio=1`（全覆盖，不补口径提示）、`2026-10-11` 的 `uv` / `cvr=null`（分母为 0）。`refund_rate` **每天都有值**（fixtures 里没有 `refund_rate=null` 的天）；**字段集恰好等于 §12 的 `MetricPoint`** |
+| `metrics.extended.json` | 同上 + `inventory_units`（契约外，只在 Mock 扩展开关打开时回给前端）；**没有 `cost_cents`**——那条自算路径已删除 |
 | `logs.json` | 38 条，覆盖 3 个 run：成功（8 步）、挂起后恢复（8 步，含 `approval_gate` 的 `interrupted` 与恢复各一条）、`collect` 失败（1 步，`outcome=error`）。每条 `node.trace` 都按 §7.6.1 带 `outcome`/`duration_ms`/`input_digest`/`output_digest`/`error`，`level↔outcome` 映射合规 |
 
 ## 验证（不靠肉眼）
@@ -123,8 +124,8 @@ npm run verify:dom         # 另开一个终端、dev 起着；headless Chrome �
 | 命令 | 证明什么 | 结果 |
 |---|---|---|
 | `npm run typecheck` | 严格 TS 下能编译（含 `noUncheckedIndexedAccess`） | 通过 |
-| `npm run verify` | §12 逐字 diff、§7.4 提交体两条硬规则、§7.1 按 code 分支、§0 金额格式、§5.5 参数校验、§7.6.1 三态与不变量、fixtures 与 §7 同形、mock 的 400/409 分支 | 28/28 |
-| `npm run verify:dom` | 真浏览器里三个页面**对着 fixtures 渲染**：卡片/图表/日志三态（含 computed style 黄 vs 红）、耗时列、run 摘要，真的走一遍「编辑参数 + 拒绝 + 提交 → 回执 → 列表刷新」，并用注入的定时器探针证明**轮询不叠加** | 39/39 |
+| `npm run verify` | §12 逐字 diff、§7.4 提交体两条硬规则、§7.1 按 code 分支、§0 金额格式、§5.5 参数校验、§7.6.1 三态与不变量、fixtures 与 §7 同形、§7.5 毛利率直读契约字段且必须与覆盖率成对展示（`null` 与 `0` 严格区分）、mock 的 400/409 分支 | 33/33 |
+| `npm run verify:dom` | 真浏览器里三个页面**对着 fixtures 渲染**：卡片/图表/日志三态（含 computed style 黄 vs 红）、耗时列、run 摘要、缺口 banner 的文案（只讲库存缺字段）、`gross_margin=null` → 「未配置成本」与 `gross_margin=0` → `0.00%` 两种口径都真的上屏，真的走一遍「编辑参数 + 拒绝 + 提交 → 回执 → 列表刷新」，并用注入的定时器探针证明**轮询不叠加** | 46/46 |
 | `npm run build` | 生产构建 | 通过 |
 
 `verify:dom` 用 CDP 驱动本机 Chrome（`CHROME_PATH` 可覆盖），不引 puppeteer；断言失败会打印实际值并把每页 DOM 快照写到 `frontend/.verify/*.html`。
@@ -167,12 +168,12 @@ frontend/
 ├─ package.json / tsconfig.json / vite.config.ts / index.html / .env.example
 ├─ mock/                        # fixtures（有状态假后端的数据源）
 │  ├─ alerts.json               # 3 条待审批，跨 2 个 thread
-│  ├─ metrics.json              # §7.5 同形（无扩展字段）
-│  ├─ metrics.extended.json     # + cost_cents / inventory_units（契约外，开关驱动）
+│  ├─ metrics.json              # §7.5 同形（含 gross_margin / cost_coverage_ratio）
+│  ├─ metrics.extended.json     # + inventory_units（契约外，开关驱动；不含 cost_cents）
 │  └─ logs.json                 # 38 条，3 个 run，覆盖 ok/interrupted/error 三态
 ├─ scripts/
 │  ├─ verify.mjs                # 自检驱动（§12 逐字 diff + esbuild 打包套件）
-│  ├─ verify-suite.ts           # 28 条契约断言（纯 Node）
+│  ├─ verify-suite.ts           # 32 条契约断言（纯 Node；+verify.mjs 的 §12 逐字 diff = 33）
 │  └─ dom-check.mjs             # headless Chrome + CDP 的真实渲染断言
 └─ src/
    ├─ api/

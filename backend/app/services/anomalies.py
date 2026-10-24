@@ -21,8 +21,14 @@ from app.services.rules import ALLOWED_NAMES, CompiledExpr, RuleEvalError, RuleS
 
 _SEVERITY_ORDER = {Severity.CRITICAL: 0, Severity.WARN: 1, Severity.INFO: 2}
 
-#: `MetricsSnapshot` 里可以进命名空间的字段（其余派生量由 :func:`_derived_namespace` 补）
-_METRIC_FIELDS = tuple(name for name in ALLOWED_NAMES)
+#: 可以进命名空间的字段 = §8.3.3 冻结的全集（**唯一事实源**是 `rules.ALLOWED_NAMES`）。
+#:
+#: v1.5.1 修过一次漂移：原实现里 :func:`_threshold_of` 手抄了一份"指标名清单"，与
+#: `rules.ALLOWED_NAMES` 各自演化——`gmv_delta_ratio` / `order_delta_ratio` /
+#: `refund_rate_delta` 这三个环比派生量只在 ALLOWED_NAMES 里有，于是引用它们的规则
+#: （例如 `aov_drop_day`）永远提取不到 `threshold`，前端只能显示 `observed vs None`。
+#: 现在两处都用同一个来源，新增名字只改 `ALLOWED_NAMES` 一处。
+_METRIC_FIELDS: tuple[str, ...] = tuple(ALLOWED_NAMES)
 
 
 def _previous(metrics: MetricsSnapshot, history: Sequence[MetricsSnapshot]) -> MetricsSnapshot | None:
@@ -80,13 +86,14 @@ def _threshold_of(expr: CompiledExpr, namespace: dict[str, Any]) -> float | int 
     只做**保守**提取：取第一个"左侧就是主指标名、右侧可独立求值成数值"的比较，把它右侧的值
     当作阈值。提取不到（组合条件、指标在右侧且含派生量等）就返回 `None` —— 不猜。
     这个值只用于展示，判定结果永远来自整条表达式的布尔值。
+
+    "主指标名"直接取 `rules.ALLOWED_NAMES`（见模块级 `_METRIC_FIELDS` 的注释）：曾经这里手抄
+    过一份清单，与冻结集合漂移之后 `gmv_delta_ratio` 这类派生量永远提取不到阈值。
     """
     tree = expr.tree
     if tree is None:  # pragma: no cover - compile_expression 一定填了 tree
         return None
-    metric_names = {"gmv_cents", "order_count", "paid_order_count", "refund_order_count",
-                    "refund_amount_cents", "aov_cents", "refund_rate", "uv", "cvr",
-                    "gmv_7d_avg_cents"}
+    metric_names = ALLOWED_NAMES
     for node in ast.walk(tree):
         if not isinstance(node, ast.Compare):
             continue

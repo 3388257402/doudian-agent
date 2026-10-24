@@ -57,6 +57,45 @@ def test_dict_key_is_still_masked() -> None:
     assert redact_any({"nested": {"app_secret": SECRET}}) == {"nested": {"app_secret": "***"}}
 
 
+def test_password_as_dict_key_is_masked() -> None:
+    """`password` 必须同时挡在**键名层**（v1.5.0 补）。
+
+    它原先只在文本层（`DEFAULT_SCRUB_KEYS`），而文本层只认 `key=value` 形态——
+    于是 `data={"password": "SECRET"}` 这种结构化值两层都碰不到，明文落盘。
+    这条用例就是审查复现那条泄露的回归锁。
+    """
+    assert redact({"password": SECRET}) == {"password": "***"}
+    assert SECRET not in json.dumps(redact_any({"outer": {"password": SECRET}}))
+
+
+def test_sink_unions_configured_keys_with_defaults(tmp_path: Path) -> None:
+    """**生产路径**也必须遮 `password`：配置传的键集合是**并集**，不是替换。
+
+    这是那条泄露真正的根因（独立审查实测）：`JsonlLogSink.__init__` 原来写的是
+    `tuple(redact_keys)`，而所有真实装配点都传 `settings.observability.redact_keys`
+    （settings.yaml 里只有 5 个键，没有 `password`）。所以"把 password 加进
+    DEFAULT_REDACT_KEYS"在生产路径上**完全不生效**——只改常量表是不够的。
+
+    这条用例用 settings 那样的键集合构造 sink，断言默认键仍然生效：
+    它会在"有人把并集改回替换"时立刻变红。
+    """
+    from app.observability.logging import JsonlLogSink
+
+    sink = JsonlLogSink(
+        tmp_path / "app.jsonl",
+        # 故意只传 settings.yaml 里那 5 个键（不含 password）
+        redact_keys=("app_secret", "access_token", "sign", "authorization", "cookie"),
+    )
+    try:
+        sink.write("x", message="ok", data={"password": SECRET, "access_token": SECRET})
+    finally:
+        sink.close()
+
+    text = (tmp_path / "app.jsonl").read_text(encoding="utf-8")
+    assert SECRET not in text, f"默认键被配置覆盖掉了: {text}"
+    assert text.count('"***"') >= 2
+
+
 def test_base64_padding_is_consumed() -> None:
     """`=` 形态的值里可以含 `=`：Base64 填充不能被当成"值的结束"。
 

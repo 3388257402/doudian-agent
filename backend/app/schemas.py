@@ -337,6 +337,14 @@ class MetricPoint(BaseModel):
         - `gmv_7d_avg_cents`：历史不足 3 天 → `null`。用 1 天算"7 日均值"是假精确。
     其余 `*_cents` 是 `int`（整数分）：`float` 会让 9900 与 99.00 在两处代码里都"看起来对"。
     `aov_cents` 例外地允许 0（分母 0 → 0）：客单价 0 是业务上真实存在的值，不是"算不出来"。
+
+    成本口径（v1.5.0，纯增量，默认 `null`）：
+        - `gross_margin`：**只对有成本的 SKU 加权**的毛利率。`null` = 没配成本 / 没有按 SKU 归集
+          / 有成本的成交额为 0；它**不是** 0（0 会被读成"不赚不亏"，而事实是"不知道"）；
+        - `cost_coverage_ratio`：有成本的 SKU 的成交额占全店 GMV 的比例。看板必须拿它和
+          `gross_margin` 成对展示：覆盖率 10% 的 -50% 不代表"全店在亏"。
+        老 checkpoint 里没有这两个键 → 默认 `null`（不补 0），老消费者读到 `null` 的行为与
+        "没有这个字段"一致。
     """
 
     model_config = _forbid_extra()
@@ -352,6 +360,8 @@ class MetricPoint(BaseModel):
     uv: int | None = None
     cvr: float | None = None
     gmv_7d_avg_cents: int | None = None
+    gross_margin: float | None = None
+    cost_coverage_ratio: float | None = None
     computed_at: str
 
 

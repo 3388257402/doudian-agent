@@ -6,7 +6,9 @@
 //   §0    金额整数分展示 /100 两位；null 显示 "—"
 //   §5.5  参数 schema 校验（edit 的参数在本地先挡一次）
 //   §7.6.1 node.trace 的 data.outcome 三态 + level↔outcome 硬映射 + error/output_digest 规则
-//   §7.5  毛利率 / 库存周转只能从"扩展字段"派生（缺字段不画假曲线）
+//   §7.5  毛利率**直读**契约字段 gross_margin（不许再自算）+ 必须与 cost_coverage_ratio 成对展示；
+//         `null`（未配置成本）与 `0`（不赚不亏）严格区分，0 不得折成 null 显示；
+//         库存周转仍只能从契约外扩展字段派生（缺字段不画假曲线）
 //
 // 由 scripts/verify.mjs 用 esbuild 打包后执行（它负责把 TS/JSON 变成可 import 的模块）。
 
@@ -29,7 +31,7 @@ import type {
 } from "../src/api/types";
 import { buildApproveRequest, type DecisionDraft } from "../src/lib/approve";
 import { formatCents, formatDuration, formatPercent } from "../src/lib/format";
-import { deriveDashboard } from "../src/lib/metrics";
+import { deriveDashboard, MARGIN_NULL_LABEL, summarize } from "../src/lib/metrics";
 import {
   deriveRunSummaries,
   durationOf,
@@ -331,38 +333,164 @@ check("§7.6.1 不变量：同一 run 的 node.trace 条数 == 派生出的步�
 
 // ————————————————————————— §7.5 派生指标 —————————————————————————
 
-check("§7.5 按契约真实形状（无扩展字段）→ 毛利率/库存周转报缺口，序列全 null 而不是 0", () => {
+check("§7.5 毛利率逐点等于契约字段 gross_margin（前端不再自算）", () => {
   const model = deriveDashboard(METRICS.points as MetricPoint[]);
-  assertEqual(
-    model.gaps.map((g) => g.key).sort(),
-    ["gross_margin", "inventory_turnover"],
-    "缺字段时必须报两个缺口",
-  );
   const margin = model.primary.find((s) => s.key === "gross_margin") ?? fail("缺毛利率序列");
-  const turnover = model.primary.find((s) => s.key === "inventory_turnover") ?? fail("缺库存周转序列");
-  assert(margin.points.every((p) => p.value === null), "缺 cost_cents 时毛利率必须是 null，不是 0");
-  assert(turnover.points.every((p) => p.value === null), "缺 inventory_units 时库存周转必须是 null，不是 0");
-  // 销量是契约内字段，任何情况下都要能画
+  // 逐点对齐：任何"自己再算一遍"的实现（含/不含退款、加不加成本字段）都会在这里的某一位小数上露馅。
+  assertEqual(
+    margin.points.map((p) => p.value),
+    METRICS.points.map((p) => p.gross_margin ?? null),
+    "毛利率序列必须与 fixtures 的 gross_margin 逐点相同",
+  );
+  // 首点 gross_margin 为 null（那家店那天没配成本）→ 必须还是 null：既不能变 0，也不能变 1.0。
+  assertEqual(margin.points[0]?.value ?? null, null, "gross_margin=null 的点必须保持 null");
+  // 文案断言用字面量，不用 MARGIN_NULL_LABEL：拿常量跟同一个常量比，改文案永远不会红。
+  assertEqual(margin.nullLabel, "未配置成本", "null 值的卡片文案（不是 0% 也不是 —）");
+  assertEqual(margin.headline, "newest", "卡片头条取最新一天（null 也要显示「未配置成本」）");
+  // 销量来自契约内字段，任何情况下都要能画
   const sales = model.primary.find((s) => s.key === "paid_order_count") ?? fail("缺销量序列");
   assert(sales.points.some((p) => p.value !== null), "销量来自 paid_order_count（契约内），必须有值");
 });
 
-check("§7.5 扩展字段回来后毛利率/库存周转自动可算（证明缺口是数据问题，不是画不出）", () => {
+check("§7.5 gross_margin=0 是「不赚不亏」这个真事实，不得落进 null 分支显示「未配置成本」", () => {
+  // 这条防的是"把 0 当假"（`if (!v)` / `v || null` 式判断）：那会让 0 走进 nullLabel，
+  // 把"不赚不亏"显示成"没配成本"。契约 §7.5 明写 null ≠ 0（null=不知道，0=真事实）。
+  // 常量值单独用字面量钉一次——不拿 MARGIN_NULL_LABEL 跟自己比（那样的断言改文案永远不红）。
+  assertEqual(MARGIN_NULL_LABEL, "未配置成本", "导出常量的字面值");
+
+  const base = METRICS.points[METRICS.points.length - 1] ?? fail("fixtures 为空");
+  const zeroDay: MetricPoint = { ...base, gross_margin: 0, cost_coverage_ratio: 0.75 };
+  const margin = deriveDashboard([zeroDay]).primary.find((s) => s.key === "gross_margin") ?? fail("缺毛利率序列");
+  const point = margin.points[0] ?? fail("毛利率序列为空");
+  assert(point.value !== null, "gross_margin=0 不得被读成 null（null 才会走 nullLabel）");
+  assertEqual(point.value, 0, "gross_margin=0 必须原样保留为 0");
+  // 卡片取值逻辑是 `value === null ? nullLabel : renderValue(...)`，所以钉住 0 的展示字符串：
+  // 一旦有人把 0 折成 null，这里会变成 "未配置成本" 而红。
+  assertEqual(formatPercent(point.value, 2), "0.00%", "0 的展示字符串（不是「未配置成本」）");
+
+  // fixtures 里必须真的有一天 0：否则上面只是人造点，"不赚不亏"从没在默认数据里上过屏。
+  assertEqual(
+    METRICS.points.filter((p) => p.gross_margin === 0).map((p) => p.date),
+    ["2026-10-14"],
+    "默认 fixtures 里必须有且只有一天 gross_margin=0（演示不赚不亏）",
+  );
+  const fixtureMargin =
+    deriveDashboard(METRICS.points).primary.find((s) => s.key === "gross_margin") ?? fail("缺毛利率序列");
+  const fixtureZero = fixtureMargin.points.find((p) => p.date === "2026-10-14") ?? fail("缺 2026-10-14");
+  assertEqual(fixtureZero.value, 0, "fixtures 的 0 传到派生层仍然是 0（不是 null）");
+  assert(
+    typeof fixtureZero.qualifier === "string" && fixtureZero.qualifier.includes("76.37%"),
+    `0 那天仍要带覆盖率前提，实际 ${String(fixtureZero.qualifier)}`,
+  );
+});
+
+check("§7.5 库存周转仍按契约缺口处理：缺 inventory_units 报缺口并全 null，扩展字段回来后自动可算", () => {
+  const baseline = deriveDashboard(METRICS.points as MetricPoint[]);
+  // 毛利率不再是缺口（字段已入契约），只剩库存周转
+  assertEqual(baseline.gaps.map((g) => g.key), ["inventory_turnover"], "缺字段时必须且只报库存周转一个缺口");
+  const turnover = baseline.primary.find((s) => s.key === "inventory_turnover") ?? fail("缺库存周转序列");
+  assert(turnover.points.every((p) => p.value === null), "缺 inventory_units 时库存周转必须是 null，不是 0");
+
   const extended = (metricsExtendedFixture as unknown as MetricsResponse).points;
-  const model = deriveDashboard(extended);
-  assertEqual(model.gaps.length, 0, "有扩展字段时不应报缺口");
+  const withInventory = deriveDashboard(extended);
+  assertEqual(withInventory.gaps.length, 0, "有 inventory_units 时不应报缺口");
+  const turnoverExt = withInventory.primary.find((s) => s.key === "inventory_turnover") ?? fail("缺库存周转序列");
+  assert(turnoverExt.points.some((p) => p.value !== null), "带 inventory_units 时库存周转应有值");
+
+  // 毛利率不吃扩展字段：Mock 扩展开关（只加 inventory_units）不得改变任何一个毛利率的数
+  const marginExt = withInventory.primary.find((s) => s.key === "gross_margin") ?? fail("缺毛利率序列");
+  assertEqual(
+    marginExt.points.map((p) => p.value),
+    METRICS.points.map((p) => p.gross_margin ?? null),
+    "毛利率不因 Mock 扩展字段开而变化",
+  );
+});
+
+check("§7.5 最新一天 gross_margin=null → 头条是 null（不拿更早那天的数冒充今天）", () => {
+  const valued = METRICS.points[METRICS.points.length - 1] ?? fail("fixtures 为空");
+  assert(valued.gross_margin !== null && valued.gross_margin !== undefined, "末点应当有值（否则这条断言测不到东西）");
+  // 追加一天"没配成本"：卡片头条必须是 null → 显示「未配置成本」；环比仍用最后一个有值点。
+  const nullDay: MetricPoint = { ...valued, date: "2026-10-23", gross_margin: null, cost_coverage_ratio: 0 };
+  const margin =
+    deriveDashboard([valued, nullDay]).primary.find((s) => s.key === "gross_margin") ?? fail("缺毛利率序列");
+  assertEqual(margin.headline, "newest", "头条取最新一天");
+  assertEqual(margin.points[margin.points.length - 1]?.value ?? null, null, "最新一天是 null");
+  assertEqual(summarize(margin).latest?.date, "2026-10-22", "环比基线仍是最后一个有值点");
+});
+
+check("§7.5 旧自算口径已删除：只给契约外 cost_cents、不给 gross_margin → 毛利率必须是 null", () => {
+  // 这条是防回退：旧实现读 cost_cents 按 (GMV − 退款 − 成本) / (GMV − 退款) 算，会得到 0.24 这种数。
+  // 现在同一个点必须一个数都算不出来——"两套口径并存"在这里被钉死。
+  const legacy = [
+    {
+      date: "2026-10-22",
+      gmv_cents: 12_840_000,
+      order_count: 342,
+      paid_order_count: 318,
+      refund_order_count: 11,
+      refund_amount_cents: 215_000,
+      aov_cents: 40_377,
+      refund_rate: 0.034591,
+      uv: 5_120,
+      cvr: 0.062109,
+      gmv_7d_avg_cents: null,
+      cost_cents: 7_960_800,
+      inventory_units: 10_812,
+      computed_at: "2026-10-22T17:00:00Z",
+    },
+  ] as unknown as MetricPoint[];
+  const margin =
+    deriveDashboard(legacy).primary.find((s) => s.key === "gross_margin") ?? fail("缺毛利率序列");
+  assertEqual(margin.points.map((p) => p.value), [null], "只有 cost_cents 时不得算出任何毛利率");
+  // 同上：字面量断言，不拿 MARGIN_NULL_LABEL 跟自己比。
+  assertEqual(margin.nullLabel, "未配置成本", "算不出来时显示「未配置成本」而不是 0%");
+});
+
+check("§7.5 毛利率与 cost_coverage_ratio 成对读：覆盖率<1 必须在卡片上给出「仅覆盖 X%」", () => {
+  const model = deriveDashboard(METRICS.points as MetricPoint[]);
   const margin = model.primary.find((s) => s.key === "gross_margin") ?? fail("缺毛利率序列");
-  const turnover = model.primary.find((s) => s.key === "inventory_turnover") ?? fail("缺库存周转序列");
-  assert(margin.points.some((p) => p.value !== null), "带 cost_cents 时毛利率应有值");
-  assert(turnover.points.some((p) => p.value !== null), "带 inventory_units 时库存周转应有值");
-  // 毛利率公式抽查： (净收入 - 成本) / 净收入，净收入 = GMV - 退款金额
-  const first = extended[0] ?? fail("扩展 fixtures 为空");
-  // cost_cents 是契约外字段（没有类型别名可依赖），这里按扩展 fixtures 的实际形状读。
-  const cost = (first as unknown as { cost_cents?: number }).cost_cents ?? fail("扩展 fixtures 缺 cost_cents");
-  const net = first.gmv_cents - first.refund_amount_cents;
-  const expected = (net - cost) / net;
-  const actual = margin.points[0]?.value ?? fail("毛利率首点为空");
-  assert(Math.abs(actual - expected) < 1e-9, `毛利率首点公式不符：期望 ${expected}，实际 ${actual}`);
+  const last = margin.points[margin.points.length - 1] ?? fail("毛利率序列为空");
+  // fixtures 末点覆盖率 0.7418 → 提示必须带出这个数（这是"敢显示这个毛利率"的前提）
+  assertEqual(last.qualifier, "仅覆盖 74.18% 成交额", "覆盖率<1 的口径提示");
+  // 覆盖率恰好 100% 的点没有前提要补，不要硬塞一句废话
+  const full = margin.points.find((p) => p.date === "2026-10-16") ?? fail("缺 2026-10-16");
+  assertEqual(full.qualifier ?? null, null, "覆盖率=100% 时不补口径提示");
+  // 值为 null 时不挂提示（否则会出现「未配置成本 + 仅覆盖 0.00%」这种叠字）
+  assertEqual(margin.points[0]?.qualifier ?? null, null, "null 值不挂口径提示");
+});
+
+check("§7.5 cost_coverage_ratio 的三条边界：>1 如实显示不裁剪、缺失时不猜、0 明说「一个成本都没配」", () => {
+  const base = METRICS.points[METRICS.points.length - 1] ?? fail("fixtures 为空");
+  const marginOf = (point: MetricPoint): { value: number | null; qualifier: string | null } => {
+    const series = deriveDashboard([point]).primary.find((s) => s.key === "gross_margin") ?? fail("缺毛利率序列");
+    const first = series.points[0] ?? fail("毛利率序列为空");
+    return { value: first.value, qualifier: first.qualifier ?? null };
+  };
+
+  // >1：上游汇总与订单明细对不上时后端如实给 >1，前端不许 min(…,1.0) 抹平，也不许格式化成 100%
+  const over = marginOf({ ...base, cost_coverage_ratio: 2 });
+  assertEqual(over.value, base.gross_margin ?? null, "毛利率数值本身不受覆盖率影响");
+  assert(over.qualifier !== null && over.qualifier.includes("200.00%"), `>1 必须如实显示，实际 ${String(over.qualifier)}`);
+
+  // 覆盖率缺失（分母为 0 / 未按 SKU 归集）：不能说成"覆盖 100%"或"覆盖 0%"，要讲"未给出"
+  const unknown = marginOf({ ...base, cost_coverage_ratio: null });
+  assert(
+    unknown.qualifier !== null && unknown.qualifier.includes("未给出"),
+    `覆盖率缺失时必须说明未给出，实际 ${String(unknown.qualifier)}`,
+  );
+
+  // 覆盖率恰好 0：语义是"一个成本都没配 / 没归集"，不是"覆盖率很小"。
+  // 合规后端下 coverage=0 ⟹ gross_margin=null ⟹ 卡片走「未配置成本」，这个分支到不了；
+  // 能到这儿必然是后端违约（给了非 null 的毛利率），所以文案要直白，不能是「仅覆盖 0.00% 成交额」。
+  const zeroCoverage = marginOf({ ...base, gross_margin: 0.12, cost_coverage_ratio: 0 });
+  assert(
+    zeroCoverage.qualifier !== null && zeroCoverage.qualifier.includes("一个成本都没配"),
+    `coverage=0 必须明说"一个成本都没配"，实际 ${String(zeroCoverage.qualifier)}`,
+  );
+  assert(
+    zeroCoverage.qualifier !== null && !zeroCoverage.qualifier.includes("仅覆盖"),
+    `coverage=0 不得退化成"仅覆盖 0.00%"，实际 ${String(zeroCoverage.qualifier)}`,
+  );
 });
 
 // ————————————————————————— mock 假后端的 §7.4 校验 —————————————————————————
@@ -519,6 +647,8 @@ const METRIC_POINT_KEYS = [
   "uv",
   "cvr",
   "gmv_7d_avg_cents",
+  "gross_margin",
+  "cost_coverage_ratio",
   "computed_at",
 ];
 
@@ -532,9 +662,10 @@ check("扩展字段单独放 metrics.extended.json（不在默认 fixtures 里�
   const extended = (metricsExtendedFixture as unknown as MetricsResponse).points;
   assert(extended.length > 0, "扩展 fixtures 不能为空");
   for (const point of extended) {
+    // 契约外只剩 inventory_units：cost_cents 随"毛利率自算路径"一起删除了，不许回潮
     assertDeepKeys(
       point as unknown as Record<string, unknown>,
-      [...METRIC_POINT_KEYS, "cost_cents", "inventory_units"],
+      [...METRIC_POINT_KEYS, "inventory_units"],
       `extended points[${point.date}]`,
     );
   }

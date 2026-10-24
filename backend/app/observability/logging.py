@@ -55,12 +55,18 @@ __all__ = [
 ]
 
 #: 默认脱敏键（dict **键名**，大小写不敏感，见 `redact_any`）。
+#:
+#: `password` 必须在这一组里（v1.5.0 补）：它原先只在 `DEFAULT_SCRUB_KEYS`（文本层），
+#: 而文本层只认 `key=value` 形态——于是 `data={"password": "SECRET"}` 这种**结构化**值
+#: 两层都碰不到，明文落盘。这是审查实测出来的（构造一条带 password 的审计事件即可复现）。
+#: 教训：一个名字该放哪一层，看的是"它出现在什么**位置**"，不是"它敏不敏感"。
 DEFAULT_REDACT_KEYS: tuple[str, ...] = (
     "app_secret",
     "access_token",
     "sign",
     "authorization",
     "cookie",
+    "password",
 )
 
 #: 默认 scrub 键（自由**文本里**出现在 `key=value` 里的键名，大小写不敏感，见 `redact_any`）。
@@ -312,7 +318,14 @@ class JsonlLogSink:
     ) -> None:
         self._path = Path(path)
         self._path.parent.mkdir(parents=True, exist_ok=True)
-        self._redact_keys = tuple(redact_keys)
+        # **并集，不是替换**：与文本层 `_scrub_keys()` 保持同一语义（"默认键只增不减"）。
+        # 这里原先写的是 `tuple(redact_keys)`，而所有真实装配点传的都是 settings 里的键集合
+        # （`adapters.refresh_log_sink` / `main` lifespan / 测试 conftest）——于是**新增一个默认键
+        # 在生产路径上完全不生效**：把 `password` 加进 `DEFAULT_REDACT_KEYS` 之后，
+        # `data={"password": "SECRET"}` 依旧明文落盘（独立审查实测）。
+        # 教训：同一个类里两个"脱敏键集合"不能一个取并集、一个取替换——
+        # 配置只能往默认集上**加**，不能悄悄把它减掉，否则默认值就是摆设。
+        self._redact_keys = tuple({*DEFAULT_REDACT_KEYS, *redact_keys})
         self._scrub_patterns = _scrub_patterns(_scrub_keys(self._redact_keys))
         self._lock = threading.Lock()
         self._seq = self._read_last_seq()

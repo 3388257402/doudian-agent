@@ -181,6 +181,45 @@ rules:
     assert [rule_id for rule_id, _ in evaluation.skipped] == ["div_zero_rule"]
 
 
+def test_anomaly_threshold_uses_the_frozen_name_set(tmp_path: Path) -> None:
+    """`threshold` 的"主指标名集合"必须来自 `ALLOWED_NAMES`（v1.5.1 修掉的第二份清单）。
+
+    漂移现场：`gmv_delta_ratio` 是 §8.3.3 的环比派生量，只在 `ALLOWED_NAMES` 里有。
+    旧实现手抄了一份清单、漏掉了三个派生量，于是引用它们的规则（仓里 `aov_drop_day`
+    就是这么写的）永远拿不到 `threshold`，前端只能显示 `observed vs None`。
+    """
+    assert "gmv_delta_ratio" in ALLOWED_NAMES
+    path = _write(
+        tmp_path,
+        """
+version: "1"
+rules:
+  - id: delta_rule
+    enabled: true
+    severity: info
+    metric: aov_cents
+    when: "gmv_delta_ratio is not None and gmv_delta_ratio < -0.2"
+    window: day
+    description: "GMV 环比跌幅超过 20%"
+""",
+    )
+    metrics = {"date": "2026-10-23", "gmv_cents": 100_000, "aov_cents": 20_000}
+    history = [{"date": "2026-10-22", "gmv_cents": 200_000}]  # 环比 = (100000-200000)/200000 = -0.5
+
+    evaluation = evaluate_rules(
+        metrics=metrics,  # type: ignore[arg-type]
+        history=history,  # type: ignore[arg-type]
+        rules=load_rules(path),
+        run_id="run_threshold",
+        max_anomalies=20,
+    )
+    assert [item["rule_id"] for item in evaluation.anomalies] == ["delta_rule"]
+    assert evaluation.anomalies[0]["observed"] == 20_000
+    assert evaluation.anomalies[0]["threshold"] == -0.2, (
+        "派生量必须能从同一个冻结集合里被认成主指标名，否则 threshold 永远是 None"
+    )
+
+
 def test_none_comparison_is_false_not_exception() -> None:
     """`gmv_7d_avg_cents` 为 None 时数值比较为 False（§8.3.3），`is None` 正常工作。"""
     compiled = compile_expression(

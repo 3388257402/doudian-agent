@@ -3,7 +3,7 @@
 # 表达式求值走白名单 AST 解释器（app/services/rules.py）：
 #   - 没有函数调用（白名单里没有 Call）：没有 abs()、没有 len()、没有 __import__
 #   - 没有属性访问、没有下标、没有推导式、没有 f-string
-#   - 只能引用 §8.3.3 冻结的 18 个名字
+#   - 只能引用 §8.3.3 冻结的名字（实现侧唯一事实源是 `app/services/rules.py` 的 `ALLOWED_NAMES`）
 #
 # 任何结构错误（未知字段 / 语法错误 / 拼错的指标名）都在**加载期**抛 RuleLoadError，
 # 不会拖到运行期变成"规则永远不触发"。
@@ -54,3 +54,36 @@ rules:
     when: "gmv_delta_ratio is not None and gmv_delta_ratio < -0.2"
     window: day
     description: "GMV 环比跌幅超过 20%（默认关闭，用于人工排查）"
+
+  # ------------------------------------------------------------------------------------
+  # 亏本卖（v1.5.0）：让 Agent 第一次能回答"是不是有货在亏本卖"（README 已知限制 4）。
+  #
+  # 口径（`app/services/metrics.py` 的 `_margin_and_coverage`）：
+  #   gross_margin        = (有成本 SKU 的成交额 - 这些 SKU 的成本额) / 有成本 SKU 的成交额
+  #   cost_coverage_ratio = 有成本 SKU 的成交额 / 全店 GMV
+  # 两者都只对**配了成本**的 SKU 计算；一个成本都没配时都是 None（不是 0）。
+  #
+  # 阈值为什么是 0.0：成本表里的成本是**商品成本**，不含平台佣金、支付手续费、运费和退货
+  # 损耗。所以"毛利率 < 0"是**已经确定在亏**的那条线，而不是"薄利预警线"。用 0.05 之类的
+  # 阈值等于把"薄利"报成"亏本"，而这个规则一旦误报，Agent 就会去给本来正常的商品改价/下架
+  # ——本仓最贵的一类误报。想更早预警可以改这个数，它是运营参数，不是代码常量：
+  # 改这里 → 重跑 backend 全量测试（`load_rules` 会重新校验表达式）。
+  #
+  # 为什么必须同时看覆盖率（≥ 60%）：`gross_margin` 只代表"有成本的那部分成交"。若覆盖率
+  # 只有 10%，一个 -50% 的毛利率只说明"这一小撮在亏"，拿它当全店结论去动别人的价就是误伤。
+  # 覆盖率与毛利率必须成对出现，缺一个都不能下结论（两条 `is not None` 就是在保证这一点）。
+  #
+  # 为什么没有 actions：现有动作类型（price_update / stock_update / coupon_create）都需要
+  # **一个确定的 SKU** 作为目标，而店铺级加权毛利率**指不出是哪件货在亏**——`target_from`
+  # 只能拿 top_gmv_sku / lowest_stock_sku 去猜，猜错就是给好货降价或下架。所以本次只
+  # **告警不动手**（§8.3：actions 缺省 = 只报警）。等 §5.3.1 的 SKU 级 `skus` 落地后，
+  # 这条规则应改为 SKU 级并直接对亏损 SKU 出 `price_update`（提价，不是降价）或停售。
+  # ------------------------------------------------------------------------------------
+  - id: loss_making
+    enabled: true
+    severity: critical
+    metric: gross_margin
+    when: "gross_margin is not None and gross_margin < 0.0 and cost_coverage_ratio is not None and cost_coverage_ratio >= 0.6"
+    window: day
+    description: "有成本覆盖的成交额整体低于商品成本价（加权毛利率 < 0，且成本覆盖 ≥ 60%）"
+

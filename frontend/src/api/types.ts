@@ -1,4 +1,4 @@
-// 逐字照抄 docs/CONTRACT.md §12（契约 v1.2.0，2026-10-23 冻结）。
+// 逐字照抄 docs/CONTRACT.md §12（契约 v1.5.0，冻结）。
 // 规则：JSON 键与后端 Python 字段名 1:1 相同（snake_case），此处不做 camelCase 转换；
 // 字面量联合类型用枚举字符串；金额一律整数分且字段名以 _cents 结尾；"没有"用 null 而非缺键。
 // 改这里之前必须先改 CONTRACT.md 并升版本（§13 变更流程）。
@@ -121,6 +121,8 @@ export interface MetricPoint {
   uv: number | null;
   cvr: number | null;
   gmv_7d_avg_cents: Money | null;
+  gross_margin?: number | null;
+  cost_coverage_ratio?: number | null;
   computed_at: string;
 }
 

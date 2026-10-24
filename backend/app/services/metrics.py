@@ -11,6 +11,11 @@
    在边界炸，而不是静默转换——静默转换会让 9900 分 vs 99.00 元的歧义一路传到下单。
 4. 缺字段语义：`order_summary` 的五个金额/计数是**必需字段**（缺 → `KeyError`，
    因为缺了就算不出契约要求的字段）；`uv` 是可缺字段（缺 → `uv=None`, `cvr=None`）。
+5. 成本口径（`gross_margin` / `cost_coverage_ratio`）：成本是**参数**（`cost_table`）不是文件
+   读取（§8.5：读 `config/sku_costs.yaml` 是装配层的责任）。没有成本 → 两个字段都是 `None`，
+   **不是 0**：把"没配成本"当 0 会把正常的商品判成亏本，然后 Agent 去改价/下架——本仓里
+   最贵的一类误报。`cost_coverage_ratio` 存在的唯一理由，是让消费者看到"这个毛利率只覆盖了
+   一部分成交额"，而不是把它当成全店的结论。
 """
 
 from __future__ import annotations
@@ -46,6 +51,7 @@ def compute_metrics(
     previous: MetricsSnapshot | None = None,
     history: Sequence[MetricsSnapshot] | None = None,
     now: datetime | None = None,
+    cost_table: Mapping[str, int] | None = None,
 ) -> MetricsSnapshot:
     """由原始快照算出 `MetricsSnapshot`（公式见 §5.3 表，逐行对应）。
 
@@ -53,6 +59,11 @@ def compute_metrics(
     用 `history` 算出来放进规则命名空间（§8.3.3 的 `gmv_delta_ratio` 等）。
     这里对 `previous` 只做**顺序一致性校验**——把"历史倒序传入"这种错误在源头拦住，
     否则环比符号会整体翻转，而结果看起来完全正常。
+
+    `cost_table` 是 keyword-only 的**可选**参数（`sku_id -> 成本整数分`，§8.5）：不传等价于
+    "这家店没配成本"，两条成本口径字段都是 `None`。传了也不会凭空造出按 SKU 的成交额——那
+    必须由 `collect` 归集进 `order_summary["by_sku"]`，否则我们只知道"成本是多少"，不知道
+    "卖出去了多少件、按什么价卖的"，算不出任何有意义的毛利率。
     """
     _reject_non_cent_amounts(raw)
 
@@ -93,6 +104,10 @@ def compute_metrics(
 
     gmv_7d_avg_cents = _gmv_7d_avg(history or (), today=date)
 
+    gross_margin, cost_coverage_ratio = _margin_and_coverage(
+        summary, gmv_cents=gmv_cents, cost_table=cost_table
+    )
+
     computed_at = _iso_z(now)
 
     return {
@@ -107,8 +122,111 @@ def compute_metrics(
         "uv": uv,
         "cvr": cvr,
         "gmv_7d_avg_cents": gmv_7d_avg_cents,
+        "gross_margin": gross_margin,
+        "cost_coverage_ratio": cost_coverage_ratio,
         "computed_at": computed_at,
     }
+
+
+def _margin_and_coverage(
+    summary: Mapping[str, Any],
+    *,
+    gmv_cents: int,
+    cost_table: Mapping[str, int] | None,
+) -> tuple[float | None, float | None]:
+    """店铺级加权毛利率 + 有成本 SKU 的成交额占比（两个都可能为 `None`）。
+
+    公式（只对**有成本**的那部分 SKU 算，成本未知的 SKU 既不进分子也不进分母）：
+
+        covered_revenue = Σ by_sku[sku].gmv_cents        （sku ∈ cost_table）
+        covered_cost    = Σ cost_table[sku] × by_sku[sku].units
+        gross_margin        = (covered_revenue - covered_cost) / covered_revenue
+        cost_coverage_ratio = covered_revenue / gmv_cents
+
+    为什么分母是"有成本的成交额"而不是全店 GMV：把没有成本的 SKU 塞进分母，等于假设
+    "这些 SKU 的成本等于售价"（毛利 0）。那是**编出来的数**，而且方向不可控——真亏的会被
+    摊薄成"还行"，真赚的会被摊薄成"亏本"。宁可只报一个覆盖了一部分的毛利率，也不报一个
+    假装覆盖了全店的。
+
+    为什么需要 `cost_coverage_ratio`：上面那个"只报一部分"的性质必须**可见**，否则
+    `gross_margin = -0.5` 会被读成"全店在亏"，其实它可能只代表 5% 的成交额。规则层因此
+    要求覆盖率下限；本函数只负责如实给出这个数。
+
+    `None` 的四种来源（都**不能**用 0 代替）：
+    - `by_sku` 缺失：`collect` 没做按 SKU 归集（老快照/历史桶）→ 无法归属，两个都是 `None`；
+    - `covered_revenue == 0`：一个 SKU 都没配上成本（或配了但今天没卖）→ 毛利率 `None`；
+    - `gmv_cents == 0`：全店没成交 → 覆盖率的分母是 0 → `None`（§5.3 的除法边界）；
+    - 覆盖率不裁剪：`covered_revenue > gmv_cents` 说明上游汇总与订单明细对不上，如实给出
+      > 1 的数，让数据不一致暴露出来，而不是用 `min(…, 1.0)` 把它抹平。
+    """
+    by_sku = summary.get("by_sku")
+    if by_sku is None:
+        return None, None
+    if not isinstance(by_sku, Mapping):
+        # 用 ValueError 而不是 TypeError：与同文件的 `_require_int` / `_reject_non_cent_amounts`
+        # 保持一致——本模块把"上游给的数据形状不对"统一表达成 ValueError（调用方只需处理一种）。
+        raise ValueError(  # noqa: TRY004
+            f"order_summary.by_sku 必须是映射（sku_id -> {{gmv_cents, units}}），"
+            f"收到 {type(by_sku).__name__}"
+        )
+
+    table = cost_table or {}
+    covered_revenue = 0
+    covered_cost = 0
+    for raw_sku, entry in by_sku.items():
+        sku_id = str(raw_sku)
+        where = f"order_summary.by_sku[{sku_id!r}]"
+        if not isinstance(entry, Mapping):
+            raise ValueError(  # noqa: TRY004 - 同上：数据形状错误统一用 ValueError
+                f"{where} 必须是映射，收到 {type(entry).__name__}"
+            )
+        entry_revenue = _require_int(entry, "gmv_cents", where=where)
+        entry_units = _require_int(entry, "units", where=where)
+        if entry_revenue < 0:
+            raise ValueError(f"{where}.gmv_cents 必须 >= 0，收到 {entry_revenue}")
+        if entry_units < 0:
+            raise ValueError(f"{where}.units 必须 >= 0，收到 {entry_units}")
+
+        cost = table.get(sku_id)
+        if cost is None:
+            continue  # 成本未知：不计入毛利，但它的成交额也不会被塞进分母（见 docstring）
+        # 成本表本身在加载期已校验（§8.5），这里再查一次是因为 `compute_metrics` 是公开
+        # 纯函数：调用方可以直接传字典进来，边界上炸比让 float 成本静默参与运算更好。
+        if isinstance(cost, bool) or not isinstance(cost, int):
+            raise ValueError(  # noqa: TRY004 - 同上：金额类型错误统一用 ValueError
+                f"cost_table[{sku_id!r}] 必须是整数分 int，收到 {cost!r}"
+            )
+        if cost <= 0:
+            raise ValueError(f"cost_table[{sku_id!r}] 必须 > 0（整数分），收到 {cost}")
+        if entry_revenue > 0 and entry_units == 0:
+            # 有成交额却没有件数：成本摊不出去（金额/件数任一为 0 都会让毛利率失真）。
+            #
+            # 为什么采集层容错、这里却拒绝（v1.5.1，两层**态度不同是刻意的**）：
+            # - 采集层（`nodes._order_units`）面对的是**上游真实脏数据**：`product_count: 0`
+            #   如果直接抛，`collect` 节点会把整轮 run 打成 failed → `POST /api/agent/run` 500
+            #   → 一条脏数据打死当天所有指标。所以那一层对"件数 <= 0 / 缺件数"按 1 件降级，
+            #   并记一条 warn 级审计（JSONL 可见）；
+            # - 本层是**纯函数边界**，面对的是"已经归集好的 by_sku"。到这里 `units` 已经被
+            #   下游当成真值参与 `成本额 = 单价成本 × 件数`，再猜一次就等于在真值上盖一层猜测，
+            #   而且会让"有人绕开 collect 手工拼 summary"这类错误永远不被发现。所以这里拒绝，
+            #   不降级、不兜底。
+            #
+            # 换句话说：容错属于**数据入口**，拒绝属于**计算契约**；两者都在做自己的本职。
+            raise ValueError(
+                f"{where}: 成交额 {entry_revenue} > 0 但 units = 0，成本无法折算"
+                "（按 SKU 归集时件数必须 >= 1）"
+            )
+
+        covered_revenue += entry_revenue
+        covered_cost += cost * entry_units
+
+    gross_margin = (
+        None
+        if covered_revenue <= 0
+        else round((covered_revenue - covered_cost) / covered_revenue, 6)
+    )
+    cost_coverage_ratio = None if gmv_cents <= 0 else round(covered_revenue / gmv_cents, 6)
+    return gross_margin, cost_coverage_ratio
 
 
 def _gmv_7d_avg(history: Sequence[Mapping[str, Any]], *, today: str) -> int | None:

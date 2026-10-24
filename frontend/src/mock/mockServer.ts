@@ -35,8 +35,9 @@ import { getMockFlags } from "./flags";
 const SHOP = "12345678";
 const APPROVAL_SEED = alertsFixture as unknown as AlertsResponse;
 const METRICS_SEED = metricsFixture as unknown as MetricsResponse;
-// 契约外扩展字段（cost_cents / inventory_units）只在 mock 开关打开时才回给前端，
+// 契约外扩展字段（inventory_units）只在 mock 开关打开时才回给前端，
 // 见 src/mock/flags.ts 的说明：默认响应必须与 §7.5 的真实形状一致。
+// 毛利率/成本覆盖率是**契约字段**（§7.5），两个 fixtures 里都已经有，不受开关影响。
 const METRICS_EXTENDED_SEED = metricsExtendedFixture as unknown as MetricsResponse;
 const LOGS_SEED = logsFixture as unknown as LogsResponse;
 
@@ -227,7 +228,7 @@ function handleMetrics(req: ApiRequest, trace: string): TransportResponse {
     return bad("RESOURCE_NOT_FOUND", `店铺 ${shopId} 没有指标数据`, { shop_id: shopId }, 404, trace);
   }
 
-  // 默认按 §7.5 的真实形状返回；只有显式打开 Mock 扩展开关时，才附上 cost_cents / inventory_units。
+  // 默认按 §7.5 的真实形状返回；只有显式打开 Mock 扩展开关时，才附上契约外的 inventory_units。
   const source = getMockFlags().extendedMetrics ? METRICS_EXTENDED_SEED : state.metrics;
   const points = source.points.filter((p: MetricPoint) => {
     if (dateFrom !== null && p.date < dateFrom) return false;

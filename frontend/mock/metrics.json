@@ -19,6 +19,8 @@
       "uv": 7500,
       "cvr": 0.062,
       "gmv_7d_avg_cents": null,
+      "gross_margin": null,
+      "cost_coverage_ratio": 0.0,
       "computed_at": "2026-10-09T17:00:00Z"
     },
     {
@@ -33,6 +35,8 @@
       "uv": 7700,
       "cvr": 0.062468,
       "gmv_7d_avg_cents": null,
+      "gross_margin": 0.187412,
+      "cost_coverage_ratio": 0.735184,
       "computed_at": "2026-10-10T17:00:00Z"
     },
     {
@@ -47,6 +51,8 @@
       "uv": null,
       "cvr": null,
       "gmv_7d_avg_cents": null,
+      "gross_margin": 0.179065,
+      "cost_coverage_ratio": 0.728634,
       "computed_at": "2026-10-11T17:00:00Z"
     },
     {
@@ -61,6 +67,8 @@
       "uv": 8100,
       "cvr": 0.062222,
       "gmv_7d_avg_cents": 18573333,
+      "gross_margin": 0.194831,
+      "cost_coverage_ratio": 0.750327,
       "computed_at": "2026-10-12T17:00:00Z"
     },
     {
@@ -75,6 +83,8 @@
       "uv": 7800,
       "cvr": 0.062308,
       "gmv_7d_avg_cents": 18967500,
+      "gross_margin": 0.190572,
+      "cost_coverage_ratio": 0.744108,
       "computed_at": "2026-10-13T17:00:00Z"
     },
     {
@@ -89,6 +99,8 @@
       "uv": 8400,
       "cvr": 0.062738,
       "gmv_7d_avg_cents": 19058000,
+      "gross_margin": 0.0,
+      "cost_coverage_ratio": 0.763749,
       "computed_at": "2026-10-14T17:00:00Z"
     },
     {
@@ -103,6 +115,8 @@
       "uv": 7600,
       "cvr": 0.062368,
       "gmv_7d_avg_cents": 19391667,
+      "gross_margin": 0.186945,
+      "cost_coverage_ratio": 0.730412,
       "computed_at": "2026-10-15T17:00:00Z"
     },
     {
@@ -117,6 +131,8 @@
       "uv": 7900,
       "cvr": 0.062658,
       "gmv_7d_avg_cents": 19327143,
+      "gross_margin": 0.192517,
+      "cost_coverage_ratio": 1.0,
       "computed_at": "2026-10-16T17:00:00Z"
     },
     {
@@ -131,6 +147,8 @@
       "uv": 8100,
       "cvr": 0.062716,
       "gmv_7d_avg_cents": 19495714,
+      "gross_margin": 0.197238,
+      "cost_coverage_ratio": 0.770196,
       "computed_at": "2026-10-17T17:00:00Z"
     },
     {
@@ -145,6 +163,8 @@
       "uv": 7700,
       "cvr": 0.062208,
       "gmv_7d_avg_cents": 19650000,
+      "gross_margin": 0.188341,
+      "cost_coverage_ratio": 0.742508,
       "computed_at": "2026-10-19T17:00:00Z"
     },
     {
@@ -159,6 +179,8 @@
       "uv": 7400,
       "cvr": 0.062297,
       "gmv_7d_avg_cents": 19831429,
+      "gross_margin": 0.181176,
+      "cost_coverage_ratio": 0.726833,
       "computed_at": "2026-10-20T17:00:00Z"
     },
     {
@@ -173,6 +195,8 @@
       "uv": 6600,
       "cvr": 0.060606,
       "gmv_7d_avg_cents": 19584286,
+      "gross_margin": 0.165384,
+      "cost_coverage_ratio": 0.708912,
       "computed_at": "2026-10-21T17:00:00Z"
     },
     {
@@ -187,6 +211,8 @@
       "uv": 5120,
       "cvr": 0.062109,
       "gmv_7d_avg_cents": 19092857,
+      "gross_margin": 0.1832,
+      "cost_coverage_ratio": 0.7418,
       "computed_at": "2026-10-22T17:00:00Z"
     }
   ]

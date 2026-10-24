@@ -37,7 +37,17 @@ function renderAxis(series: MetricSeries): (value: number | null) => string {
 
 export function MetricCard({ series, color, gap }: MetricCardProps): JSX.Element {
   const { latest, previous } = summarize(series);
-  const delta = formatDelta(latest?.value ?? null, previous?.value ?? null);
+  // 头条值：默认取"最后一个有值点"（趋势卡惯例）；毛利率声明了 headline="newest"，
+  // 于是最新一天是 null 时头条就是 null → 卡片显示「未配置成本」，不会拿更早那天的数冒充今天。
+  const headline =
+    series.headline === "newest" ? (series.points[series.points.length - 1] ?? null) : latest;
+  const delta = formatDelta(headline?.value ?? null, previous?.value ?? null);
+  const value = headline?.value ?? null;
+  // 最新值为 null 时不能含糊：毛利率写「未配置成本」（null = 没配成本，不是 0% 也不是"数据没刷新"）。
+  // 没有 nullLabel 的序列（其他指标）沿用 "—"，因为对它们来说 null 只是"没有这个数"。
+  const valueText = value === null ? (series.nullLabel ?? "—") : renderValue(series, value);
+  // 显示数值时必须一起显示的口径前提（毛利率 = "仅覆盖 X% 成交额"）。值本身为 null 时 metrics.ts 不挂它。
+  const qualifier = value === null ? null : (headline?.qualifier ?? null);
 
   return (
     <section className="card metric-card" aria-label={series.label}>
@@ -52,9 +62,11 @@ export function MetricCard({ series, color, gap }: MetricCardProps): JSX.Element
       </header>
 
       <div className="metric-value">
-        <strong>{renderValue(series, latest?.value ?? null)}</strong>
-        <span className="metric-date">{latest ? latest.date : "无数据"}</span>
+        <strong>{valueText}</strong>
+        <span className="metric-date">{headline ? headline.date : "无数据"}</span>
       </div>
+
+      {qualifier !== null ? <p className="metric-qualifier">{qualifier}</p> : null}
 
       {gap ? (
         <div className="gap-box">

@@ -52,9 +52,15 @@ EXPECTED_NODES: tuple[str, ...] = (
     "finalize",
 )
 
-#: JSONL 里我们自己的事件名只有 `node.trace` 一族（其它事件走 state 的 `audit` 进库，
-#: 不走 JSONL）——所以"链路走完"的判据是**8 个节点的 node.trace 都在**，不是某个收尾事件名。
-#: 别在这里发明一个 `run.finished`：JSONL 里没有它（它只在 state.audit 里）。
+#: JSONL 里我们自己的事件名分两类：
+#:
+#: 1. `node.trace`（8 个节点各一条，+ 审批重放一条）——节点级事实源；
+#: 2. 审计出口事件（v1.5.1 起）：`metrics.computed` / `anomaly.detected` / `sku_costs.unmatched` /
+#:    `collect.units_degraded` / `collect.zero_revenue_paid`。它们过去**只**进 `state.audit`
+#:    （checkpoint），于是 `loss_making` 这类只告警不给动作的规则在日志页上完全不存在。
+#:
+#: "链路走完"的判据仍然是**8 个节点的 node.trace 都在**：审计事件是"事实的可见性"，
+#: 不是"节点跑了"的判据（采集失败时 `collect.done` 就不会出现，而 `collect` 的 node.trace 仍在）。
 
 #: 本文件在 `backend/tests/fixtures/demo/`；parents[3] 是仓库根
 REPO_ROOT = HERE.parents[3]

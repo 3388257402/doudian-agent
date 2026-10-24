@@ -30,8 +30,15 @@ import yaml
 
 from app.enums import ActionType, Severity
 
-# §8.3.3 冻结命名空间
-ALLOWED_NAMES: frozenset[str] = frozenset(
+# §8.3.3 的**两个**名字集合。互斥是"两轮判定唯一性"的前提：规则引用了哪一侧的名字，
+# 就决定了它在"店铺轮"还是"SKU 轮"求值（§5.4）。一个名字同时属于两边 = 轮次有歧义。
+#
+# 为什么要显式拆成两个集合而不是一个扁平 frozenset（v1.5.0，ADR-021 A 条）：
+# `gross_margin` 在店铺级是"全店有成本覆盖的加权毛利率"，在 SKU 级是"单件售价与单件成本之差"，
+# **分母不同、精度不同、用途不同**。扁平集合下，谁把它同时加进两边都没人拦——直到某个
+# 为全店调的 `gross_margin < 0` 被套到单品上，把"薄利"判成"亏本"，Agent 就会去给正常商品
+# 改价/下架。那是本仓最贵的一类误报，所以这条门禁必须存在，且失败时要报得出来。
+SHOP_NAMES: frozenset[str] = frozenset(
     {
         "gmv_cents",
         "order_count",
@@ -43,15 +50,87 @@ ALLOWED_NAMES: frozenset[str] = frozenset(
         "uv",
         "cvr",
         "gmv_7d_avg_cents",
+        # v1.5.0：店铺级成本口径（`compute_metrics(..., cost_table=…)`，§8.5 的成本表）。
+        # 两个名字必须成对使用：只看毛利率会拿"5% 成交量"的结论去改全店的价。
+        "gross_margin",
+        "cost_coverage_ratio",
+        # 派生量（由上面几个算出，不是上游直接给）
         "gmv_delta_ratio",
         "order_delta_ratio",
         "refund_rate_delta",
+    }
+)
+
+#: SKU 轮命名空间。**按 §8.3.3 冻结清单写全 10 个，即使其中 6 个还没实现**——
+#: 写全是这条门禁的意义所在：门禁要拦的是"将来有人把 `gross_margin` 也加进 SKU 侧"，
+#: 而不是"现在有几个名字没实现"。未实现的那些仍会被 `ALLOWED_NAMES` 挡在 `load_rules` 之外。
+#: 注意：SKU 侧毛利率的**唯一合法名字是 `sku_gross_margin`**（§8.3.3 命名硬规则 / ADR-021）。
+SKU_NAMES: frozenset[str] = frozenset(
+    {
         "stock",
         "current_price_cents",
         "stock_days",
         "is_on_sale",
+        "sku_gross_margin",
+        "cost_cents",
+        "sales_7d",
+        "avg_daily_sales_7d",
+        "ad_spend_cents_7d",
+        "ad_order_count_7d",
     }
 )
+
+#: 当前**可用**的名字 = 店铺级全部 + SKU 级已实现的 4 个。
+#: 与 v1.5.0 之前的行为完全一致（19 个名字），SKU 轮次落地时再把其余 6 个加进来。
+ALLOWED_NAMES: frozenset[str] = frozenset(SHOP_NAMES) | frozenset(
+    {"stock", "current_price_cents", "stock_days", "is_on_sale"}
+)
+
+
+def assert_name_sets_disjoint() -> None:
+    """断言 §8.3.3 的两个名字集合互斥，且 `ALLOWED_NAMES` 没有越界。
+
+    **为什么在 import 期就调用一次**：这是**代码写错了**（不是配置写错了），
+    越早炸越好——等到某个客户店的 `rules.yaml` 加载时才炸，现场看到的是"规则加载失败"，
+    真正的原因（两个常量集合重叠）要翻三层代码才找得到。
+
+    **为什么 `load_rules` 里也调**：契约 §8.3.3 把这条写成了加载期门禁，
+    运维在改完 `rules.py` 后只要调用一次 `load_rules` 就该看到结果，不必依赖 import 时机。
+
+    报错必须带**交集名字**并指向 §8.3.3 / ADR-021——不允许裸 `AssertionError`、
+    不允许"取其一"式自动改名（那会让阈值在无人察觉时换了含义）。
+    """
+    overlap = SHOP_NAMES & SKU_NAMES
+    if overlap:
+        raise RuleLoadError(
+            "§8.3.3 命名空间被破坏：以下名字同时属于店铺级与 SKU 级 → "
+            f"{sorted(overlap)}。两集合必须互斥（规则引用的名字决定求值轮次，"
+            "同时属于两边会让轮次不确定）。SKU 侧毛利率的唯一合法名字是 "
+            "`sku_gross_margin`——见 §8.3.3「命名硬规则」/ ADR-021",
+            rule_id="<namespace>",
+        )
+    outside = ALLOWED_NAMES - (SHOP_NAMES | SKU_NAMES)
+    if outside:
+        raise RuleLoadError(
+            f"§8.3.3：ALLOWED_NAMES 里有不属于任何一轮的名字 {sorted(outside)}——"
+            "每个可用名字都必须能归入店铺级或 SKU 级，否则规则求值时没有确定的轮次",
+            rule_id="<namespace>",
+        )
+    missing = SHOP_NAMES - ALLOWED_NAMES
+    if missing:
+        raise RuleLoadError(
+            f"§8.3.3：店铺级名字 {sorted(missing)} 未出现在 ALLOWED_NAMES 里——"
+            "店铺轮规则会因为'名字不在命名空间'而被拒绝加载",
+            rule_id="<namespace>",
+        )
+
+
+# import 期的第一次校验**不能写在这里**：`RuleLoadError` 在下面才定义。
+# 那条校验的唯一职责就是失败时抛 `RuleLoadError` 并带上 §8.3.3 / ADR-021 的报错文本；
+# 若在异常类定义前调用，失败时抛的是 `NameError`——报错文本全丢，门禁在最需要它的
+# 那一刻失效。这个顺序错误是独立审查实测抓出来的（构造重叠集合 → 期望 RuleLoadError，
+# 实际 NameError）。真正的调用点在 `RuleLoadError` 定义之后。
+
 
 _RULE_ID_RE = re.compile(r"^[a-z][a-z0-9_]{1,63}$")
 _SKU_TARGET_RE = re.compile(r"^sku:[A-Za-z0-9_-]{1,64}$")
@@ -93,6 +172,12 @@ class RuleLoadError(Exception):
         if source is not None:
             parts.append(f"source={source!r}")
         super().__init__(" | ".join(parts))
+
+
+# import 期立刻验一次：写错常量属于代码缺陷，不该等到某个店的配置加载才暴露。
+# 位置必须在 `RuleLoadError` 定义之后，否则失败时抛 `NameError` 而不是带条款指的
+# `RuleLoadError`（见上方那段说明）。
+assert_name_sets_disjoint()
 
 
 class RuleEvalError(Exception):
@@ -632,6 +717,10 @@ def _parse_rule(raw: Any, *, index: int, allowed_names: frozenset[str]) -> Rule:
 
 def load_rules(path: str | Path | None = None) -> RuleSet:
     """加载并**完整校验** `rules.yaml`。任何问题都在这里抛 `RuleLoadError`（§8.1/§8.3.3）。"""
+    # 契约 §8.3.3 要求的"加载期门禁"：命名空间被破坏时，这里就要报出来。
+    # import 期已经验过一次；这里再验是为了让"改完 rules.py 调一次 load_rules 就能确认"
+    # 成为可操作的步骤，而不是必须重新启动进程才能发现问题。
+    assert_name_sets_disjoint()
     rules_path = Path(path) if path is not None else _DEFAULT_RULES_PATH
     try:
         text = rules_path.read_text(encoding="utf-8")
@@ -684,12 +773,17 @@ def build_namespace(metrics: Mapping[str, Any], **overrides: Any) -> dict[str, A
 
 __all__ = [
     "ALLOWED_NAMES",
+    "SHOP_NAMES",
+    "SKU_NAMES",
     "CompiledExpr",
     "Rule",
     "RuleAction",
     "RuleEvalError",
     "RuleLoadError",
     "RuleSet",
+    # 门禁必须能被外部显式调用：契约 §8.3.3 要求"改完 rules.py 调一次 load_rules 就能确认"，
+    # 而 `import *` 或按名取用的调用方此前根本看不到这个函数（审查 F3）。
+    "assert_name_sets_disjoint",
     "build_namespace",
     "compile_expression",
     "evaluate",

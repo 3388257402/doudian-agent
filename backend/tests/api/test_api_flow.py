@@ -302,9 +302,47 @@ async def test_logs_show_interrupted_node_trace_and_desc_paging(api: ApiHarness)
     assert len(second_page["items"]) == 6
     assert all(item["seq"] < int(first_page["next_cursor"]) for item in second_page["items"])
 
-    # level 过滤 + 未知 run 的空页
+    # level 过滤：本 run 有**一条** critical 异常（`refund_spike`），它必须落成 `level=error`。
+    #
+    # v1.5.1 之前这里断言的是 `items == []`——那条断言本身编码了缺陷：审计条目当时只进
+    # `state.audit`（checkpoint），从来不写 JSONL，所以一条 critical 告警在日志页上根本不存在。
+    # 现在两条通道并存：`node.trace` 的键集合不变，异常走独立的 `anomaly.detected` 事件。
     errors = await api.http.get("/api/logs", params={"run_id": run["run_id"], "level": "error"})
-    assert errors.status_code == 200 and errors.json()["items"] == []
+    assert errors.status_code == 200
+    error_items = errors.json()["items"]
+    assert [item["event"] for item in error_items] == ["anomaly.detected"]
+    assert error_items[0]["data"]["rule_id"] == "refund_spike"
+    assert error_items[0]["data"]["severity"] == "critical"
+    # 但**节点级**没有红灯：整轮没有一条 node.trace 的 outcome=error（挂起是 info，§7.6.1）
+    assert [item for item in error_items if item["event"] == "node.trace"] == []
+    warning_level = await api.http.get(
+        "/api/logs", params={"run_id": run["run_id"], "level": "warn"}
+    )
+    assert warning_level.status_code == 200
+    warn_items = warning_level.json()["items"]
+    # warn 档：异常明细（gmv_drop_day 是 warn）+ 采集层降级（上游没给件数，成本会偏乐观）。
+    # 按 `data.kind` 取明细（v1.5.2）：同一个 event 名下有两种 schema，不能靠"有没有 rule_id"猜。
+    assert "gmv_drop_day" in [
+        item["data"]["rule_id"] for item in warn_items if item["data"].get("kind") == "detail"
+    ]
+    assert any(item["event"] == "collect.units_degraded" for item in warn_items)
+    assert all(item["event"] != "node.trace" for item in warn_items)
+    # `event` 前缀匹配：`anomaly.` 命中本次 run 的所有异常事件（一条汇总 + 每条异常一条明细）。
+    # 这是"审批台看不到的告警至少能在日志页查到"的接口级保证（loss_making 只告警不给动作）。
+    anomalies = await api.http.get(
+        "/api/logs", params={"run_id": run["run_id"], "event": "anomaly."}
+    )
+    assert anomalies.status_code == 200
+    anomaly_items = anomalies.json()["items"]
+    assert all(item["event"] == "anomaly.detected" for item in anomaly_items)
+    detail_items = [item for item in anomaly_items if item["data"].get("kind") == "detail"]
+    summary_items = [item for item in anomaly_items if item["data"].get("kind") == "summary"]
+    assert len(summary_items) == 1 and summary_items[0]["data"]["count"] == 2
+    assert "rule_id" not in summary_items[0]["data"]
+    assert {"gmv_drop_day", "refund_spike"} <= {
+        item["data"]["rule_id"] for item in detail_items
+    }
+
     unknown = await api.http.get("/api/logs", params={"run_id": "run_does_not_exist"})
     assert unknown.status_code == 200 and unknown.json() == {"items": [], "next_cursor": None}
 

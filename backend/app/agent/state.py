@@ -65,6 +65,11 @@ class MetricsSnapshot(TypedDict):
     uv: int | None  # 访客数，无数据 => None
     cvr: float | None  # paid_order_count / uv，任一缺失 => None
     gmv_7d_avg_cents: int | None  # 近 7 日（不含今天）均值，历史不足 => None
+    # 成本口径（v1.5.0，README 已知限制 4 计划中的"店铺级加权毛利率"）：
+    # 只对**配了成本**的 SKU 计算，成本未知的 SKU 既不进分子也不进分母。
+    # 没有成本 / 没有按 SKU 归集 / 分母为 0 => None（**绝不填 0**：0 会把"没配成本"判成亏本）。
+    gross_margin: float | None  # (有成本成交额 - 这些 SKU 的成本额) / 有成本成交额
+    cost_coverage_ratio: float | None  # 有成本 SKU 的成交额占全店 GMV 的比例（暴露覆盖不全）
     computed_at: str
 
 

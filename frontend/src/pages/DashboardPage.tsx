@@ -114,7 +114,7 @@ export function DashboardPage(): JSX.Element {
                 metrics.refresh();
               }}
             />
-            <span className="field-hint">模拟后端额外返回 cost_cents / inventory_units（契约外）</span>
+            <span className="field-hint">模拟后端额外返回 inventory_units（契约外，用于库存周转）</span>
           </label>
         ) : null}
       </div>
@@ -160,19 +160,21 @@ export function DashboardPage(): JSX.Element {
                 ))}
               </ul>
               <p className="banner-hint">
-                这是契约缺口，不是前端 bug：<code>MetricPoint</code>（§7.5/§12）里没有成本与库存字段。已向 spec-lead
-                提议增补可选扩展字段（<code>frontend/src/api/extension.ts</code> 有完整说明）。Mock 模式下可用筛选栏的
-                「Mock：扩展字段」开关演示后端补齐后的样子。
+                这是契约缺口，不是前端 bug：<code>MetricPoint</code>（§7.5/§12）里没有库存字段（
+                <code>inventory_units</code>），库存周转因此算不出来。已向 spec-lead 提议把它作为可选扩展字段增补进契约（
+                <code>frontend/src/api/extension.ts</code> 有完整说明）。Mock 模式下可用筛选栏的「Mock：扩展字段」
+                开关演示后端补齐后的样子。
               </p>
             </section>
           ) : null}
 
           {mode === "mock" && mockFlags.extendedMetrics ? (
             <section className="banner banner-warn" aria-label="Mock 扩展字段">
-              <strong>当前响应含契约外扩展字段（cost_cents / inventory_units）</strong>
+              <strong>当前响应含契约外扩展字段（inventory_units）</strong>
               <p className="banner-hint">
-                这是 Mock 假后端在模拟"后端哪天补上这两个字段"。真实后端按 §7 的 <code>response_model</code>{" "}
-                禁止透传未知字段，所以默认不返回它们；关掉开关即可看到契约原样下的行为（两张卡片变成缺口提示）。
+                这是 Mock 假后端在模拟"后端哪天补上库存字段"。真实后端按 §7 的 <code>response_model</code>{" "}
+                禁止透传未知字段，所以默认不返回它；关掉开关即可看到契约原样下的行为（库存周转那张卡变成缺口提示）。
+                毛利率不在此列：它读的是契约字段 <code>gross_margin</code>，开关不影响。
               </p>
             </section>
           ) : null}
@@ -209,8 +211,9 @@ export function DashboardPage(): JSX.Element {
       ) : null}
 
       <p className="muted small">
-        看板只读：不提供"手工改指标"。所有指标由后端 <code>compute_metrics</code> 按 §5.3 公式算出；前端任何派生量（毛利率、库存周转、
-        环比）都在 <code>src/lib/metrics.ts</code> 里，公式写在函数的注释里。
+        看板只读：不提供"手工改指标"。所有指标由后端 <code>compute_metrics</code> 按 §5.3 公式算出；毛利率与成本覆盖率
+        <strong>直接取后端字段</strong>（前端不自算、不读契约外成本字段），前端只负责派生同比/环比与库存周转（
+        <code>src/lib/metrics.ts</code>，公式写在函数注释里）。
       </p>
     </div>
   );

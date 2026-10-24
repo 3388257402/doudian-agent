@@ -791,6 +791,13 @@ h4 {
   color: var(--text-muted);
 }
 
+/* 口径提示（毛利率的"仅覆盖 X% 成交额"）：必须和数值一起读，所以放在数值正下方而不是塞进 tooltip。 */
+.metric-qualifier {
+  margin: 4px 0 0;
+  font-size: 12px;
+  color: #f59e0b;
+}
+
 .delta {
   font-size: 12px;
   font-variant-numeric: tabular-nums;

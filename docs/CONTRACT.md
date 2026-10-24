@@ -1,6 +1,6 @@
 # CONTRACT.md — 抖店智能运营 Agent 契约（单一事实源）
 
-- 版本：**1.4.0**（冻结；v1.3.1 补 §4.7 规则 5c2 与 §7.6.1 的 `error.type`；v1.3.2 登记 `app/api/queries.py` 的只读边界与 §7.5 数据源；**v1.4.0 合并此前未登记的两批增量**——原拟 1.3.3 的 **§7.6.2 脱敏两层与「必须测通道」**（并入本版，不再单独计版本）+ 正文里**已存在但 §13 未登记**的 **SKU 维度与成本表**条文（§3.3 / §5.1 / §5.3.1 / §5.4 / §8.3.3 / §8.5 / §10.3 / §11 的 `v1.4.0` 标注自此有 §13 依据），并结清「正文标 1.4.0、版本行停在 1.3.x」的欠账；**纯增量**：不改既有签名（新增参数全部 keyword-only 带默认值）、不改表列、不改 JSON 键、不改错误码，见 §13）
+- 版本：**1.5.0**（冻结；**v1.5.0 = 成本/毛利率落地，纯增量**——§3.3 `MetricsSnapshot` 新增 `gross_margin` / `cost_coverage_ratio`（**店铺级**成本口径）、§5.3 `compute_metrics(..., cost_table=…)` 由"已入册未实现"转为**已实现**并新增数据面 `order_summary["by_sku"]`、§8.3.3 `ALLOWED_NAMES` 新增这两个名字且冻结「SKU 侧必须叫 `sku_gross_margin`」、§8.3 新增 `loss_making` 规则（**只告警不给动作**）、§8.5 补成本表实现细节并把"启动期交叉校验"改写为**运行期审计**；**未完成项见 §13 的 1.5.0 行**；v1.3.1 补 §4.7 规则 5c2 与 §7.6.1 的 `error.type`；v1.3.2 登记 `app/api/queries.py` 的只读边界与 §7.5 数据源；**v1.4.0 合并此前未登记的两批增量**——原拟 1.3.3 的 **§7.6.2 脱敏两层与「必须测通道」**（并入本版，不再单独计版本）+ 正文里**已存在但 §13 未登记**的 **SKU 维度与成本表**条文（§3.3 / §5.1 / §5.3.1 / §5.4 / §8.3.3 / §8.5 / §10.3 / §11 的 `v1.4.0` 标注自此有 §13 依据），并结清「正文标 1.4.0、版本行停在 1.3.x」的欠账；**纯增量**：不改既有签名（新增参数全部 keyword-only 带默认值）、不改表列、不改 JSON 键、不改错误码，见 §13）
 - 维护者：spec-lead（唯一有权修改本文件的人）
 - 适用方：agent-core / platform / frontend 三方**并行开发**
 - 冻结规则：本文件中的**路径、名称、签名、字段名、枚举值、JSON 键、错误码**均为契约正文。任何一方需要偏离，必须先提给 spec-lead 改本文件并升版本，**不得**在自己代码里"先这么写"。
@@ -354,7 +354,7 @@ class RawSnapshot(TypedDict):
     window: Window
     shop: dict[str, Any]                   # 店铺基础信息（原样字段 + 归一化字段）
     products: list[dict[str, Any]]         # 每个商品/规格一条，金额已归一化为 *_cents
-    order_summary: dict[str, Any]          # 订单聚合（金额 *_cents）
+    order_summary: dict[str, Any]          # 订单聚合（金额 *_cents）；v1.5.0 起另含 by_sku（见本节末）
     source: dict[str, Any]                 # {"methods": [...], "request_ids": [...], "partial": bool}
 
 
@@ -370,6 +370,8 @@ class MetricsSnapshot(TypedDict):
     uv: int | None                          # 访客数，无数据 => None
     cvr: float | None                       # paid_order_count / uv，任一缺失 => None
     gmv_7d_avg_cents: int | None            # 近 7 日（不含今天）均值，历史不足 => None
+    gross_margin: float | None              # v1.5.0 店铺级：只对**有成本**的 SKU 加权，算不出 => None（绝不是 0）
+    cost_coverage_ratio: float | None       # v1.5.0 店铺级：有成本成交额 / 全店 GMV，分母 0 => None（**不裁剪**）
     skus: list[SkuSnapshot]                 # SKU 级明细，按 sku_id 升序
     computed_at: str
 
@@ -508,6 +510,20 @@ def append_audit(state: AgentState, entry: AuditEntry) -> list[AuditEntry]:
 **`history` 里 `skus` 必须为 `[]`（v1.4.0 冻结）**：`history` 是"近 7 天店铺级对比"用的，只读其店铺级字段；7 天的 SKU 明细塞进 state 会把 LangGraph checkpoint 放大到 8×N（N = SKU 数），且没有任何消费者（SKU 级 7 日均值由 `raw` 的 7 日聚合直接算出，见 §5.3.1）。**禁止**在 `history` 元素里填 `skus`，也**禁止**新增 `sku_history` 字段（要加得先提契约变更）。
 
 **派生方向（v1.4.0，单向）**：`raw.products`（每个 SKU 一条，金额已是整数分）→ `metrics.skus`（`compute_metrics` 产出）→ `anomalies`（`detect_anomalies` 两轮求值）→ `pending_actions`（`propose_actions`）。**反向禁止**：`compute_metrics` 不得读 `anomalies`，`detect_anomalies` 不得回写 `metrics`。原因是 `interrupt` 恢复会重放节点（ADR-010），单向派生保证重放幂等。
+
+**成本口径的两个字段是「店铺级」的（v1.5.0 冻结，ADR-021）**：`gross_margin` / `cost_coverage_ratio` 描述的是**全店有成本覆盖的那部分成交额**，**不是**任何单个 SKU 的毛利率。三条硬语义（任何一条被"优化"掉都会直接变成误报）：
+
+1. **只对有成本的 SKU 加权**。成本未知的 SKU 既不进分子也不进分母——把它们的成交额塞进分母，等于假设"这些 SKU 的成本 = 售价"（毛利 0），那是**编出来的数**，而且方向不可控（真亏的被摊薄成"还行"，真赚的被摊薄成"亏本"）。
+2. **算不出就是 `None`，绝不是 `0`**。四种来源：①老快照没有 `by_sku`（没做按 SKU 归集）；②一个有成本的 SKU 都没有（或配了但今天没卖）；③覆盖率的分母（全店 GMV）为 0；④有成本成交额为 0。写成 `0` 会被读成"不赚不亏"这个**假事实**，而 `0 < 阈值` 还会直接判亏本 → Agent 去改价/下架（本仓最贵的一类误报）。
+3. **覆盖率不裁剪**。`cost_coverage_ratio > 1` 是**合法输出**（上游汇总与订单明细对不上），必须如实暴露，**禁止** `min(…, 1.0)` 抹平——抹平等于把数据不一致藏起来。
+
+**`order_summary["by_sku"]` 是成本口径的唯一数据面（v1.5.0 新增，由 `collect` 归集，公式见 §5.3）**：`{sku_id: {"gmv_cents": int, "units": int}}`。口径逐条冻结：
+
+- 只统计**已支付**的订单行（"已支付"的判据是数据不是状态词表：`pay_amount > 0` 或存在 `pay_time`）；
+- 明细里**没有 `sku_id`** 的已支付行**不放进 `by_sku`**，只进全店 GMV 分母（计为未覆盖）——它无法归属到任何 SKU，**绝不**为了凑满覆盖率摊到别的 SKU 上；
+- **退款单仍计入**成交额与件数（与 `gmv_cents` 的既有口径一致：GMV 含已退款支付额）；退款把成本冲回来（退货入库）是另一个口径，需要单独的净额指标，不在这里偷偷做掉；
+- **件数缺失按 1 件**，且这个假设**有方向**：件数偏小 → 成本额偏小 → 毛利率偏高 → 更不容易报"亏本"，即它只会造成**漏报**（可见、可补字段），不会造成"把好货判成亏本"的误报；
+- **件数有值但不是非负整数**（float / 字符串 / bool / 负数）→ `ValueError`：静默取 1 会把"上游改了字段类型"永远藏成"每单都只买一件"。
 
 ---
 
@@ -1011,7 +1027,7 @@ class DoudianClient:
         clock: Callable[[], float] = time.monotonic,
         sleep: Callable[[float], Awaitable[None]] = asyncio.sleep,
         logger: logging.Logger | None = None,
-        total_budget_s: float | None = None,                        # v1.4.0 新增（keyword-only）
+        total_budget_s: float | None = None,                        # v1.4.0 入册（keyword-only）；**v1.5.0 确认：代码未实现**，见 §13(m)
         redact_keys: Sequence[str] = DEFAULT_REDACT_KEYS,           # v1.4.0 新增（keyword-only）
     ) -> None: ...
 
@@ -1051,7 +1067,7 @@ def create_doudian_client(settings: Settings) -> DoudianClient: ...
 5. `mutating=True` 时**只对 `rate_limited` 重试**；`timeout`/`connection`/`server_5xx` 一律转 `DoudianAmbiguousOutcomeError`（ADR-011）。
 6. 响应解析：HTTP 2xx 且 body 是 JSON 且 `body["err_no"] == 0` → `ok=True`；`err_no != 0` → 抛对应 `DoudianError` 子类（**不返回 ok=False 让调用方自己判断**——必须抛）。
    `request_id`：取响应头 `x-tt-logid` / `x-request-id` / body 的 `log_id`，都没有则 `None`（不编造）。
-7. 日志：每次 `call` 结束写一条 `doudian.call` 事件（`method`、`http_status`、`err_no`、`attempts`、`duration_ms`、`request_id`），**脱敏走 §7.6.2 的两层并集**：**键名层** 5 键（`app_secret`/`access_token`/`sign`/`authorization`/`cookie`）+ **值级层** 9 键（`app_secret`/`access_token`/`app_key`/`token`/`secret`/`password`/`sign`/`authorization`/`cookie`，见 §7.6.2）。只做键名层等于对**字符串** `message` 完全不设防（上游错误原文正是 `"… access_token=SECRET …"` 这种形态），因此两层都必须走。
+7. 日志：每次 `call` 结束写一条 `doudian.call` 事件（`method`、`http_status`、`err_no`、`attempts`、`duration_ms`、`request_id`），**脱敏走 §7.6.2 的两层并集**：**键名层** 6 键（`app_secret`/`access_token`/`sign`/`authorization`/`cookie`/`password`）+ **值级层** 9 键（`app_secret`/`access_token`/`app_key`/`token`/`secret`/`password`/`sign`/`authorization`/`cookie`，见 §7.6.2）。只做键名层等于对**字符串** `message` 完全不设防（上游错误原文正是 `"… access_token=SECRET …"` 这种形态），因此两层都必须走。
 
 **v1.4.0 新增两个 keyword-only 参数（冻结，含默认值与理由）**
 
@@ -1061,10 +1077,11 @@ DEFAULT_REDACT_KEYS: tuple[str, ...] = ("app_secret", "access_token", "sign", "a
 
 | 参数 | 默认 | 语义 | 为什么必须**在这里** |
 |---|---|---|---|
-| `total_budget_s: float \| None` | `None`（= `settings.app.request_timeout_s`） | **单次 `call` 的绝对截止时间预算**：从**第一个请求发出前**起算的秒数，覆盖"每次尝试 + 全部退避 + 重试"的**总耗时**；超预算立即停止重试并抛最后一个错误类别（§9.2）。**不是每次尝试重新计时**——那正是"重试把请求总时长放大到不可控"的成因。`None` → 由 `create_doudian_client(settings)` 从 `settings.app.request_timeout_s` 填入，保证生产路径永远不是 `None` | §9.2 早就要求了"单次 call 的总时间预算"，但 §5.1 的签名里没有位置。没有入口时，实现只能把 `settings` 塞进 client（client 就不纯了）或干脆不实现预算（§9.2 变成空话）。注入一个 float 是唯一不改依赖关系的落点 |
+| `total_budget_s: float \| None` | `None`（= `settings.app.request_timeout_s`） | **单次 `call` 的绝对截止时间预算**：从**第一个请求发出前**起算的秒数，覆盖"每次尝试 + 全部退避 + 重试"的**总耗时**；超预算立即停止重试并抛最后一个错误类别（§9.2）。**不是每次尝试重新计时**——那正是"重试把请求总时长放大到不可控"的成因。`None` → 由 `create_doudian_client(settings)` 从 `settings.app.request_timeout_s` 填入，保证生产路径永远不是 `None`。**⚠ v1.5.0 状态：已入册、代码未实现**（见 §13(m)）：当前重试上界只有 `max_attempts` × 退避，**不存在**绝对截止时间；一次 `call` 的最坏耗时仍可能到几十秒 | §9.2 早就要求了"单次 call 的总时间预算"，但 §5.1 的签名里没有位置。没有入口时，实现只能把 `settings` 塞进 client（client 就不纯了）或干脆不实现预算（§9.2 变成空话）。注入一个 float 是唯一不改依赖关系的落点 |
 | `redact_keys: Sequence[str]` | `DEFAULT_REDACT_KEYS` | §5.1-7 脱敏用的键集合，**两层并集、同一个 `redact_keys` 同时喂给两层**（§7.6.2）：**键名层**＝dict 的键名 ∈ `redact_keys`（大小写不敏感）就把整个值递归替换为 `"***"`，默认 5 键；**值级层**＝自由文本里 `key=value` / `key: value` / `"key":"value"` 的**值**替换，键集 = `DEFAULT_SCRUB_KEYS ∪ redact_keys`（**只增不减**），默认 9 键。少任一层都有一整类输入 100% 漏遮：键名层对 `str` 是 no-op（而错误原文恰好写在 `message` 里），值级层看不见 dict 键。完整语义、已知边界与测试要求见 §7.6.2 | **client 不持有 `Settings`**（这是刻意的：`DoudianClient` 要能在没有配置系统的单测里构造）。而 §5.1-7 又要求按 `settings.observability.redact_keys` 脱敏——那只能注入。**不要**为这件事引入模块级全局配置：全局状态与 §5.1-1 的"一个进程一个 client"会互相掩盖，也会让测试之间的脱敏键互相污染 |
 
-`create_doudian_client(settings)` 必须把 `total_budget_s=settings.app.request_timeout_s` 与 `redact_keys=settings.observability.redact_keys` 显式传进去（单一装配点，§4.8）。
+`create_doudian_client(settings)` 必须把 `redact_keys=settings.observability.redact_keys` 显式传进去（单一装配点，§4.8）——这一条**已实现**。
+`total_budget_s=settings.app.request_timeout_s` 同样**必须**传，但**该参数在代码里还不存在**（v1.5.0 状态：已入册、未实现，见 §13(m)）。所以现在生产路径上**没有绝对截止预算**，只有 `max_attempts` × 退避。**不要**为了让这条"看起来成立"而在装配点硬塞一个位置参数——那会制造一个"传了但没人用"的假接线（本项目已因同类问题返工过一次）。
 
 #### 5.1.2 抖店异常族（`app/services/errors.py`，逐字）
 
@@ -1168,7 +1185,7 @@ def compute_metrics(
     previous: MetricsSnapshot | None = None,
     history: Sequence[MetricsSnapshot] | None = None,
     now: datetime | None = None,
-    cost_table: Mapping[str, int] | None = None,   # v1.4.0 新增（keyword-only）：sku_id -> cost_cents
+    cost_table: Mapping[str, int] | None = None,   # v1.5.0 **已实现**（keyword-only）：sku_id -> 成本整数分
 ) -> MetricsSnapshot: ...
 ```
 
@@ -1187,15 +1204,32 @@ def compute_metrics(
 | `uv` | `order_summary.get("uv")` | `None` |
 | `cvr` | `round(paid_order_count / uv, 6)`；`uv` 为 `None`/0 → `None` | `None` |
 | `gmv_7d_avg_cents` | `round(mean(history[*].gmv_cents))`，只取**日期 < 今天**的、最多 7 条；不足 3 条 → `None` | `None` |
+| `gross_margin` | **v1.5.0，店铺级加权**：`round((covered_revenue - covered_cost) / covered_revenue, 6)`；`covered_revenue = Σ by_sku[s].gmv_cents`（`s ∈ cost_table`），`covered_cost = Σ cost_table[s] × by_sku[s].units` | `None` |
+| `cost_coverage_ratio` | **v1.5.0**：`round(covered_revenue / gmv_cents, 6)`；**不裁剪**（`> 1` 合法，用于暴露上游汇总与明细对不上） | `None` |
 | `date` | `raw["window"]["end"]` | — |
 | `computed_at` | `(now or utcnow()).isoformat()` → 转 `...Z` | — |
 
 - 入参 `raw` 里的金额**必须已经是整数分**；若出现 `*_yuan`/float 金额字段 → 抛 `ValueError`（在边界处炸，不要静默转换）。
 - **`uv` 的来源与作用域（v1.3.2，公式不变）**：`uv` 不在订单明细里，只可能来自上游 `order.searchList` 的 `data.summary`（夹具/demo 约定；抖店真实接口不返回访客数）。`collect` 只有在**能确认这段汇总就是当天**时才把它写进 `order_summary["uv"]`——①`summary.date` / `summary.window.end` 显式声明的业务日期等于 `window.end`，或②本次返回的订单**全部落在** `window.end`（单日响应）。判不出来就写 `None`：**禁止**按"窗口汇总 / 天数"摊派（`cvr` 会被摊薄成约 1/8，所有 uv/cvr 规则静默失效），也**禁止**补 0。`uv` 有值但不是非负整数 → `ValueError`（不静默降级成"这家店没有访客数据"，那会把上游的数据结构变更永远藏起来）。
 
+- **成本口径：已实现（v1.5.0，ADR-021）**。`cost_table` 是 keyword-only 的**可选**参数（`sku_id -> 成本整数分`，来自 `config/sku_costs.yaml`，§8.5）；**不传**等价于"这家店没配成本"，两个成本字段都是 `None`。传了也**不会凭空造出按 SKU 的成交额**——那必须由 `collect` 归集进 `order_summary["by_sku"]`（§3.3），否则我们只知道"成本是多少"，不知道"卖了多少件、按什么价卖的"，算不出任何有意义的毛利率。边界逐条冻结（全部是**数据形状错误** → `ValueError`，**不静默降级**）：
+
+  | 情形 | 处置 |
+  |---|---|
+  | `by_sku` 缺失（`None`） | 两个字段都是 `None`（老快照/历史桶没做归集，无法归属） |
+  | `by_sku` 不是映射 / 某条 entry 不是映射 | `ValueError` |
+  | `entry["gmv_cents"]` / `entry["units"]` 缺失或非 `int` | `ValueError`（报错带 `order_summary.by_sku[<sku>]` 位置） |
+  | `entry["gmv_cents"] < 0` 或 `entry["units"] < 0` | `ValueError` |
+  | `cost_table[s]` 是 `bool` / 非 `int` / `<= 0` | `ValueError`（成本表加载期已校验，这里再查一次是因为本函数是**公开纯函数**，调用方可以直接传字典进来） |
+  | `entry["gmv_cents"] > 0` 但 `entry["units"] == 0` | `ValueError`（有成交额却没件数，成本摊不出去） |
+
+- **`None` 与 `0` 在成本口径上不是同义词**：`gross_margin = None` 是"不知道"，`0.0` 是"不赚不亏"，两者在规则求值里结果**不同**（前者数值比较为 `False`、规则不触发、**不进 skipped**；后者会被阈值判断真实地命中或错过）。`metrics.computed` 审计里两个字段必须原样落盘（`None` 与 `0.0` 可区分），否则事后无法解释"为什么这次 `loss_making` 没响"。
+- **成本表加载失败 ≠ 没有成本**：`compute_metrics` 节点取成本表时若抛 `ConfigError`，按 `category="config"` 记 `errors` 并让 run `failed`——**绝不**降级成空表继续跑，那会把一次配置事故伪装成"这家店没配成本"的正常状态。
+- **`sku_costs.unmatched` 审计（v1.5.0，§8.5）**：本次**商品列表非空**且成本表里有对不上的 `sku_id` 时，`compute_metrics` 节点记一条 `{"event": "sku_costs.unmatched", "data": {"sku_ids": [...], "count": n}}`。**只记不阻断**（一条过期配置不该让当天所有指标都算不出来）；商品列表为空时**不报**（采集降级时每一条都会"看起来对不上"，报出来是一串假警报，反而把真问题淹掉）。
+
 #### 5.3.1 SKU 级指标（`skus`，v1.4.0 新增，ADR-018）
 
-`compute_metrics` 除店铺级 12 个字段外，必须产出 `skus: list[SkuSnapshot]`：**每个在售或近 7 日有销量的 SKU 一条**，**按 `sku_id` 升序**（字符串比较，确定性排序让重放/哈希/diff 稳定）。
+`compute_metrics` 除店铺级 **14** 个字段外（v1.5.0 起含 `gross_margin` / `cost_coverage_ratio` 两个成本口径字段），必须产出 `skus: list[SkuSnapshot]`：**每个在售或近 7 日有销量的 SKU 一条**，**按 `sku_id` 升序**（字符串比较，确定性排序让重放/哈希/diff 稳定）。
 
 公式（逐字；**分母为 0 或任一操作数为 `None` → 结果为 `None`，绝不返回 0**）：
 
@@ -1213,6 +1247,8 @@ def compute_metrics(
 | `is_on_sale` | `raw.products[i]["is_on_sale"]`（bool） | 缺失 → `False` 并记 `errors` |
 | `ad_spend_cents_7d` | `raw.products[i].get("ad_spend_cents_7d", 0)` | 无数据 → `0`，并记 audit `ad_spend.unavailable`（见下） |
 | `ad_order_count_7d` | `raw.products[i].get("ad_order_count_7d", 0)` | 无数据 → `0`，同上 |
+
+**v1.5.0 命名冲突预告（必读）**：本表的 `gross_margin` 是 **SKU 级**（`(current_price_cents - cost_cents) / current_price_cents`），与 §5.3 / §3.3 新增的**店铺级** `gross_margin` **同名不同义**。SKU 轮次落地时本字段**必须**改名为 `sku_gross_margin`（§8.3.3 的硬规则），**不得**沿用同名——同名会让规则作者无意中把店铺级阈值套到单品上。
 
 **数据来源（必须如实，不许编造接口）**：
 - `products` / `订单`：`DoudianClient.list_products` / `search_orders`（§5.1）→ **`collect` 节点按 `sku_id` 归集**成 `raw.products[i]` 上的字段，金额在此处就算成整数分（§0）。
@@ -1786,6 +1822,8 @@ Query：
       "uv": 5120,
       "cvr": 0.062109,
       "gmv_7d_avg_cents": 11980000,
+      "gross_margin": 0.1832,
+      "cost_coverage_ratio": 0.7418,
       "computed_at": "2026-10-23T01:00:00Z"
     }
   ]
@@ -1801,7 +1839,20 @@ Query：
 2. **缺的日期不补零、缺的字段不补零**：`uv` / `cvr` 等"算不出来"的一律 `null`（§5.3），**禁止**用 0 或均值填充；
 3. run 枚举经 `app/api/queries.py` 只读取 `agent_traces`（`run_id` / `thread_id` / `status` / `started_at`），不写、不校准 `step_count`（边界见 §0.1）。
 
-**`/api/metrics` 仍是店铺级（v1.4.0 明确，不改形状）**：响应里**没有** `skus`，`MetricPoint` 字段集合与 v1.3.0 完全一致。原因不是"不需要"，而是**当前没有可服务的数据源**——四张表里没有指标表（§6.1），历史指标从哪来本节此前就没定义。把 `skus` 挂到一个没有落库的来源上，只会制造一条实现不了的契约。
+**v1.5.0 新增两个可选字段（`MetricPoint`，纯增量）**：`gross_margin` 与 `cost_coverage_ratio`，两者都是**店铺级**成本口径（§5.3 / §3.3），**默认 `null`**：
+
+- **语义**：`gross_margin` = 只对有成本的 SKU 加权的毛利率；`cost_coverage_ratio` = 有成本成交额 / 全店 GMV。**必须成对读**——覆盖率 10% 的 `-0.5` 不代表"全店在亏"。
+- **`null` 不是 `0`**：`null` = 没配成本 / 没做按 SKU 归集 / 分母为 0；`0.0` = "不赚不亏"这个真事实。消费者**禁止**把 `null` 当 0 参与比较或画成 0 的柱子。
+- **老 checkpoint 兼容**：`MetricsSnapshot` 里没有这两个键的历史快照，经 `MetricPoint` 的默认值校验为 `null`（响应模型 `model_config` 只 forbid extra，不改默认），**不需要回填、不需要重跑**。
+- **`cost_coverage_ratio` 可能 `> 1`**：上游汇总与订单明细对不上时会如实给出 `> 1`，**不裁剪**（§5.3）。消费者不要把它当"百分比必然 ≤ 100%"来格式化。
+
+**✅ 前端 TS 类型已同步（v1.5.0 落地，不是未完成项）**：`frontend/src/api/types.ts` 的 `MetricPoint` 已加 `gross_margin?: number | null` 与 `cost_coverage_ratio?: number | null`（:124-125），**同一次提交**里改完了 §12 的逐字块（所以 `frontend/scripts/verify.mjs` 的 §12 diff 是绿的）。
+
+前端看板的"毛利率"卡片**已改为直接读后端字段**（`frontend/src/lib/metrics.ts`：取值零计算，`null` 显示「未配置成本」而不是 `0.00%` 或 `—`），并且**删除了**原先那段自算口径——旧实现用**契约外字段** `cost_cents` 与另一套公式 `(GMV − 退款 − 成本) / (GMV − 退款)`，与后端店铺级加权**同名不同义**，同一个中文名下曾同时存在两个数。现在 `cost_cents` 已从 `src/api/extension.ts` 移除（文件头写明"不要加回来"），`verify-suite.ts` 里加了**反向断言**：只给 `cost_cents`、不给 `gross_margin` 时，毛利率必须一个数都算不出来——这条锁死旧路径不得回潮。
+
+覆盖率提示：`cost_coverage_ratio < 1` 时卡片显示「仅覆盖 X% 成交额」；`> 1` **原样显示不裁剪**（用来暴露上游汇总与明细对不上）；缺失时说"未给出"。**`0` 与 `null` 都不得被判成"全店不赚不亏"。**
+
+**`/api/metrics` 仍是店铺级（v1.4.0 明确，v1.5.0 不变）**：响应里**没有** `skus`（v1.5.0 加的两个字段是**店铺级**的，不是 SKU 明细）。原因不是"不需要"，而是**当前没有可服务的数据源**——四张表里没有指标表（§6.1），历史指标从哪来本节此前就没定义。把 `skus` 挂到一个没有落库的来源上，只会制造一条实现不了的契约。
 **处置**：SKU 级指标只在 `MetricsSnapshot`（state 内）可见，通过 `Anomaly.sku_id` → `ActionProposal.target` → `/api/alerts` 这条链路被运营看到（§7.3）。**要彻底解决**（SKU 明细看板 + 历史趋势）需要先做"指标持久化"决策（新增表或 JSONL 汇，走契约变更 + 一条新 ADR），不在 v1.4.0 范围。
 `/api/logs` 里的 `anomaly.detected` 事件可以带 `sku_id`（`data` 内自由字段），这是当前唯一能看到 SKU 级异常明细的地方。
 
@@ -1842,7 +1893,7 @@ Query：
 - 数据来源：JSONL 日志汇（`settings.observability.log_file`，默认 `data/logs/app.jsonl`）。行结构就是上面 `items[]` 的元素（`seq` 由写入端分配）。
 - 排序：`seq DESC`。`next_cursor` 为最后一条 `seq` 的字符串形式，无更多则 `null`。
 - 日志汇是**启动时**从文件末尾续上 `seq`（读取最后一行 `seq` +1）；文件不存在则从 1 开始。
-- 脱敏是**两层**（v1.3.3）：`data` 里的敏感**键名**（`app_secret`/`access_token`/`sign`/`authorization`/`cookie`，大小写不敏感）整个值替换为 `"***"`，**且** `message` 与 `data` 里的**自由文本**还要做值级 scrub（`access_token=xxx` 这类）——只做键名层时 `message` 完全不受保护，而上游错误原文恰好写在那里。完整语义、已知边界与测试要求见 **§7.6.2**。
+- 脱敏是**两层**（v1.3.3；v1.5.0 键名层补 `password`）：`data` 里的敏感**键名**（`app_secret`/`access_token`/`sign`/`authorization`/`cookie`/`password`，大小写不敏感）整个值替换为 `"***"`，**且** `message` 与 `data` 里的**自由文本**还要做值级 scrub（`access_token=xxx` 这类）——只做键名层时 `message` 完全不受保护，而上游错误原文恰好写在那里。完整语义、已知边界与测试要求见 **§7.6.2**。
 
 #### 7.6.1 节点级 trace 的事件形状（`event="node.trace"`，冻结 v1.2.0）
 
@@ -1941,7 +1992,7 @@ HITL 挂起（`outcome="interrupted"`，**这是正常控制流，不是故障**
 
 | 层 | 作用对象 | 命中判据 | 碰不到什么 |
 |---|---|---|---|
-| **键名层** | 任意嵌套 dict 的**键名** | 键名（大小写不敏感）∈ `settings.observability.redact_keys`（默认 `app_secret`/`access_token`/`sign`/`authorization`/`cookie`），命中就把该键的**整个值**（不论类型、不论深度）换成 `"***"` | 非 dict 结构；**`message` 这类自由文本**——那个键名叫 `message`，永远不叫 `access_token` |
+| **键名层** | 任意嵌套 dict 的**键名** | 键名（大小写不敏感）∈ `settings.observability.redact_keys`（默认 6 键：`app_secret`/`access_token`/`sign`/`authorization`/`cookie`/`password`），命中就把该键的**整个值**（不论类型、不论深度）换成 `"***"` | 非 dict 结构；**`message` 这类自由文本**——那个键名叫 `message`，永远不叫 `access_token` |
 | **值级层** | 任意**字符串**（`message`、`data` 里的字符串值、`error.message` 等） | 文本里出现 `key=value` / `key: value` / `"key":"value"` 的**值**；键集 = `DEFAULT_SCRUB_KEYS` ∪ `redact_keys`（**并集，只增不减**，默认 9 个：`access_token`/`app_secret`/`app_key`/`token`/`secret`/`password`/`sign`/`authorization`/`cookie`） | 结构化 `data` 的**键**（dict 键不是文本，正则看不见它） |
 
 - **只做键名层是不够的（这是真实事故，不是假设）**：上游错误原文是 `str`——`DoudianUpstreamError("… access_token=SECRET-abc123 …")`——它被写进 `message`（和 `data.error.message`），而按键名的脱敏对字符串是 no-op。于是"已脱敏"只对 dict 成立、对**真正会泄露的那条通道**不成立：契约与 DECISIONS 有 5 处声称已脱敏，`access_token=SECRET-abc123` 却原样进了 JSONL（REVIEW-core F1）。
@@ -2098,6 +2149,15 @@ rules:
       - type: stock_update
         target_from: top_refund_sku
         params: {stock: 0}
+
+  # v1.5.0：店铺级加权毛利率。**故意不给 actions**——理由见本节下方"为什么 loss_making 没有 actions"。
+  - id: loss_making
+    enabled: true
+    severity: critical
+    metric: gross_margin
+    when: "gross_margin is not None and gross_margin < 0.0 and cost_coverage_ratio is not None and cost_coverage_ratio >= 0.6"
+    window: day
+    description: "有成本覆盖的成交额整体低于商品成本价（加权毛利率 < 0，且成本覆盖 ≥ 60%）"
 ```
 
 字段语义：
@@ -2129,6 +2189,10 @@ rules:
 - 店铺级异常才用 `target_from`（`top_gmv_sku` / `top_refund_sku` / `lowest_stock_sku` / `sku:<id>`）。
 - `propose_actions` 的入参 `metrics` 已含 `skus`（§5.3.1），因此**签名不需要改**即可解析；`products` 仍用于校验 `target` 存在与取 `product_id`（`price_update` 需要 `product_id`+`sku_id` 两个参数，见 §5.5 schema 之外的调用侧要求）。
 - 一句话：**店铺级异常 → 挑 SKU；SKU 级异常 → 已经是那个 SKU**。两者不要混着写。
+
+**`loss_making` 为什么没有 `actions`（v1.5.0，ADR-021）**：`gross_margin` 是**店铺级加权**指标，它**指不出具体是哪件货在亏**。现有三种动作类型（`price_update` / `stock_update` / `coupon_create`）都要求一个**确定的 `target`**，而店铺级异常只能靠 `target_from` 去挑（`top_gmv_sku` / `lowest_stock_sku`）——那是**猜**。猜错的代价不对称：给"GMV 最高"的好货降价或下架，等于用一次误报去伤害店里最赚钱的商品，且**不可回滚**（价格改了、库存清零了，已经成交的订单收不回来）。所以本规则**只告警、不动手**（`actions` 缺省 = 只报警不动手，见上表）。等 §5.3.1 的 SKU 级 `skus` 落地后，这条规则应改为 **SKU 级**并对亏损 SKU 出 `price_update`（**提价**，不是降价）或停售——那时目标不再需要猜。
+
+**已知缺口（必须登记，不许读成"运营已经能看到"）**：alert-only 的异常（命中了无 `actions` 规则的 `Anomaly`）**不出现在 `/api/alerts`**——该端点读的是 `approval_request` 表，只有**产生了审批行**的异常才可见（§7.3）。因此运营**从审批台看不到** `loss_making`。当前唯一可见通道是 `/api/logs`：`anomaly.detected`（含 `rule_ids`）与 `metrics.computed`（含 `gross_margin` / `cost_coverage_ratio`）。**需要一个独立的告警出口**（把 `Anomaly` 直接暴露成可读告警流），那属于**设计债**，不是本次实现——见 §13 的 1.5.0 未完成项。
 
 #### 8.3.1 文法（EBNF，冻死）
 
@@ -2191,30 +2255,43 @@ def evaluate(expr: CompiledExpr, namespace: Mapping[str, Any]) -> bool: ...
   ```
   gmv_cents, order_count, paid_order_count, refund_order_count, refund_amount_cents,
   aov_cents, refund_rate, uv, cvr, gmv_7d_avg_cents,
+  gross_margin, cost_coverage_ratio,          # v1.5.0：**店铺级**成本口径（已实现，§5.3）
   gmv_delta_ratio, order_delta_ratio, refund_rate_delta,
   stock, current_price_cents, stock_days, is_on_sale,
-  gross_margin, cost_cents, sales_7d, avg_daily_sales_7d,
+  sku_gross_margin, cost_cents, sales_7d, avg_daily_sales_7d,
   ad_spend_cents_7d, ad_order_count_7d
   ```
 
   多一个名字都要走契约变更流程。
 
-  **两个名字集合，互斥（v1.4.0 冻结）**：
+  **两个名字集合，互斥（v1.4.0 冻结；v1.5.0 更新 `gross_margin` 的归属）**：
 
   | 集合 | 名字 | 求值轮次 |
   |---|---|---|
-  | **店铺级**（12 + 3） | 上面第 1、2 行共 15 个（`gmv_cents` … `refund_rate_delta`） | 店铺轮，`Anomaly.sku_id=None` |
-  | **SKU 级**（10） | `stock`、`current_price_cents`、`stock_days`、`is_on_sale`、`gross_margin`、`cost_cents`、`sales_7d`、`avg_daily_sales_7d`、`ad_spend_cents_7d`、`ad_order_count_7d` | 每个 SKU 一轮，`Anomaly.sku_id=该 SKU` |
+  | **店铺级**（12 + 3） | 上面第 1–4 行共 15 个（12 个指标名 `gmv_cents` … `gmv_7d_avg_cents` + `gross_margin` / `cost_coverage_ratio`，再加 3 个派生量 `gmv_delta_ratio` / `order_delta_ratio` / `refund_rate_delta`） | 店铺轮，`Anomaly.sku_id=None` |
+  | **SKU 级**（10） | `stock`、`current_price_cents`、`stock_days`、`is_on_sale`、**`sku_gross_margin`**、`cost_cents`、`sales_7d`、`avg_daily_sales_7d`、`ad_spend_cents_7d`、`ad_order_count_7d` | 每个 SKU 一轮，`Anomaly.sku_id=该 SKU` |
 
   两个集合**必须互斥**：`load_rules` 要断言 `SHOP_NAMES ∩ SKU_NAMES == ∅`（常量集合写死在 `services/rules.py`，`RuleLoadError` 兜底）。互斥是**两轮判定唯一性**的前提——规则引用集合决定轮次，若一个名字同时属于两边，轮次就有歧义（§5.4）。
 
-- **求值上下文（v1.4.0）**：
-  - 店铺轮命名空间 = 15 个店铺级名字。
-  - SKU 轮命名空间 = **15 个店铺级名字 ∪ 该 SKU 的 10 个名字**（共 25 个键）。因此 SKU 级规则可以写 `"gross_margin < 0.05 and gmv_delta_ratio < -0.2"`——"这个 SKU 亏本 **且** 店铺在掉量"这种跨层条件必须能写，否则运营只能拆两条规则、又无法表达"同时"。
+  **v1.5.0 实现状态**：`services/rules.py` 里已有 `SHOP_NAMES`（15）/ `SKU_NAMES`（按本节清单写全 10 个，含未实现的 6 个）/ `ALLOWED_NAMES = SHOP_NAMES ∪ 已实现的 4 个 SKU 名字`，并有 `assert_name_sets_disjoint()`：**import 期就验一次**（写错常量属代码缺陷，不该等到某个店的配置加载才暴露），`load_rules` 里再调一次（契约要求的加载期门禁）。报错带**交集名字**并指向本节与 ADR-021。
+
+  **命名硬规则（v1.5.0 冻结，ADR-021 A 条，违反即 `RuleLoadError`）**：`gross_margin` **只属于店铺级**（全店有成本覆盖的加权毛利率，§5.3）；**SKU 轮次落地时，SKU 侧的毛利率必须命名为 `sku_gross_margin`**。这条规则没有"建议"成分，落地形态写死三条：
+
+  1. `SHOP_NAMES` 里含 `gross_margin` / `cost_coverage_ratio`；`SKU_NAMES` 里含 `sku_gross_margin`、**不得**含 `gross_margin`。
+  2. "两集合互斥"断言一旦触发，错误信息**必须**是明确可读的（带两个集合的交集名字），并**必须**指向本条（`§8.3.3 命名硬规则 / ADR-021`）——**不允许**静默失败、不允许只抛一个裸 `AssertionError`、不允许"取其一"式自动改名。
+  3. `rules.yaml` 里 SKU 级规则写 `gross_margin` 时，加载期按"店铺级名字用在了 SKU 轮"报错，而不是当成店铺级规则悄悄求值。
+  4. **改名范围是全文级的**：正文里所有 **SKU 级** `gross_margin` 的表述——§3.3 `SkuSnapshot.gross_margin`、§5.3.1 的公式表、§5.4 的"`gross_margin is None` 的 SKU"、§10.3 的 `test_sku_metrics.py` 断言——在 SKU 轮次落地时**一律**改成 `sku_gross_margin`。本节只立规则、不改那些逐字块；改动它们必须与 SKU 轮次的代码在同一次提交里完成。
+
+  **理由（同名不同含义的代价）**：两个 `gross_margin` 的**分母不同、精度不同、用途也不同**——店铺级是"有成本成交额的加权毛利率"（一个数代表一部分成交），SKU 级是"单件售价与单件成本之差"（一个数代表一件货）。同名会让规则作者**无意中把店铺级阈值用到单品上**：一条为全店调的 `gross_margin < 0.0`，套到单品上会把"薄利"直接判成"亏本"，而这条规则一旦误报，Agent 就会去给本来正常的商品改价/下架——本仓最贵的一类误报。**同名不同义不是风格问题，是让阈值悄悄改变含义的问题。**
+
+- **求值上下文（v1.4.0；v1.5.0 更正店铺级名字计数）**：
+  - 店铺轮命名空间 = **15** 个店铺级名字（12 个指标名 + 3 个派生量）。**原文标称"12 + 3 = 15"，但当时实际只列了 13 个名字**（第 1、2 行是 10 个指标名，不是 12 个）——v1.5.0 加进 `gross_margin` / `cost_coverage_ratio` 两个名字之后，"12 + 3 = 15"才真正成立。
+  - SKU 轮命名空间 = **15 个店铺级名字 ∪ 该 SKU 的 10 个名字**（共 **25** 个键）。因此 SKU 级规则可以写 `"sku_gross_margin < 0.05 and gmv_delta_ratio < -0.2"`——"这个 SKU 亏本 **且** 店铺在掉量"这种跨层条件必须能写，否则运营只能拆两条规则、又无法表达"同时"。
+  - **SKU 轮里两个成本名字同时存在，含义不同（v1.5.0）**：`gross_margin` = **店铺级**加权毛利率（全店一个数），`sku_gross_margin` = **该 SKU** 的毛利率（每个 SKU 不同）。这正是命名硬规则要防的歧义——写 `"gross_margin < 0.0"` 的 SKU 级规则，在 N 个 SKU 上会得到**同一个**店铺级结果（要么全命中要么全不命中），而作者以为在逐件判断。
   - 命名空间里**每个名字都必须存在**（值为 `None` 也算存在）；缺键 → `RuleEvalError`。
 - **运行期**：
   - `Name` 不在 `namespace`（例如 `gmv_7d_avg_cents` 为 `None` 是值缺失，但名字必须在）→ `RuleEvalError`。
-  - **数值比较任一侧为 `None` → 该比较结果为 `False`**（**不是**异常，**不是** `True`）；但 `is None` / `is not None` 正常工作。**这是"数据不足，正常未命中"，不进 skipped 记录**（§5.4 已冻结两者分开）。典型例子：`cost_cents` / `gross_margin` 为 `None` 的 SKU，`"gross_margin < 0.05"` 求值为 `False`，规则**不触发**——但**绝不允许**有人先把 `None` 换成 `0` 再比较（那会让"没配成本的 SKU"被判成亏本并触发改价，§8.5）。
+  - **数值比较任一侧为 `None` → 该比较结果为 `False`**（**不是**异常，**不是** `True`）；但 `is None` / `is not None` 正常工作。**这是"数据不足，正常未命中"，不进 skipped 记录**（§5.4 已冻结两者分开）。典型例子：`cost_cents` / `sku_gross_margin` 为 `None` 的 SKU，`"sku_gross_margin < 0.05"` 求值为 `False`，规则**不触发**——但**绝不允许**有人先把 `None` 换成 `0` 再比较（那会让"没配成本的 SKU"被判成亏本并触发改价，§8.5）。同理 `gross_margin`（店铺级）为 `None` 时，`"gross_margin < 0.0"` 为 `False`，`loss_making` 不触发。
   - `bool` **不是** `int`：`True < 2` 这种写法在求值时不报错但没有业务意义；实现要显式拒绝"布尔参与算术"→ `RuleEvalError`。
   - 除以 0 / 取模 0 → `RuleEvalError`（由调用方跳过该规则并记录）。
   - 表达式结果**必须是 `bool`**；得到数字/字符串 → `RuleEvalError`。
@@ -2238,10 +2315,11 @@ LOG_LEVEL=INFO
 
 环境变量名与 yaml 字段的映射由 `Settings` 显式声明（`DATABASE_URL` → `database.url` 等），**不搞**自动前缀推导歧义。
 
-### 8.5 `config/sku_costs.yaml`（SKU 成本表，v1.4.0 新增，冻结）
+### 8.5 `config/sku_costs.yaml`（SKU 成本表，v1.4.0 入册 / **v1.5.0 已实现**，冻结）
 
 ```yaml
 version: "1"
+effective_from: "2026-10-23"   # 可选：YYYY-MM-DD 或完整 ISO-8601；只做校验与展示，**不参与计算**
 # sku_id -> 成本价（整数分）。没有条目 = 成本未知，不是 0。
 costs:
   "3400000000000000002": 8200
@@ -2250,16 +2328,32 @@ costs:
 
 | 规则 | 规定 |
 |---|---|
-| 归属 | **agent-core**（`backend/config/` 与 `settings.yaml`/`rules.yaml` 同组，§0.1） |
-| 键 | `sku_id` 字符串（§0 字符集），**必须**能在 `raw.products` 里对上；对不上的条目 → 启动期 `RuleLoadError` 类错误（`ConfigError`），不静默忽略 |
-| 值 | `cost_cents: int`（整数分，`> 0`）；出现 float/元/字符串 → `ConfigError` |
-| 缺失 | **该 SKU 的 `cost_cents = None` → `gross_margin = None`**（§5.3.1）。**绝不填 0、绝不猜** |
-| 与规则的关系 | `gross_margin` 为 `None` 时，数值比较为 `False` → 规则**不触发**，且**不进 skipped**（§5.4/§8.3.3）。所以"没配成本"的后果是**这条 SKU 不报警**，而不是**被判亏本**——前者是漏报（可见、可补配置），后者是误报（会让 Agent 去改价/下架） |
-| 加载时机 | `app.main` lifespan 读取 → 注入 `compute_metrics(cost_table=...)`（§4.8 装配点 + §5.3 参数）。热更新不支持：改文件要重启（成本变化的审计价值 > 免重启的便利） |
+| 归属 | **agent-core**（`backend/config/` 与 `settings.yaml`/`rules.yaml` 同组，§0.1）；加载器是 `app/services/costs.py` |
+| 顶层 | **只允许** `version` / `effective_from` / `costs` 三个键，多一个都是 typo → `ConfigError`（写成 `cost:` 而被静默忽略，会让成本表"看起来没生效"）。`costs` **必需**；"没有成本"的正确写法是**删掉整个文件**，**不是**写一个空值把它伪装成"配置过但没内容" |
+| 键 | `sku_id` 字符串，必须匹配 `^[A-Za-z0-9_-]{1,64}$`（§0 字符集）。写成整数 `3400…` 也拒收——上游 `raw.products[i]["sku_id"]` 是**字符串**，类型不一致会让 `cost_table.get()` 永远取不到 |
+| 值 | `int` 且 `> 0`（整数分）。`bool` **不算** `int`；float / 字符串 / `None`（YAML 里 `"sku":` 后面什么都不写）/ `0` / 负数 → **全部 `ConfigError`** |
+| 重复键 | **`ConfigError`**。`yaml.safe_load` 对重复键**静默取后者**——手写的成本表里同一个 SKU 出现两次时，前一行（很可能是财务核对过的正确值）被无声覆盖，而这类错误在量小的配置里没人会发现。所以加载器**自己检测**（`_UniqueKeyLoader`）。一个 Python `dict` 构造完成时重复键已经被合并、"有没有重复"这个信息就不存在了，因此这一项**只可能**在 YAML 加载层做 |
+| 编码 | **非 UTF-8**（例如财务把表另存成 GBK）→ `ConfigError`。**绝不**"尽力而为"地读一半：读错的成本会被当真成本参与"是否亏本"的判断，比没有成本危险得多 |
+| 文件缺失 | **不是错误**：记一条结构化 `warn`（`event="config.sku_costs_missing"`）后视为**空表** → `gross_margin = None`、`loss_making` 不触发。缺失是"这个商家还没配成本"（正常状态），内容错误是"有人写坏了"（必须当场失败）——两者都当错误会让第一次部署起不来，都当正常会让 typo 静默生效 |
+| 缺条目（某个 SKU 没写） | 该 SKU 视为**成本未知**：SKU 级 `cost_cents = None`（§5.3.1）；店铺级口径里它**既不进分子也不进分母**（§5.3），因此覆盖率下降——这正是 `cost_coverage_ratio` 要暴露的事。**绝不填 0、绝不猜** |
+| 与规则的关系 | `gross_margin` 为 `None` 时，数值比较为 `False` → 规则**不触发**，且**不进 skipped**（§5.4/§8.3.3）。所以"没配成本"的后果是**不报警**，而不是**被判亏本**——前者是漏报（可见、可补配置），后者是误报（会让 Agent 去改价/下架） |
+| 加载时机 | `app.main` lifespan 读取 → 注入 `compute_metrics(cost_table=...)`（§4.8 装配点 + §5.3 参数）。热更新不支持：改文件要重启（成本变化的审计价值 > 免重启的便利）；`get_sku_costs()` 是进程级缓存，缓存而**不热重载**是为了让"哪次 run 用的是哪版成本"有确定的边界 |
+
+**成本键能否在 `raw.products` 里对上：改成运行期审计（v1.5.0 改写，ADR-021 C 条）**
+
+原条文写的是"对不上的条目 → **启动期** `ConfigError`"。这条**物理上做不到**：启动期（`app.main` lifespan）根本没有 `raw`——商品列表来自一次上游调用（`collect`），lifespan 只加载配置、不发业务请求。要在启动期做静态交叉校验，只能把上游数据搬进启动流程，那等于让**进程启动依赖抖店可用性**。
+
+改写为：**运行期在 `compute_metrics` 节点做审计**。判据与处置写死：
+
+- **能判断时**（本次 `raw.products` 非空）→ 记一条 `{"event": "sku_costs.unmatched", "data": {"sku_ids": [...], "count": n}}`（审计条目，随 run 落 `audit`，可在 `/api/logs` 看到）。**只记不阻断**：一条过期的成本配置不该让当天所有指标都算不出来——阻断 = 一个 typo 换掉全天看板，比漏一条提示贵得多。
+- **商品列表为空时（采集降级 `partial=True`）→ 不报**：此时**每一条**成本都会"看起来对不上"，报出来是一串假警报，反而把真问题淹掉。
+- 顺序上它追加在 `metrics.computed` 之后，所以同一轮 run 里"算了什么（`gross_margin` / `cost_coverage_ratio`）"与"哪些成本没对上"都能看到。
+
+**为什么这个改法比原来的更好**：原条文把一条**静态可查性**当前置门禁，但它依赖的数据在那一刻不存在——一条永远无法执行的条款，最后一定变成"没人用的条款"（§8.3.3 的同一个教训）。而"过期成本配置"的真实后果是**漏报**（那件货不再有毛利率，`loss_making` 的覆盖率分子变小），不是**误报**（不会把好货判成亏本）。对漏报，正确的处置是**让它在日志里可见、让人去补配置**，不是让整条流水线停下来。
 
 **三条写死的原因（逐条对应一次真实事故形态）**：
 1. **抖店开放平台没有成本字段**。任何"从历史售价/采购单反推成本"的做法都是猜测；猜测直接决定"是否亏本"的判断结果，比没有这个指标更危险。
-2. **缺失 ≠ 0**。填 0 时 `gross_margin = (price-0)/price = 1.0`（看起来暴利），而一旦有人写成"缺省按 0 参与比较"的**反方向**（或缺 `cost` 时把 margin 当 0），`0 < 阈值` → 直接判亏本 → 触发改价/下架。**误报里最贵的一种**：Agent 主动把好货降价。
+2. **缺失 ≠ 0**。把缺失当 0 成本时，覆盖部分的毛利额等于成交额 → `gross_margin = 1.0`（看起来暴利，规则永不触发，问题被藏起来）；而一旦有人写成**反方向**（缺成本时把该 SKU 当"成本 0 参与"，或干脆把 margin 当 0），`0 < 阈值` → 直接判亏本 → 触发改价/下架。**误报里最贵的一种**：Agent 主动把好货降价。所以缺失的唯一正确表达是 `None`，且 `None` 必须让规则**不触发**（§8.3.3）。
 3. **成本不进 DB**（不做第 5 张表）。原因是双向的：①它是**商家自维护的配置**，随部署走、要能 code review，不是运行时业务数据；②§4.7 断言 B′ 冻结"`__tablename__` 恰好 4 行"，加表要动断言、动迁移、动 §6——为一个几乎不变的映射表付这个代价不值得。若将来要支持"按时间生效的成本"（成本会变），那时再提契约变更加 `sku_cost_history` 表，别现在猜。
 
 ---
@@ -2411,7 +2505,7 @@ G:\SN\doudian-agent\.venv\Scripts\python.exe -m uvicorn app.main:app --app-dir b
 - [ ] 5 个路由的路径、query 参数名、响应键名照抄 §7
 - [ ] 错误包络与 9 个错误码照抄 §7.1
 - [ ] `DoudianClient` 关键参数名（`mutating`、`transport`、`rate_limit`）照抄 §5.1
-- [ ] **v1.4.0**：`DoudianClient.__init__` 加 `total_budget_s` / `redact_keys` 两个 **keyword-only + 默认值**参数（§5.1），`create_doudian_client(settings)` 必须显式传 `settings.app.request_timeout_s` 与 `settings.observability.redact_keys`；`total_budget_s` 是**绝对截止**（从第一个请求起算），不是每尝试重新计时
+- [ ] **v1.4.0**：`DoudianClient.__init__` 加 `redact_keys` 一个 **keyword-only + 默认值**参数（§5.1）——**已实现**；同批入册的 `total_budget_s` **仍未实现**（§13(m)），`create_doudian_client(settings)` 目前只显式传 `settings.app.request_timeout_s` 与 `settings.observability.redact_keys`；`total_budget_s` 是**绝对截止**（从第一个请求起算），不是每尝试重新计时
 - [ ] **v1.4.0**：`compute_metrics(..., cost_table=None)` 产出 `skus`（§5.3.1），**纯函数不读文件**；`cost_table` 由 lifespan 读 `config/sku_costs.yaml` 后注入；`history` 元素的 `skus` 恒为 `[]`（§3.3）
 - [ ] 签名实现与三个黄金向量一致
 - [ ] 只用 `sa.JSON`、`String(n)`、`with_variant` 主键、Python 侧时间默认值
@@ -2433,8 +2527,9 @@ G:\SN\doudian-agent\.venv\Scripts\python.exe -m uvicorn app.main:app --app-dir b
 
 ## 12. 前端 TS 类型（逐字，`frontend/src/api/types.ts`）
 
-> **本节代码块是逐字冻结块**：`frontend/scripts/verify.mjs` 会把下面的 ```ts 块抽出来与 `src/api/types.ts` **逐行 diff**（不多、不少、不重排）。因此块内**只允许放类型定义**，任何说明、注释、版本标注都写在块外——块内多一行注释就等于下游构建失败（v1.4.0 就是这么把 frontend 验收跑红的，见 §0.2）。
+> **本节代码块是逐字冻结块**：`frontend/scripts/verify.mjs` 会把本节**第一个 ts 围栏块**（即下面那个块，本节正文里不许再出现三个反引号 + ts 的围栏标记——它会把抽取位置提前到正文中间，v1.5.0 修过一次）抽出来与 `src/api/types.ts` **逐行 diff**（不多、不少、不重排）。因此块内**只允许放类型定义**，任何说明、注释、版本标注都写在块外——块内多一行注释就等于下游构建失败（v1.4.0 就是这么把 frontend 验收跑红的，见 §0.2）。
 > **v1.4.0 对 §12 的净改动为零**：`MetricPoint` 没有 `skus`（`/api/metrics` 仍是店铺级，§7.5）；也**没有** `Anomaly` 的 TS 接口，因为 `Anomaly` 从不出现在 HTTP 响应里（§7.3）——SKU 级信息走 `PendingApproval.target`（= `sku_id`）与 `evidence.sku_id`。可选增强（不改类型）：审批卡片读 `evidence["sku_id"]` 显示"哪件货"。
+> **v1.5.0 对 §12 的净改动 = `MetricPoint` 加两行可选字段**：`gross_margin?: number | null` 与 `cost_coverage_ratio?: number | null`，与 §7.5 的同名契约字段一一对应（店铺级成本口径，默认 `null`）。**两处必须同一次改完**：`frontend/src/api/types.ts` 与本节逐字块——只改一边会让 `verify.mjs` 的逐行 diff 立刻变红（v1.4.0 就是这么红的，§0.2）。看板取值在 `frontend/src/lib/metrics.ts`：**直接读后端这两个字段**，不再用契约外扩展字段 `cost_cents` 自算（旧自算口径已删除，见 §7.5 的成本口径说明）。
 
 ```ts
 export type RunStatus =
@@ -2555,6 +2650,8 @@ export interface MetricPoint {
   uv: number | null;
   cvr: number | null;
   gmv_7d_avg_cents: Money | null;
+  gross_margin?: number | null;
+  cost_coverage_ratio?: number | null;
   computed_at: string;
 }
 
@@ -2600,9 +2697,23 @@ export interface LogsResponse {
 | 1.3.2 | 2026-10-24 | ①**§0.1 登记 `app/api/queries.py`**（归属 API 层 / platform）并冻结边界：**只读**（仅 `SELECT`）、禁 `INSERT/UPDATE/DELETE`、禁触达 `step_count`、禁绕过 `tracing.py` 的仓储写 run 摘要、禁业务判断；登记理由是两条**冻结签名覆盖不到的读路径**（§5.8 的 `list_by_status` 不含行 `id` ↔ §7.3 的 `next_cursor`；§4.7 的 run 仓储只按 `(shop_id, run_id)` 取单行 ↔ §7.5 的 `/api/metrics` 需要 run 枚举）；②**§5.8 / §7.3** 补读路径说明：列表/游标允许经 `queries.py` 做 keyset 分页（`created_at DESC, id DESC` + `id < before_id`），**写路径不变**；③**§7.5** 补数据源说明：数据源是 checkpoint state（契约没有指标表），缺数据 `404`、**不补零**；④**§5.3** 补 `uv` 的来源与作用域判据（**公式未改**）：`collect` 只在能确认"这段汇总就是当天"时写 `order_summary["uv"]`，否则 `None`（不摊派、不补零），`uv` 有值但非非负整数 → `ValueError` | 全部（agent-core：`nodes.py` 的 `collect` 写 `order_summary.uv`；platform：`queries.py` 的只读边界 + `/api/metrics` 的 checkpoint 数据源；qa：`test_collect_uv.py` 钉住"有 uv / 无 uv / 作用域不明 / 声明作用域 / 非法值"五条边界；frontend：**无需改动**，`uv`/`cvr` 仍可为 `null`；reviewer：新增 `queries.py` 的两条 grep 可查项） |
 | 1.3.3 | 2026-10-24 | **（已并入 1.4.0：本行保留作留痕，内容不删不改，不再单独计版本；当前版本见本表末行 1.4.0）** ①**新增 §7.6.2「脱敏的两层与边界」**：**键名层**（`redact_keys` 命中的 dict 键名，整个值递归替换为 `"***"`）与**值级层**（自由文本里 `key=value` / `key: value` / `"key":"value"` 的**值**替换，键集 = `DEFAULT_SCRUB_KEYS` ∪ `redact_keys`）**在同一次递归里完成**，统一入口 `redact_any`（`redact` 降为**兼容别名**）；写明"两层为什么都要"（键名层对 `str` 是 no-op，而消息原文恰好写在 `message` 里）、两种分隔符与五种值形态、`_`/`-` 互通、`:` 形态裸值的上界、**已知不覆盖 5 条**、`stderr` 经 `_ScrubbingFormatter` 先 format 再 scrub；②**§10.3 新增通道级测试要求**（`test_platform_redaction_channel.py`，含**反向验证**：删掉 `write()` 里的 scrub 后必须变红）；③§7.6 原有的脱敏条目**补全**（补 `cookie`、补"值级层也要"、加 §7.6.2 指针）；④DECISIONS 新增 **ADR-020**（脱敏必须两层，且必须测通道），记 5 条被否方案并在附 A 补 4 行 | platform（`observability/logging.py`：两层同调、`write()` 对 `message`/`data` 走统一入口、`stderr` 走 `_ScrubbingFormatter`）；qa（通道级 + 反向验证两份用例）；agent-core 与 frontend：**无需改动**——JSONL 顶层键、`/api/logs` 响应形状、§12 的 `LogItem` 一字未动；reviewer：新增"声称已脱敏"的可查项（每一处都要能指到 §7.6.2 的某一层或某条已知不覆盖） |
 | 1.4.0 | 2026-10-24 | **合并此前未登记的两批增量**：原拟 **1.3.3** 的「§7.6.2 脱敏的两层与边界 + 必须测通道」并入本版（不再单独计版本），以及正文里**早已存在、§13 却从未登记**的「SKU 维度 + 成本表」条文（§0.2 / §1.1 / §3.3 / §4.1 / §5.1 / §5.3.1 / §5.4 / §8.3.3 / §8.5 / §10.3 / §11 的 `v1.4.0` 标注自此有 §13 依据）；同时结清"正文标 `v1.4.0`、§13 无 1.4.0 行、版本行停在 1.3.x"的欠账。**纯增量：不改既有签名（新增参数全部 keyword-only 带默认值）、不改表列、不改 JSON 键、不改错误码、不改路由。** **① 已落地（契约正文与代码同时成立，可按下面的锚点复核）**：(a) **§7.6.2「脱敏的两层与边界」**（:1936-1976）有正文；代码侧 `backend/app/observability/logging.py` 有统一入口 `redact_any`（21 处引用）、`DEFAULT_REDACT_KEYS`（5 键，含 `cookie`）与 `DEFAULT_SCRUB_KEYS`（6 处引用），两份用例齐备——`backend/tests/platform/test_platform_redaction_channel.py`（通道级：调真实 `JsonlLogSink.write` 后**读回落盘文件**断言明文不出现）与 `test_platform_redaction_scrub.py`（函数级对抗）。(b) **§5.3 的 `uv` 来源与作用域判据**（:1194；**归属 §5.3，不是 §5.3.1**）有正文；代码侧 `backend/app/agent/nodes.py` 的 `_summary_uv` / `_declared_uv_scope` / `_day_uv` 落地了"判不出作用域就写 `None`（不摊派、不补零）、有值但非非负整数抛 `ValueError`"，`backend/tests/agent_core/test_collect_uv.py` 在。(c) **`app/api/queries.py` 的只读边界登记**（§0.1 目录树 :80、边界与可检查形态 :140-153）有正文；文件存在，两条 grep 实测均为 **0**（无 `.add(`/`.delete(`/`.flush(`/`.commit(`；无 `step_count` 赋值或自增）。(d) **`DoudianClient` 的 `redact_keys` keyword-only 参数**（§5.1 签名 :1015、语义与理由 :1056-1067）有正文；代码侧 `doudian_client.py` 的 `__init__` 已收该参数（:357），`create_doudian_client` 显式传 `settings.observability.redact_keys`（:842）。(e) **补正一处漏改**：§5.1 的 `DEFAULT_REDACT_KEYS` 逐字块补上 `cookie`（原块只有 4 键，而 §7.6.2 的键名层、`backend/config/settings.yaml` 与代码一直是 5 键——1.3.3 补 §7.6 时漏了这一个块）。**② 已入册、代码未实现（不得读作"已落地"）**：(f) **`total_budget_s`**（§5.1 签名 :1014、语义 :1056）**正文有、代码无**：`grep -rn "total_budget_s" backend/` 为 0，`DoudianClient.__init__` 目前只落了 `redact_keys` 一个 v1.4.0 参数。(g) **SKU 级成本归属与毛利率未实现**：`grep -rn "gross_margin" backend/` 为 **0**，`grep -rn "cost" backend/`（`*.py`+`*.yaml`，排除 `__pycache__`）为 **0**，`SkuSnapshot` 为 **0**；`backend/config/sku_costs.yaml` 不存在，`backend/tests` 里没有 `test_sku_metrics.py` / `test_sku_anomalies.py`。因此下面这些**只有契约条文**：`SkuSnapshot`（§3.3 :377-382，含 `gross_margin` / `cost_cents`）、`MetricsSnapshot.skus`（§3.3 :373）、`Anomaly.sku_id`（§3.3 :402；代码 `backend/app/agent/state.py` 的 `Anomaly` 至今没有这个键）、`compute_metrics(..., cost_table=…)`（§5.3.1 :1171 起）、§5.4 的**两轮求值**（:1241 起）、§8.3.3 的 SKU 名字集合（:2196-2207）、§8.5 的 `config/sku_costs.yaml`（:2241 起）。(h) 因此 **`loss_making` 规则不存在**——正文与代码都没有：`grep -rn "loss_making" backend/` 为 0，`backend/config/rules.yaml` 里没有该规则。README 的「已知限制」第 4 条有对应说明（`README.md:277-279`，其中"SKU 级成本归属未实现"一句与本节一致）；但该条同时把成本口径写成"店铺级加权"、称需自维护 `config/sku_costs.yaml`，而仓库里**该文件与该口径的实现同样不存在**——本行只按 grep 事实登记，**README 不在本次可改文件范围**（`docs/` 外），留给下一轮单独修。 | 全部（**platform**：脱敏两层、`write()` 对 `message`/`data` 走统一入口、`stderr` 走 `_ScrubbingFormatter` 均已落地；**agent-core**：`uv` 作用域判据已落地，但 §3.3 / §5.1 `total_budget_s` / §5.3.1 / §5.4 / §8.3.3 / §8.5 的 SKU 与成本条目是**待实现项**，不是既有能力；**frontend**：**无需改动**——§12 净改动为零、`/api/metrics` 仍店铺级；**qa**：脱敏两份用例已登记，`test_sku_metrics.py` / `test_sku_anomalies.py` 随 SKU 条目一并待实现；**reviewer**：新增可查项——正文里每一处 `v1.4.0` 标注都要能在本行找到落点，且"已入册未实现"不得被读成"已实现"） |
+| 1.5.0 | 2026-10-24 | **成本/毛利率落地（纯增量）**：把 v1.4.0 里"已入册、代码未实现"的**成本表 + 店铺级毛利率**真正实现，并把三处"写不出来 / 做不到 / 会误伤"的条文改成可执行形态。**① 已落地**：(a) **§3.3 `MetricsSnapshot` 新增 `gross_margin` / `cost_coverage_ratio`**（`float` 或 `None`，**店铺级**口径）；(b) **§5.3 `compute_metrics(..., cost_table=…)` 由"已入册未实现"转为已实现**，补两条公式（只对有成本 SKU 加权；覆盖率 = 有成本成交额 / 全店 GMV；分母 0 → `None`；**覆盖率不裁剪**，`> 1` 用于暴露上游汇总与明细对不上）+ 6 条数据形状错误的 `ValueError` 边界；(c) **新增数据面 `order_summary["by_sku"] = {sku_id: {gmv_cents: int, units: int}}`**：只统计**已支付**订单行、无 `sku_id` 的已支付行只进 GMV 分母（计为未覆盖）、**退款单仍计入**、件数缺失按 1 件（**偏乐观**：成本被少算 → 毛利率偏高 → 只会**漏报**亏损，不会误报；算例见 §5.3 边界表）、件数非 int / 负数 → `ValueError`；(d) **§8.3.3 `ALLOWED_NAMES` 新增 `gross_margin` / `cost_coverage_ratio`（店铺级）**，店铺级名字 13→15（12 个指标名 + 3 个派生量，并更正原文"12+3=15"的计数错误）、SKU 轮命名空间 23→25 键；(e) **§8.3 `rules.yaml` 新增 `loss_making`**：`severity=critical`、`metric=gross_margin`、条件含 `cost_coverage_ratio >= 0.6`、**无 `actions`（只告警）**；(f) **§8.5 补实现细节**：顶层 `version` / `effective_from` / `costs`、值 `int > 0`、键 `^[A-Za-z0-9_-]{1,64}$`、**重复键 → `ConfigError`**（PyYAML 默认静默取后者，加载器自检）、空值 / 0 / 负数 / float / 字符串 / bool → `ConfigError`、非 UTF-8 → `ConfigError`、**文件缺失 → 记 warn、视为空表**；(g) **§7.5 `MetricPoint` 新增两个可选字段**（默认 `null`，老 checkpoint 无这两个键仍通过校验）。**② 三条裁定（ADR-021）**：(h) **命名冲突**——`gross_margin` 被**店铺级**占用，而 §8.3.3 的 SKU 名字集合里原本也写着它，现冻结硬规则：**SKU 轮次落地时 SKU 侧必须命名 `sku_gross_margin`**，两集合互斥断言触发时必须报**明确错误**并指向本条，**不允许静默失败**；(i) **`loss_making` 无 `actions` 的取舍**——店铺级加权毛利率**指不出具体 SKU**，现有动作类型都要求确定 `target`，用"GMV 最高 SKU"去猜会给好货降价 / 下架，所以**只告警不给动作**；(j) **§8.5 的"启动期校验成本键能在 `raw.products` 里对上"物理上做不到**（启动期没有 `raw`），改写为**运行期在 `compute_metrics` 节点审计 `sku_costs.unmatched`**（只记不阻断；商品列表为空时不报）。**③ 未完成项（不得读作已完成）**：(k) **前端 TS 类型已同步（原"未同步"已结清）**——`frontend/src/api/types.ts` 的 `MetricPoint` 已加 `gross_margin?: number | null` / `cost_coverage_ratio?: number | null`，§12 的逐字块在同一次提交里改完（`verify.mjs` 的 §12 diff 绿）；看板的毛利率已改为**零计算读后端字段**，契约外字段 `cost_cents` 与那套 `(GMV−退款−成本)/(GMV−退款)` 公式**已删除**，并加了"只给 cost_cents 时必须算不出数"的反向断言锁死回潮；(l) **alert-only 的 anomaly 不出现在 `/api/alerts`**——该端点读 `approval_request` 表，只有**产生了审批行**的异常才可见，因此运营**从审批台看不到** `loss_making`，当前唯一可见通道是 `/api/logs` 的 `anomaly.detected`（含 `rule_ids`）与 `metrics.computed`（含两个成本字段）；**需要一个独立的告警出口，属于设计债，不是本次实现**。**代码锚点**：`backend/app/services/costs.py`（新）、`backend/config/sku_costs.yaml`（新）、`backend/app/services/metrics.py`、`backend/app/agent/state.py`、`backend/app/agent/nodes.py`、`backend/app/services/rules.py`、`backend/app/services/anomalies.py`、`backend/app/main.py`、`backend/app/schemas.py`、`backend/config/rules.yaml`、`backend/tests/platform/test_platform_gross_margin.py`（**34 用例全绿**）。 | 全部（agent-core：成本表加载器 + 毛利率 / 覆盖率公式 + `by_sku` 归集 + 未匹配审计；platform：lifespan 加载成本表、`MetricPoint` 两个默认 `null` 的字段；qa：`test_platform_gross_margin.py` 34 例；**frontend：无需改动**——§12 净改动为零，但**看板口径已对齐（`types.ts` + §12 逐字块 + 看板取值 + `verify-suite.ts` 断言同一次提交完成；基线 verify 的 27/28 红也已修，根因是 §12 正文内嵌围栏标记），属未完成项 (k)**；reviewer：新增可查项——正文里每一处 `v1.5.0` 标注都要能在本行找到落点，且"未完成项"不得被读成"已实现"） |
+
+**1.5.0 的未完成项 (m)：`total_budget_s` 已入册、代码未实现。** §5.1 的签名里列了它、§1083 要求装配点显式传它、§9.2 规定了它的行为，但 `backend/app/services/doudian_client.py` 里**没有这个参数**（`grep total_budget_s backend` = 0）。v1.5.0 期间曾试做一版，因**未接线**（`create_doudian_client` 从未传它，生产路径恒为 `None`，功能是死代码）被整版回退；同时那次实现还有三处与 §9.2 不符（截止起算点、令牌桶/信号量等待未计入、错误类别选错）。要真做必须先补齐：接线 + 起算点对齐 + `_send` 内等待计入 + 新增 `ErrorCategory.BUDGET`（不占用 `CONFIG`）+ 相等边界用 `>=` + 测试能证明"第 N+1 次尝试前就被掐掉"。**在那之前，任何文档/看板/简历都不得声称"有单次调用总预算"。**
+
+**1.5.0 的兼容性**：**纯增量，不改任何既有签名 / 表列 / JSON 键 / 错误码 / 路由**。具体：
+- **签名只加不删**：`compute_metrics` 的 `cost_table` 早在 v1.4.0 就入册（keyword-only + 默认 `None`），本版只是把它**实现**——老调用点一行都不用改，不传就是"这家店没配成本"（两个成本字段 `None`）。
+- **没有新增表**：`__tablename__` 仍恰好 4 行（§4.7 断言 B′ 不变，§6.1）。成本是**配置文件**（§8.5）、`by_sku` 是 `raw` 里的**归集结果**，两者都不进 DB。
+- **JSON 只增两个可选键**：`/api/metrics` 的 `points[]` 多出 `gross_margin` / `cost_coverage_ratio`，默认 `null`；**老 checkpoint 没有这两个键仍能通过 `MetricPoint` 校验**（`model_config` 只 forbid extra、不改默认），**不需要回填、不需要重跑**。旧消费者读到 `null` 的行为与"没有这个字段"一致。
+- **唯一的行为变化**：`metrics` 里多了两个成本口径数字；当成本覆盖 ≥ 60% 且加权毛利率 < 0 时 `loss_making` 会命中并记 `anomaly.detected`。**它不产生审批行、不产生任何动作**（无 `actions`），所以审批台的可见性**不变**——这正是未完成项 (l) 要单独解决的问题。
+- **一个刻意的"不对称"**：成本表**内容**坏了（重复键 / 非 UTF-8 / 空值 / 0 / 负数 / float / bool）→ 进程启动即失败（`ConfigError`）；文件**缺失** → 只记 `warn` 并按空表继续。这两条不对称是设计（§8.5），不是遗漏：前者是"有人写坏了"，后者是"这家店还没配成本"。
+- **§12 已改（v1.5.0 同步完成）**：`types.ts` 的两个字段与 §12 的 ts 块在**同一次提交**里改完，`verify.mjs` 的 §12 逐行 diff 已 PASS。**顺带修掉一个长期潜伏的陷阱**：§12 正文里原本内嵌了字面的围栏标记，`verify.mjs` 用 `indexOf` 取第一个围栏，命中的是**正文**而不是代码块——所以基线 `verify` 本来就是红的（HEAD 上就红）。已去掉正文里的围栏字样，并写死"本节正文不许再出现围栏标记"。
+
+- **键名层默认集 5 → 6（v1.5.0 补 `password`）**：`password` 原先只在**文本层**的 `DEFAULT_SCRUB_KEYS` 里，而文本层只认 `key=value` 形态——于是 `data={"password": "SECRET"}` 这种**结构化**值两层都碰不到、明文落盘。判据不是"这个名字敏不敏感"，而是"它出现在什么**位置**"：出现在 dict 键名上，就必须进键名层。已有回归用例锁死（`test_password_as_dict_key_is_masked`）。
+- **一处 docstring 与实现不符已改正**：`_log_audit` 曾声称"同时写进 JSONL 汇（`state.audit` 原样保留）"，但它只写 sink；`state` 是不可变 `Mapping`，审计条目要随节点返回进 state。现在 docstring 写明"只写汇，`state.audit` 由调用点 `append_audits(...)` 成对写"。**注意这条不是措辞纠错，它揭示了一个真实风险**：双出口靠每个调用点自觉，漏写一侧不会报错。
 
 **1.4.0 的兼容性**：**纯增量，不改任何既有签名 / 表列 / JSON 键 / 错误码 / 路由**。所有新增都是**追加型**，既有调用点与既有消费者一个都不需要改。具体：
-- **签名只加不删**：`DoudianClient.__init__` 末尾追加 `total_budget_s` / `redact_keys` 两个 **keyword-only + 带默认值**参数，`compute_metrics` 追加 `cost_table=None`；三处都不改既有位置参数、不改返回类型，老调用点原样可用。
+- **签名只加不删**：`DoudianClient.__init__` 末尾追加 `redact_keys` 一个 **keyword-only + 带默认值**参数（`total_budget_s` 同期入册，但**至今未实现**，见 §13(m)），`compute_metrics` 追加 `cost_table=None`；三处都不改既有位置参数、不改返回类型，老调用点原样可用。
 - **没有新增表**：`__tablename__` 仍恰好 4 行（§4.7 断言 B′ 不变，§6.1 已复核）。SKU 明细是**派生结果**（state 内、可重算），成本是**配置文件**（§8.5），两者都不进 DB。
 - **JSONL 与 HTTP 形状一字未动**：§7.6 的 10 个顶层键、`/api/logs` 响应、§12 的 `LogItem` 均未改；`/api/metrics` 仍是店铺级、**不加** `skus`（§7.5）；`Anomaly` 从不出现在任何 HTTP 响应里，因此 §12 不需要新的 TS 类型（净改动为零）。
 - **与 1.3.3 的关系**：原拟 1.3.3 的脱敏条目**全部保留**在 §7.6.2（正文一句未删），本版只把它并入统一的一行、不再单独计一个版本号；上表的 1.3.3 行标"已并入 1.4.0"保留留痕。

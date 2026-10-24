@@ -20,6 +20,22 @@
 - `action_log` 的唯一键是 `idempotency_key`（UNIQUE），重放/重试第二次是
   `skipped_duplicate` 而不是真的再改一次价。
 
+## 审计事件有**两个**出口（v1.5.1 的根因修复）
+
+`state.audit` 是 checkpoint 里的审计留痕（可复现、可回放），但**只有读 checkpoint 的人看得见**；
+`/api/logs` 只读 JSONL 汇。于是"只写 audit、不写 sink"的事件在系统里**没有任何人类出口**：
+`loss_making` 是最贵的一例——它只告警、不给 `approval_request`（审批台看不见），落在
+`state.audit` 里（日志页看不见），一次"这批货在亏本卖"的判定就这样消失了。
+
+因此 `metrics.computed` / `anomaly.detected` / `sku_costs.unmatched`（以及采集层的降级留痕）
+**同时**写两处：`state.audit`（原样，不动）+ JSONL 汇（走 `app.observability.logging` 的 sink
+与统一脱敏）。这不是往 `node.trace` 里加键——`data` 的键集合（§7.6.1）一个字都没改，是**新事件**。
+
+只桥接这三个（外加采集降级）而不是全部 audit 事件：其余事件（`action.proposed` /
+`approval.decided` / `action.executed` / `effect.registered` / `run.finished`）本来就各有
+**表级出口**（`approval_request` / `action_log` / `effect_snapshot` / `agent_traces`），
+再抄一份进 JSONL 只会让日志翻倍而不增加任何可查性。判据是"有没有别的出口"，不是"是不是审计"。
+
 ## 副作用与状态
 
 节点返回的是"该字段的完整目标值"（replace 语义，§3.1），不返回增量。
@@ -29,6 +45,7 @@
 
 from __future__ import annotations
 
+import logging
 from collections.abc import Awaitable, Mapping, Sequence
 from datetime import UTC, date, datetime, timedelta
 from typing import Any
@@ -38,7 +55,12 @@ from langchain_core.runnables import RunnableConfig
 from langgraph.errors import GraphBubbleUp
 from sqlalchemy import select
 
-from app.agent.adapters import resolve_client, resolve_now, resolve_runtime
+from app.agent.adapters import (
+    require_log_sink,
+    resolve_client,
+    resolve_now,
+    resolve_runtime,
+)
 from app.agent.state import (
     ActionProposal,
     AgentError,
@@ -60,7 +82,7 @@ from app.agent.state import (
 from app.agent.tracing import calibrate_run_steps, digest_of, traced, update_run_trace
 from app.db import arun_db, session_scope
 from app.enums import ActionLogStatus, ActionType, Attribution, ErrorCategory, RunStatus, Verdict
-from app.errors import ApprovalValidationError, ParamValidationError
+from app.errors import ApprovalValidationError, ConfigError, ParamValidationError
 from app.models import ActionLog
 from app.services.errors import (
     DoudianAmbiguousOutcomeError,
@@ -90,6 +112,10 @@ __all__ = [
 
 #: 近 7 日均值要 7 天历史，再加今天 = 8 个业务日（§5.3 的 `gmv_7d_avg_cents`）
 HISTORY_WINDOW_DAYS = 7
+
+#: 本模块的 stdlib logger。**只给旁路失败用**（目前是 `_log_audit` 写盘失败），
+#: 业务结论一律走节点返回值里的 `errors` / `audit`，不走 logging。
+logger = logging.getLogger(__name__)
 
 #: 业务日期所属时区（§0：`date` 字段是 `Asia/Shanghai` 的 `YYYY-MM-DD`）
 _BUSINESS_TZ = ZoneInfo("Asia/Shanghai")
@@ -130,6 +156,104 @@ def _audit(state: Mapping[str, Any], *, node: str, event: str, data: dict[str, A
         {"audit": list(state.get("audit") or [])},  # type: ignore[arg-type]
         [make_audit_entry(node=node, event=event, data=data or {}, at=at)],
     )
+
+
+#: 异常 `severity` → JSONL `level`（§7.6 的取值域：critical→error、warn→warn、info→info）。
+#:
+#: `critical` 必须落 `error`：`/api/logs?run_id=…&level=error` 是运营找"今天哪里红了"的入口，
+#: 若 `loss_making`（critical）写成 info，日志页上同一条事实就会同时在"红"和"绿"两种口径下
+#: 自相矛盾——而它恰恰是唯一没有任何别的出口的那条告警。
+_SEVERITY_LEVEL: dict[str, str] = {
+    "critical": "error",
+    "warn": "warn",
+    "info": "info",
+}
+
+
+def _log_audit(
+    state: Mapping[str, Any],
+    *,
+    node: str,
+    event: str,
+    message: str,
+    data: Mapping[str, Any] | None = None,
+    level: str = "info",
+) -> None:
+    """把一条审计事实写进 JSONL 汇（**只写汇**；`state.audit` 由调用点自己 append）。
+
+    为什么必须有这一条路（根因，不是措辞修正）：`/api/logs` 只读 JSONL 汇，而审计事件过去
+    只进 `state.audit`（checkpoint）。于是"指标算出来了 / 有异常了 / 成本表有条目对不上"这些
+    事实在**所有人类入口上都不存在**，`loss_making` 因此变成一条发出去也看不见的告警。
+
+    **为什么这里不能顺带写 `state.audit`**：传进来的 `state` 是 `Mapping`（不可变视图），
+    本函数改不动它；审计条目要随节点返回值一起进 state。所以"双出口"是**每个调用点各写一次**
+    保证的（`append_audits(...)` + `_log_audit(...)` 成对出现），不是由这个函数保证的。
+    早先这里写"同时写进"是错的——审查实测发现调用后 `state["audit"]` 仍是 `[]` 才暴露，
+    属于"注释声称的契约"与"代码真实的契约"不一致，与本项目别处的几次事故同一类。
+
+    脱敏不用自己做：`JsonlLogSink.write` 在落盘前对 `message` 与 `data` 统一走
+    `redact_any`（键名层 + 值级 scrub），这正是"复用 sink"而不是"new 一个 logger"的理由。
+
+    重放与重复：节点被重试/重放时这会多写一条（与 `node.trace` 的行为一致——一次真实执行
+    一条）。审计去重靠 `state.audit` 的 `event_id`，日志是事件流，不做去重。
+
+    ## 写盘失败：旁路失败不许改变业务结论（v1.5.2）
+
+    JSONL 是**旁路**：它的人类可读副本 + `/api/logs` 的查询入口。磁盘满 / 句柄失效（`OSError`）
+    时若让异常逃出本函数，它会从节点一路逃到 `POST /api/agent/run` → **整轮 500**；而
+    `state.audit` 那一份也会一起丢（调用点先 `append_audits(...)` 再调本函数，异常在
+    `return` 之前炸掉，节点的返回值根本构造不出来）。
+
+    所以这里**必须**接住写盘异常，但**不许静默**：用 stdlib `logging` 打一条 warning，
+    带上 event 名与异常类型。为什么这不是"用 try/except 掩盖问题"——掩盖的判据是
+    "缺陷是否因此不可见"，而不是"有没有 except"：
+
+    - 被接住的是**不影响业务结论的旁路失败**（少一行日志，指标/审批/执行全都不变）；
+    - 缺陷本身（磁盘满、文件句柄失效）由那条 warning 暴露，运维照样看得见；
+    - 而 `state.audit` 的那一份仍然随节点返回值进 checkpoint——审计**没有**被这条 except 吞掉。
+
+    反面做法（不接）等于让"日志写不进去"升级成"当天指标算不出来"，那才是把旁路当主路。
+    """
+    try:
+        sink = require_log_sink()
+        identity = {
+            key: (None if state.get(key) is None else str(state.get(key)))
+            for key in ("run_id", "trace_id", "shop_id")
+        }
+        sink.write(
+            event,
+            level=level,
+            message=message,
+            data=dict(data or {}),
+            node=node,
+            **identity,
+        )
+    except Exception as exc:  # noqa: BLE001 - 见 docstring：旁路失败不许打断业务主路径
+        # 注意日志内容里必须同时有 event 与异常类型：只写"写日志失败"等于把缺陷本身也藏起来。
+        logger.warning(
+            "JSONL 审计写入失败（event=%s，异常类型=%s）：%s；state.audit 仍然保留",
+            event,
+            type(exc).__name__,
+            exc,
+        )
+
+
+def _degradation_summary(kind: str, items: Sequence[Mapping[str, Any]]) -> dict[str, Any]:
+    """把采集层的降级现场汇总成一条可排障的审计 `data`（按原因计数 + 前 5 条现场）。
+
+    为什么只留前 5 条：一次上游改字段可能让几百条订单行同时降级，整块塞进审计/日志会让
+    "哪几种写法出现了"这个真正的问题被淹掉；而前 5 条已经足够看出形态（`missing` / `non_positive`）。
+    """
+    counts: dict[str, int] = {}
+    for item in items:
+        reason = str(item.get("reason") or "unknown")
+        counts[reason] = counts.get(reason, 0) + 1
+    return {
+        "kind": kind,
+        "count": len(items),
+        "reasons": counts,
+        "samples": [dict(item) for item in items[:5]],
+    }
 
 
 def _errors(state: Mapping[str, Any], errors: Sequence[AgentError]) -> list[AgentError]:
@@ -194,6 +318,91 @@ def _first_int(source: Mapping[str, Any], names: Sequence[str], *, where: str) -
         if name in source and source[name] is not None:
             return _money(source[name], where=f"{where}.{name}")
     return None
+
+
+#: 订单行里"买了几件"的字段名（抖店不同接口/不同版本的写法；命中第一个即可）
+_ORDER_UNIT_KEYS: tuple[str, ...] = ("product_count", "goods_count", "quantity")
+
+
+def _order_units(
+    item: Mapping[str, Any],
+    *,
+    where: str,
+    order_id: str | None = None,
+    degraded: list[dict[str, Any]] | None = None,
+) -> int:
+    """一条订单行卖出的**件数**（成本摊分靠它：成本额 = 单价成本 × 件数）。
+
+    ## 缺件数 / 件数非正 → 按 1 件，但**降级必须可见**
+
+    上游没给件数（`missing`）或给了非正数（`non_positive`，如 `product_count: 0`）时按 1 件计，
+    并把现场追加进 `degraded`（调用方 `_aggregate_orders` → `collect` 据此记一条 warn 级审计）。
+    为什么容错而不是抛异常（v1.5.1 的根因修复）：`product_count: 0` 这样的脏数据若直接抛，
+    异常会从 `collect` 逃出节点 → 图把 run 标 `failed` 并 re-raise 到 `POST /api/agent/run`
+    → **整轮 500**，一条脏数据打死当天所有指标（毛利率等成本口径还会因此永远算不出来）。
+
+    ## 这个假设的方向是**偏乐观**，不是"偏保守"（v1.5.1 更正了写反的注释）
+
+    件数偏小 → 成本额偏小 → 毛利率偏高 → 更**不容易**报"亏本" → 后果是**漏报**（把亏本看成暴利）。
+
+    算例（真实数字，来自 demo 夹具 `config/sku_costs.yaml`）：真丝衬衫成本 **28000 分/件**；
+    一行 `pay_amount=199000`（10 件 × 199 元）但**没有** `product_count` → 按 1 件算：
+
+        按 1 件（错）：毛利率 = (199000 - 28000×1)  / 199000 = **+0.8593**
+        按 10 件（对）：毛利率 = (199000 - 28000×10) / 199000 = **-0.4070**
+        偏差 = +0.8593 - (-0.4070) = **+126.6 个百分点**（方向：亏本 → 暴利）
+
+    ## 什么能降级、什么不能
+
+    - **能降级**：取值越界（`0` / 负数）——含义明确（"这件货没记件数/写错了"），按 1 件
+      是有界、可解释的降级；
+    - **不能降级成"1 件"**：类型不对（float / 字符串 / bool）→ 仍然 `ValueError`。那是
+      "上游改了字段类型"，静默取 1 会把"每单都只买一件"永久藏起来。
+    - 但**不是**"继续打死整轮"（v1.5.2）：这个 `ValueError` 由 :func:`_read_order_row` 接住，
+      该行**整行拒绝**、记一条 `collect.row_rejected` 审计，其他行照常算——这是"逐行拒绝"
+      与"按 1 件降级"两种降级的分界线：**能猜出含义的按 1 件；猜不出含义的整行不参与指标。**
+
+    ## 样本 schema（v1.5.2：`missing` 与 `non_positive` 统一，且都带 `order_id`）
+
+    只给页内下标 `order[3]` 的话，跨 run / 重试就没法定位到底是哪一单（下标会变）；
+    所以样本统一是 `{order_id, where, keys, key, value, reason}` 六个键：`missing` 的
+    `key` / `value` 为 `None`，`non_positive` 带上命中字段与非法值，`keys` 是候选字段清单。
+    """
+    for key in _ORDER_UNIT_KEYS:
+        if key not in item or item[key] is None:
+            continue
+        value = item[key]
+        if isinstance(value, bool) or not isinstance(value, int):
+            # 与同文件的 `_money` 一致：数据形状错误统一用 ValueError（调用方只接一种）。
+            raise ValueError(  # noqa: TRY004
+                f"{where}.{key}（件数）必须是整数，收到 {value!r}"
+            )
+        if value <= 0:
+            if degraded is not None:
+                degraded.append(
+                    {
+                        "order_id": order_id,
+                        "where": where,
+                        "keys": list(_ORDER_UNIT_KEYS),
+                        "key": key,
+                        "value": value,
+                        "reason": "non_positive",
+                    }
+                )
+            return 1
+        return value
+    if degraded is not None:
+        degraded.append(
+            {
+                "order_id": order_id,
+                "where": where,
+                "keys": list(_ORDER_UNIT_KEYS),
+                "key": None,
+                "value": None,
+                "reason": "missing",
+            }
+        )
+    return 1
 
 
 def _as_list(payload: Any, names: Sequence[str]) -> list[Mapping[str, Any]]:
@@ -414,12 +623,17 @@ def _normalize_product(item: Mapping[str, Any]) -> dict[str, Any] | None:
     }
 
 
-def _is_refunded(item: Mapping[str, Any], *, where: str) -> bool:
+def _is_refunded(item: Mapping[str, Any], *, refund_amount: int) -> bool:
+    """这一行是否涉及退款：状态词命中，或退款额 > 0。
+
+    退款额由调用方（:func:`_read_order_row`）**先**校验成非负整数分再传进来：这样
+    `refund_amount: "1.00"` 这种形状错会变成"整行拒绝"的一条审计，而不是在这里再解析一次
+    （同一字段解析两遍，两处校验迟早会分叉）。
+    """
     status = str(item.get("refund_status") or "").strip().upper()
     if status and status in {word.upper() for word in _REFUND_STATUSES}:
         return True
-    amount = _first_int(item, ("refund_amount_cents", "refund_amount"), where=where)
-    return bool(amount and amount > 0)
+    return refund_amount > 0
 
 
 #: 上游 `summary` 里可能声明"这段汇总覆盖哪一天"的字段（v1.3.2）
@@ -482,7 +696,193 @@ def _day_uv(payload: Any, *, window_end: str, order_days: set[str]) -> int | Non
     return None
 
 
-def _aggregate_orders(payload: Any, *, window_start: str, window_end: str) -> dict[str, Any]:
+class _BatchContractError(ValueError):
+    """**整批**订单响应不满足契约（不是"某一行脏"）。
+
+    与 :class:`_RowRejected` 的分工就是本仓"降级 vs 硬失败"的分界线：
+
+    - 一行字段类型不对 → `_RowRejected`：整行跳过、留痕、其他行照算；
+    - `data` 不是映射/列表、订单列表字段不是 list、一个已知列表字段都没有 →
+      本异常：`collect` 记一条错误并把 run 标 `failed`（走 `finalize`，不是 500）。
+
+    继承 `ValueError`：这与 `_money` / `_summary_uv` / `_as_list` 一侧的既有契约一致
+    （所有"数据形状不对"都用 ValueError 家族），只是多了一个可精确捕获的子类。
+    """
+
+
+class _RowRejected(ValueError):
+    """**一行**订单数据不合法（类型不对 / 负金额 / 件数不是整数）。
+
+    只在 :func:`_read_order_row` 里抛，由 :func:`_aggregate_orders` 逐行捕获 → 跳过该行 +
+    记一条 `collect.row_rejected` 审计。`reason` 是稳定分类（审计要按原因计数），
+    `str(exc)` 保留原始异常原文（含字段路径），两者都要进样本。
+    """
+
+    def __init__(self, message: str, *, reason: str) -> None:
+        self.reason = reason
+        super().__init__(message)
+
+
+#: 上游订单列表字段名（与 `_as_list` 的调用点保持一致；这里用常量是为了让"哪个字段算契约"
+#: 只有一处定义，避免校验和取值各自挑一份名单而悄悄分叉）。
+_ORDER_LIST_KEYS: tuple[str, ...] = ("shop_order_list", "orders", "order_list")
+
+
+def _require_orders_container(payload: Any) -> None:
+    """整批契约校验：`data` 必须是订单列表（裸 list，或带列表字段的映射），否则抛错。
+
+    为什么必须校验（v1.5.2 的根因）：`_as_list` 对"形状不认识"的输入返回 `[]`，于是
+    `data=None` / `{"oops": 1}` 会被静默聚合成"今天 0 单 0 元"。那不是"缺数据"，而是
+    **把一次上游改结构伪装成生意归零**——所有基于 "gmv 掉了" 的规则都会静默失效，
+    而没有任何一处会红（§5.3 的"缺数据不许补零"同一类事故）。
+
+    空列表 `[]` 是**合法**的（今天确实没有订单）：判据是"形状对不对"，不是"有没有内容"。
+    `字段存在但为 None` 也按空列表处理——上游对空结果返回 `null` 是常见写法，为此把整轮
+    判死属于误伤；`字段存在但不是 list`（例如变成了 `"oops"`）才是真形状错。
+    """
+    if isinstance(payload, list):
+        return
+    if not isinstance(payload, Mapping):
+        raise _BatchContractError(
+            f"订单响应 data 必须是映射或列表，收到 {type(payload).__name__}"
+        )
+    for name in _ORDER_LIST_KEYS:
+        if name not in payload:
+            continue
+        value = payload[name]
+        if value is None or isinstance(value, list):
+            return
+        raise _BatchContractError(
+            f"data.{name} 必须是 list（空结果请给 [] 或 null），收到 {type(value).__name__}"
+        )
+    raise _BatchContractError(
+        f"缺少订单列表字段（期望 {'/'.join(_ORDER_LIST_KEYS)} 之一），"
+        f"实际键：{sorted(str(key) for key in payload)}"
+    )
+
+
+def _order_id_of(item: Mapping[str, Any]) -> str | None:
+    """订单行的 `order_id`（只用于审计定位）：缺失/空值 → `None`，从不抛异常。
+
+    `order_id` 脏（例如是 dict）也不能因此拒绝整行：它是一个**辅助身份**字段，不参与任何
+    指标计算；为了它丢掉一行真实成交额反而是新的静默少算。
+    """
+    raw = item.get("order_id")
+    if raw is None or isinstance(raw, bool):
+        return None
+    text = str(raw).strip()
+    return text or None
+
+
+def _best_effort_units(item: Mapping[str, Any], *, where: str) -> int | None:
+    """0 元单的件数——**只喂审计样本**（它不进 `by_sku`），读不到就 `None`。
+
+    为什么要单独一条路：`_order_units` 对类型错会抛 `ValueError`，而 0 元单本来就不参与
+    成本口径，若因为"样本想多带一个字段"把整行拒掉，等于让旁路信息反过来改变业务结论。
+    """
+    try:
+        return _order_units(item, where=where)
+    except (ValueError, TypeError):
+        return None
+
+
+def _read_order_row(
+    item: Mapping[str, Any],
+    *,
+    where: str,
+    window_start: str,
+    window_end: str,
+    degraded: list[dict[str, Any]],
+) -> dict[str, Any] | None:
+    """把一行订单**校验并解析**成一个待提交的值；脏行抛 :class:`_RowRejected`。
+
+    ## 为什么"先解析成值、再提交到桶"，而不是就地累加
+
+    旧实现在同一遍里既解析又累加：`order_count` 先 +1，随后 `product_count: "3"` 才炸。
+    即使调用方接住异常，桶里也已经留下**半行数据**（订单数 +1、金额没加），而且异常当时
+    直接逃到 API 层变成 500。行级拒绝必须是**原子的**：要么整行进指标，要么整行不进。
+
+    ## 校验顺序（顺序本身是契约）
+
+    1. 业务日期 → 窗口外的行直接 `None`（既不算错、也不进指标；上游会多给窗口外的单）。
+       窗口判定**先于**金额解析：窗口外的行本来就不参与任何指标，把它算成"脏行"只会让
+       审计里的拒绝计数虚高。
+    2. 支付金额：必须是整数分、且**非负**（负数不是"退款/冲正"的表达方式，退款在
+       `refund_amount` 里；负金额只会让 GMV 凭空变小）。
+    3. 件数（仅对"已支付 + 有 sku + 成交额 > 0"的行）：缺失/非正按 1 件（降级），
+       类型错整行拒绝（猜不出含义，不许按 1 件猜）。
+    4. 退款金额：整数分、非负；再结合 `refund_status` 判定是否退款。
+
+    返回的 dict 是**纯值**，累加只发生在 :func:`_aggregate_orders` 的提交段：
+    `{order_id, day, paid, revenue, sku_id, units, zero_revenue, refunded, refund_amount,
+    best_effort_units}`。
+    """
+    order_id = _order_id_of(item)
+    day = _business_date_of(item.get("create_time") or item.get("pay_time"), fallback=window_end)
+    if not (window_start <= day <= window_end):
+        return None
+
+    try:
+        paid_amount = _first_int(item, ("pay_amount_cents", "pay_amount"), where=where)
+    except (ValueError, TypeError) as exc:
+        raise _RowRejected(f"支付金额不合法：{exc}", reason="bad_pay_amount") from exc
+    if paid_amount is not None and paid_amount < 0:
+        raise _RowRejected(
+            f"{where}.pay_amount 不允许为负，收到 {paid_amount!r}", reason="bad_pay_amount"
+        )
+
+    paid = bool(paid_amount and paid_amount > 0) or item.get("pay_time") is not None
+    row: dict[str, Any] = {
+        "order_id": order_id,
+        "day": day,
+        "paid": paid,
+        "revenue": int(paid_amount or 0),
+        "sku_id": None,
+        "units": 0,
+        "zero_revenue": False,
+        "refunded": False,
+        "refund_amount": 0,
+        "best_effort_units": None,
+    }
+    if not paid:
+        # 未支付行不参与金额/件数/退款三件事：不去解析它们的 `refund_amount`（旧行为一致）。
+        return row
+
+    sku_id = item.get("sku_id")
+    if sku_id is not None and str(sku_id):
+        row["sku_id"] = str(sku_id)
+        if row["revenue"] <= 0:
+            row["zero_revenue"] = True
+            row["best_effort_units"] = _best_effort_units(item, where=where)
+        else:
+            try:
+                row["units"] = _order_units(
+                    item, where=where, order_id=order_id, degraded=degraded
+                )
+            except (ValueError, TypeError) as exc:
+                raise _RowRejected(f"件数不合法：{exc}", reason="bad_units") from exc
+
+    try:
+        refund_amount = _first_int(item, ("refund_amount_cents", "refund_amount"), where=where)
+    except (ValueError, TypeError) as exc:
+        raise _RowRejected(f"退款金额不合法：{exc}", reason="bad_refund_amount") from exc
+    if refund_amount is not None and refund_amount < 0:
+        raise _RowRejected(
+            f"{where}.refund_amount 不允许为负，收到 {refund_amount!r}",
+            reason="bad_refund_amount",
+        )
+    row["refund_amount"] = int(refund_amount or 0)
+    row["refunded"] = _is_refunded(item, refund_amount=row["refund_amount"])
+    return row
+
+
+def _aggregate_orders(
+    payload: Any,
+    *,
+    window_start: str,
+    window_end: str,
+    cost_table: Mapping[str, int] | None = None,
+) -> dict[str, Any]:
     """订单列表 → 按业务日聚合（`gmv_cents` / `order_count` / `paid_order_count` /
     `refund_order_count` / `refund_amount_cents` / `uv`），并保留 `by_date` 供历史指标使用。
 
@@ -491,9 +891,70 @@ def _aggregate_orders(payload: Any, *, window_start: str, window_end: str) -> di
 
     `uv` 不在订单明细里，只可能来自上游 `summary`；由 :func:`_day_uv` 判定它是否可用于
     **当天**（拿不到就 `None`，绝不按"窗口总数 / 天数"摊派，也不补零）。
+
+    `by_sku`（v1.5.0）是成本口径的唯一数据源：`sku_id -> {"gmv_cents", "units"}`，只统计
+    **已支付**的订单行。没有这一步，"某件货在亏本卖"就无法计算——成本表只知道单价成本，
+    不知道这件货今天卖了多少钱、卖了几件（成本额 = 单价成本 × 件数）。
+    明细里没有 `sku_id` 的订单行**不放进 `by_sku`**：它无法归属到任何 SKU，于是只进全店
+    GMV 的不覆盖部分（`cost_coverage_ratio` 的分子不收它）——这正是"覆盖率"要表达的事，
+    不许为了凑满覆盖率把它摊到别的 SKU 上。
+
+    退款单仍计入成交额与件数（与 `gmv_cents` 的口径一致：GMV 含已退款支付额）。
+    退款把成本冲回来（退货入库）是另一个口径，需要单独的净额指标，不在本函数里偷偷做掉。
+
+    ## 两条**降级**事实（v1.5.1）：只留痕、不抛异常，由 `collect` 记 warn 审计
+
+    `units_degraded`：件数缺失/非正按 1 件（见 :func:`_order_units` 的算例：方向偏乐观、
+    会**漏报**亏本）。采集层容错是为了"一条脏数据不打死当天所有指标"。
+
+    `zero_revenue_paid`：**有 `pay_time` 但成交额为 0** 的订单行。
+
+    - `paid` 的判据是"`pay_amount > 0` 或存在 `pay_time`"（不看状态词表：上游改一次枚举就会
+      静默把 GMV 算成 0）。但"有 `pay_time`"只说明它被支付过，**不说明 `pay_amount` 拿到了**：
+      上游漏返回金额时 `revenue` 就是 0；也可能是**真实的 0 元赠品单**——两者从这里区分不了。
+    - 若这一行仍然进 `by_sku`（`units += 1`），成本口径会记一条**真实的成本**、却记 0 元成交：
+      `covered_revenue` 不变、`covered_cost` 变大 → 毛利率被莫名压负。算例：原本
+      `covered_revenue=120000`、`covered_cost=60000`（毛利率 **+0.5**）；混进一行
+      `units=1, revenue=0`、单价成本 80000 分的"0 元单"后 `covered_cost=140000`，
+      毛利率变成 (120000-140000)/120000 = **-0.1667**，足以**误触发** `loss_making`
+      （critical，只告警不给动作，但它会进日志/告警台，让人去追一件根本没亏的货）。
+    - 所以 `revenue <= 0` 的已支付行**不进成本口径**（不进 `by_sku`），但要留痕：它仍计入
+      `order_count` / `paid_order_count`（GMV 口径不变，那是另一件事），只是无法参与"金额/件数"
+      这条比率。这也是**偏乐观**的方向（少算成本 → 少报亏本）——与本仓"宁可漏报，不可误报"
+      的分级一致，且这条漏报是可查的（log 里有 `collect.zero_revenue_paid`）。
+    - 样本带 `units` / `unit_cost_cents`（v1.5.2，`cost_table` 给了才有）：只有件数没有单价时
+      "漏了多少钱"仍然算不出来，人只能看到"有 N 行没进成本口径"却无法排序该先修哪一单。
+    - `revenue <= 0` 也可能来自**负金额**——那种行不进这里，而是整行拒绝（见下面第 3 条）：
+
+    ## 第三条：**行级脏数据整行拒绝**（v1.5.2；这是"脏数据不许打死整轮"的根治）
+
+    分界线（也是本仓对"降级 vs 硬失败"的判据）：
+
+    - **一行的数据脏**（字段类型不对 / 负数金额 / 件数不是整数）→ :func:`_read_order_row` 抛
+      :class:`_RowRejected`，本函数**整行跳过**并写进 `row_rejected`，其他行照常算。
+      这行**不进 GMV / order_count / by_sku 中的任何一个**（原子提交：先校验成值、再累加），
+      因此不存在"计数 +1 了但金额没加"的半行状态。
+    - **整批的契约坏了**（`data` 不是映射/列表、订单列表字段不是 list、一个已知字段都没有）
+      → :func:`_require_orders_container` 抛 :class:`_BatchContractError`，由 `collect` 记错并
+      把 run 标 `failed`。绝不降级成"今天 0 单 0 元"：那会把一次上游改结构伪装成"生意归零"，
+      所有规则都会因为指标为 0 而静默失效。
+    - `summary.uv` 形状不对同样是整批级问题 → 照旧抛 `ValueError`（硬失败，见 :func:`_summary_uv`）。
+
+    `row_rejected` 的样本也是 `{order_id, where, reason, error}`：`reason` 是稳定分类
+    （`bad_pay_amount` / `bad_units` / `bad_refund_amount` / `unclassified`），`error` 保留
+    原始异常原文（含字段路径），这样"上游改了哪个字段"不用猜。
+
+    `cost_table` 只用于**审计样本**里的 `unit_cost_cents`（让事后能算出 0 元单漏了多少成本），
+    不参与本函数的任何累计口径——所以它缺省可以是 `None`。
     """
+    _require_orders_container(payload)
     orders = _as_list(payload, ("shop_order_list", "orders", "order_list"))
     buckets: dict[str, dict[str, Any]] = {}
+    #: 降级留痕（调用方负责变成审计条目；本函数是纯聚合，不碰日志/DB）
+    units_degraded: list[dict[str, Any]] = []
+    zero_revenue_paid: list[dict[str, Any]] = []
+    #: 被整行拒绝的行（脏数据）——这些行**没有**进入任何指标，审计里必须说清楚
+    row_rejected: list[dict[str, Any]] = []
 
     def _bucket(day: str) -> dict[str, Any]:
         return buckets.setdefault(
@@ -505,35 +966,114 @@ def _aggregate_orders(payload: Any, *, window_start: str, window_end: str) -> di
                 "refund_order_count": 0,
                 "refund_amount_cents": 0,
                 "uv": None,
+                "by_sku": {},
             },
         )
 
     for index, item in enumerate(orders):
         where = f"order[{index}]"
-        day = _business_date_of(item.get("create_time") or item.get("pay_time"),
-                                fallback=window_end)
-        if not (window_start <= day <= window_end):
-            # 上游可能多给了窗口外的单（时区/分页边界），聚合时以业务窗口为准。
+        order_id = _order_id_of(item)
+        #: 这一行自己的降级留痕。**行被接受才合并到 `units_degraded`**：先合并再校验的话，
+        #: 一个后面又被拒绝的行会在审计里留下"缺失件数"的痕迹，可它根本没进任何指标。
+        staged_degraded: list[dict[str, Any]] = []
+        try:
+            row = _read_order_row(
+                item,
+                where=where,
+                window_start=window_start,
+                window_end=window_end,
+                degraded=staged_degraded,
+            )
+        except _RowRejected as exc:
+            # 行级拒绝（v1.5.2）：这一行整行不进任何指标，但**必须留痕**，否则就是静默少算。
+            row_rejected.append(
+                {"order_id": order_id, "where": where, "reason": exc.reason, "error": str(exc)}
+            )
             continue
-        bucket = _bucket(day)
-        paid_amount = _first_int(item, ("pay_amount_cents", "pay_amount"), where=where)
-        paid = bool(paid_amount and paid_amount > 0) or item.get("pay_time") is not None
+        except (ValueError, TypeError) as exc:
+            # 没有显式分级的解析错也走同一条降级（带异常类型名，避免"看不出是什么错"）：
+            # 行级拒绝的唯一后果是"这行不进指标"，而这一点已经写进审计。
+            row_rejected.append(
+                {
+                    "order_id": order_id,
+                    "where": where,
+                    "reason": "unclassified",
+                    "error": f"{type(exc).__name__}: {exc}",
+                }
+            )
+            continue
+        if row is None:
+            # 业务窗口外的行（上游时区/分页边界多给的）：既不是脏数据、也不进指标。
+            continue
+        units_degraded.extend(staged_degraded)
+        bucket = _bucket(row["day"])
         bucket["order_count"] += 1
-        if paid:
-            bucket["paid_order_count"] += 1
-            bucket["gmv_cents"] += int(paid_amount or 0)
-            if _is_refunded(item, where=where):
-                bucket["refund_order_count"] += 1
-                bucket["refund_amount_cents"] += int(
-                    _first_int(item, ("refund_amount_cents", "refund_amount"), where=where) or 0
+        if not row["paid"]:
+            continue
+        bucket["paid_order_count"] += 1
+        bucket["gmv_cents"] += row["revenue"]
+        if row["sku_id"] is not None:
+            if row["zero_revenue"]:
+                # 有支付时间却没有成交额：**不进成本口径**（见 docstring 的 -0.1667 算例）。
+                # 上面已经把它计入 paid_order_count / gmv_cents（GMV 口径是另一件事）。
+                # 样本带件数与单价成本：只知道"有 N 行没进成本口径"是算不出漏了多少钱的。
+                zero_revenue_paid.append(
+                    {
+                        "order_id": row["order_id"],
+                        "where": where,
+                        "sku_id": row["sku_id"],
+                        "units": row["best_effort_units"],
+                        "unit_cost_cents": (
+                            None if cost_table is None else cost_table.get(row["sku_id"])
+                        ),
+                    }
                 )
+            else:
+                # 件数在**解析阶段**已经读好（见 `_read_order_row`）：件数缺失/类型错的边界在
+                # 采集侧，到了 compute_metrics 就只有"金额/件数"这种已经归集好的干净数据。
+                entry = bucket["by_sku"].setdefault(
+                    row["sku_id"], {"gmv_cents": 0, "units": 0}
+                )
+                entry["gmv_cents"] += row["revenue"]
+                entry["units"] += row["units"]
+        if row["refunded"]:
+            bucket["refund_order_count"] += 1
+            bucket["refund_amount_cents"] += row["refund_amount"]
 
     order_days = set(buckets)  # 先记下"有订单的那些天"，再补 end 桶（否则 scope 判定会被自己污染）
     today = buckets.get(window_end) or _bucket(window_end)
     day_uv = _day_uv(payload, window_end=window_end, order_days=order_days)
     if day_uv is not None:
         today["uv"] = day_uv
-    return {"by_date": {day: buckets[day] for day in sorted(buckets)}, **today}
+    # 降级/拒绝留痕与聚合结果**分开返回**：调用方（`collect`）要把它们从 `order_summary` 里取走
+    # 变成审计条目，而 `MetricsSnapshot` 的输入不该多出与指标无关的键。
+    return {
+        "by_date": {day: buckets[day] for day in sorted(buckets)},
+        "units_degraded": units_degraded,
+        "zero_revenue_paid": zero_revenue_paid,
+        "row_rejected": row_rejected,
+        **today,
+    }
+
+
+def _audit_cost_table() -> dict[str, int] | None:
+    """给**审计样本**用的成本表（`sku_id -> 整数分`）；读不到 → `None`。
+
+    为什么 `collect` 要碰成本表：`collect.zero_revenue_paid` 的样本只有"这行没进成本口径"，
+    没有单价就算不出"漏了多少成本"（事后只能看到 N 行，排不出该先修哪一单）。所以样本里补
+    `units × unit_cost_cents`。但这一份**只进审计**，不参与任何指标累计。
+
+    为什么 `ConfigError` 在这里降级成 `None`：成本表坏掉的**硬失败归 `compute_metrics`**
+    （那里记 CONFIG 错并让 run 失败，`test_compute_metrics_node_fails_loudly…` 钉住了）。
+    若这里也抛，一个配置事故会在采集阶段就把整轮 500，连"当天成交额是多少"都拿不到——
+    那正是本文件反复要避免的"配置错误伪装成采集事故"。所以：**读不到就没有单价，不编一个 0**。
+    """
+    try:
+        from app.services.costs import get_sku_costs
+
+        return get_sku_costs()
+    except ConfigError:
+        return None
 
 
 @traced("collect")
@@ -546,6 +1086,31 @@ async def collect(state: AgentState, config: RunnableConfig) -> dict[str, Any]:
       按 §9.2 的预算重试；重试用尽才由 `run_agent` 兜住。
     - **不可重试**错误（4xx / business / signature / auth）→ 记 `errors`；其中订单（指标的唯一
       来源）缺失即判定 `failed` 走 `finalize`，其余降级为 `partial=True` 继续。
+
+    ## 脏数据的容错与留痕（v1.5.1）
+
+    订单明细里"件数缺失/非正"与"有 `pay_time` 却成交额为 0"是**真实会发生的脏数据**。前者
+    按 1 件、后者不进成本口径（细节见 :func:`_order_units` / :func:`_aggregate_orders`），
+    **都不抛异常**：抛出去会从 `collect` 逃出节点 → 图把 run 标 `failed` 并 re-raise
+    → `POST /api/agent/run` 500，一条脏数据打死当天所有指标。
+
+    代价是"这两个选择都会让毛利率偏乐观（漏报亏本）"，所以每次降级都写**两处**留痕：
+    `state.audit`（`collect.units_degraded` / `collect.zero_revenue_paid`）与 JSONL——
+    后者是它们唯一的人类出口（没有 approval_request、也没有 action_log 行）。
+
+    ## 三种数据问题的分级（v1.5.2 补上了缺的那一档）
+
+    上一版只处理了"件数缺失/非正"和"0 元单"两种**能猜出含义**的降级，而
+    `product_count: "3"` / `pay_amount: "199.00"` 这类**猜不出含义**的形状错仍然从 `collect`
+    逃出 → 整轮 500。现在三档分明（判据写在 :func:`_aggregate_orders` 的 docstring）：
+
+    1. **能猜出含义 → 有界降级**（件数按 1 件、0 元单不进成本口径），照常算指标；
+    2. **一行的数据脏、猜不出含义 → 整行拒绝**：跳过该行并记 `collect.row_rejected`
+       （warn，带 `count` + 最多 5 条样本 + 按原因计数），其余行照常算；
+    3. **整批契约坏了 → 硬失败**（不 500）：`data` 不是映射/列表、订单列表字段不是 list、
+       一个已知列表字段都没有 → 记一条错误 + `failed` 走 `finalize`，绝不静默给出"0 单 0 元"。
+
+    审计是**旁路**：`_log_audit` 的写盘失败不会打断本节点（见该函数的 docstring）。
     """
     runtime = resolve_runtime(config)
     client = resolve_client(config, runtime)
@@ -596,6 +1161,9 @@ async def collect(state: AgentState, config: RunnableConfig) -> dict[str, Any]:
 
     # --- 订单（必需：指标的唯一来源） ---
     order_summary: dict[str, Any] | None = None
+    units_degraded: list[dict[str, Any]] = []
+    zero_revenue_paid: list[dict[str, Any]] = []
+    row_rejected: list[dict[str, Any]] = []
     try:
         response = await client.search_orders(
             start_time=f"{window_start} 00:00:00", end_time=f"{today} 23:59:59", page=0, size=100
@@ -607,11 +1175,35 @@ async def collect(state: AgentState, config: RunnableConfig) -> dict[str, Any]:
         source["partial"] = True
     else:
         _note_call(source, "order.searchList", response)
-        aggregate = _aggregate_orders(
-            getattr(response, "data", None), window_start=window_start, window_end=today
-        )
-        by_date = aggregate.pop("by_date")
-        order_summary = {**aggregate, "by_date": by_date}
+        try:
+            aggregate = _aggregate_orders(
+                getattr(response, "data", None),
+                window_start=window_start,
+                window_end=today,
+                # 成本表只用来给审计样本补 `unit_cost_cents`（事后量化"漏了多少成本"），
+                # 读不到就 None——**成本表坏掉的硬失败归 compute_metrics**，这里不许抢先炸。
+                cost_table=_audit_cost_table(),
+            )
+        except _BatchContractError as exc:
+            # 整批契约坏了：记一条具体错误，`order_summary` 保持 None → 下面统一走"订单数据缺失"
+            # 的硬失败分支（status=failed → finalize）。绝不继续用"0 单"把一次上游改结构
+            # 伪装成"今天没卖东西"。注意这里**不**捕获普通 `ValueError`：`summary.uv` 形状错
+            # 仍按 §5.3 的既有契约当场抛出（`test_collect_uv` 钉住这一条）。
+            errors.append(
+                make_agent_error(
+                    node="collect",
+                    category=ErrorCategory.UNKNOWN,
+                    message=f"订单数据结构不合法，无法聚合：{exc}",
+                    retryable=False,
+                )
+            )
+            source["partial"] = True
+        else:
+            by_date = aggregate.pop("by_date")
+            units_degraded = aggregate.pop("units_degraded")
+            zero_revenue_paid = aggregate.pop("zero_revenue_paid")
+            row_rejected = aggregate.pop("row_rejected")
+            order_summary = {**aggregate, "by_date": by_date}
 
     if order_summary is None:
         errors.append(
@@ -641,21 +1233,83 @@ async def collect(state: AgentState, config: RunnableConfig) -> dict[str, Any]:
         order_summary=order_summary,
         source=source,
     )
+    audits = _audit(
+        state,
+        node="collect",
+        event="collect.done",
+        data={
+            "window": raw["window"],
+            "products": len(products),
+            "methods": list(source["methods"]),
+            "partial": bool(source["partial"]),
+            # 整行被拒的条数在这里也出现一次：`collect.done` 是"这一轮采集到底发生了什么"的
+            # 汇总入口，读者不必先去翻 `collect.row_rejected` 才知道今天有几行没进指标。
+            "rows_rejected": len(row_rejected),
+        },
+        at=raw["collected_at"],
+    )
+    # 采集层的两次**容错**必须留痕（v1.5.1）。它们不产生 approval_request、不进 action_log，
+    # 所以除了 `state.audit` 之外还必须写一条 JSONL：否则"这次为什么漏报亏本"在日志页上
+    # 找不到任何线索（而这正是这两个降级的唯一后果）。
+    if units_degraded:
+        data = _degradation_summary("units", units_degraded)
+        audits = append_audits(
+            {"audit": audits},  # type: ignore[arg-type]
+            [make_audit_entry(node="collect", event="collect.units_degraded", data=data)],
+        )
+        _log_audit(
+            state,
+            node="collect",
+            event="collect.units_degraded",
+            level="warn",
+            message=(
+                f"有 {data['count']} 条订单行缺件数/件数非正，已按 1 件计入成本口径"
+                "（方向偏乐观：会漏报亏本）"
+            ),
+            data=data,
+        )
+    if zero_revenue_paid:
+        data = _degradation_summary("zero_revenue_paid", zero_revenue_paid)
+        audits = append_audits(
+            {"audit": audits},  # type: ignore[arg-type]
+            [make_audit_entry(node="collect", event="collect.zero_revenue_paid", data=data)],
+        )
+        _log_audit(
+            state,
+            node="collect",
+            event="collect.zero_revenue_paid",
+            level="warn",
+            message=(
+                f"有 {data['count']} 条已支付订单行成交额为 0（可能缺 pay_amount，"
+                "也可能真是 0 元单），未计入成本口径（避免虚增成本造成误报亏本）"
+            ),
+            data=data,
+        )
+    if row_rejected:
+        # 行级拒绝（v1.5.2）：这些行**整行**没进指标。审计必须把这件事说出来，否则
+        # "GMV 比昨天少了一截"就永远无法归因到"上游有几行脏数据被跳过了"。
+        data = _degradation_summary("row_rejected", row_rejected)
+        data["excluded_from_metrics"] = True
+        audits = append_audits(
+            {"audit": audits},  # type: ignore[arg-type]
+            [make_audit_entry(node="collect", event="collect.row_rejected", data=data)],
+        )
+        _log_audit(
+            state,
+            node="collect",
+            event="collect.row_rejected",
+            level="warn",
+            message=(
+                f"有 {data['count']} 条订单行数据不合法（按原因：{data['reasons']}），已整行跳过："
+                "这些行没有进入 GMV / 订单数 / by_sku 中的任何一个指标"
+                "（不是静默少算：样本见 data.samples）"
+            ),
+            data=data,
+        )
     return {
         "raw": raw,
         "errors": _errors(state, errors),
-        "audit": _audit(
-            state,
-            node="collect",
-            event="collect.done",
-            data={
-                "window": raw["window"],
-                "products": len(products),
-                "methods": list(source["methods"]),
-                "partial": bool(source["partial"]),
-            },
-            at=raw["collected_at"],
-        ),
+        "audit": audits,
     }
 
 
@@ -669,6 +1323,28 @@ def route_after_collect(state: AgentState) -> str:
 # ======================================================================================
 # 2) compute_metrics
 # ======================================================================================
+
+
+def _unmatched_cost_skus(
+    products: Sequence[Mapping[str, Any]], cost_table: Mapping[str, int]
+) -> list[str]:
+    """成本表里有、这次商品列表里**没有**的 `sku_id`（§8.5 要求"不能静默忽略"）。
+
+    为什么不在启动期做（契约原文写的是启动期 `ConfigError`）：启动期根本拿不到
+    `raw.products`——商品列表来自一次上游调用。静态交叉校验在物理上不可能，能做的只有
+    在第一次看到商品列表时把名单喊出来（调用方记 audit）。
+
+    为什么商品列表为空时返回空名单：采集降级（`partial=True`）时没有商品列表，
+    此时**每一条**成本都会"看起来对不上"，报出来是一串假警报，反而把真问题淹掉。
+    """
+    if not products:
+        return []
+    known = {
+        str(item.get("sku_id"))
+        for item in products
+        if isinstance(item, Mapping) and item.get("sku_id")
+    }
+    return sorted(set(cost_table).difference(known))
 
 
 @traced("compute_metrics")
@@ -698,6 +1374,31 @@ async def compute_metrics_node(state: AgentState, config: RunnableConfig) -> dic
     by_date = dict((raw.get("order_summary") or {}).get("by_date") or {})
     today = str(raw["window"]["end"])
 
+    # 成本表（§8.5）：正常由 lifespan 先加载并校验；这里取缓存的同一份。若它坏了（有人在
+    # lifespan 之后重置了缓存又改坏了文件），按"配置错误"记进 errors 并让 run 失败——
+    # 绝不降级成"没有成本"继续跑：那会把一次配置事故伪装成"这家店没配成本"的正常状态。
+    try:
+        from app.services.costs import get_sku_costs
+
+        cost_table = get_sku_costs()
+    except ConfigError as exc:
+        return {
+            "errors": _errors(
+                state,
+                [
+                    make_agent_error(
+                        node="compute_metrics",
+                        category=ErrorCategory.CONFIG,
+                        message=f"成本表加载失败，无法计算毛利率：{exc}",
+                        retryable=False,
+                    )
+                ],
+            ),
+            "status": RunStatus.FAILED.value,
+        }
+
+    unmatched_cost_skus = _unmatched_cost_skus(raw.get("products") or [], cost_table)
+
     history: list[MetricsSnapshot] = []
     for day in sorted(by_date):
         day_raw = RawSnapshot(
@@ -709,29 +1410,79 @@ async def compute_metrics_node(state: AgentState, config: RunnableConfig) -> dic
             source={"methods": [], "request_ids": [], "partial": False},
         )
         # 逐日累积：每一条历史都能带着"它自己那一刻"的 7 日均值，而不是全 None。
-        history.append(compute_metrics(day_raw, history=list(history), now=now))
+        history.append(
+            compute_metrics(day_raw, history=list(history), now=now, cost_table=cost_table)
+        )
 
     if history and history[-1]["date"] == today:
         metrics = history[-1]
     else:
-        metrics = compute_metrics(raw, history=list(history), now=now)
+        metrics = compute_metrics(raw, history=list(history), now=now, cost_table=cost_table)
         history.append(metrics)
+
+    audit_data = {
+        "date": metrics["date"],
+        "gmv_cents": metrics["gmv_cents"],
+        "history_days": len(history),
+        "gmv_7d_avg_cents": metrics["gmv_7d_avg_cents"],
+        # 成本口径的两个字段进审计：`None`（没配成本/没按 SKU 归集）与真实的
+        # `0.0`（配了成本但一件没卖）在这里必须能被区分，否则事后无法解释
+        # "为什么这次 loss_making 没响"。
+        "gross_margin": metrics["gross_margin"],
+        "cost_coverage_ratio": metrics["cost_coverage_ratio"],
+    }
+    audits = _audit(
+        state,
+        node="compute_metrics",
+        event="metrics.computed",
+        data=audit_data,
+        at=str(metrics["computed_at"]),
+    )
+    # 同一个事实也写进 JSONL：`/api/logs?event=metrics.` 是"这一天到底算出了什么"的唯一
+    # 人类入口（成本口径的两个字段在这里是 None 还是 0.0，决定了 loss_making 该不该响）。
+    _log_audit(
+        state,
+        node="compute_metrics",
+        event="metrics.computed",
+        level="info",
+        message=(
+            f"指标已计算：{metrics['date']} gmv={metrics['gmv_cents']} 分 "
+            f"gross_margin={metrics['gross_margin']} "
+            f"cost_coverage_ratio={metrics['cost_coverage_ratio']}"
+        ),
+        data=audit_data,
+    )
+    if unmatched_cost_skus:
+        # §8.5 要求"成本表里对不上商品的条目不能静默忽略"。启动期没有 `raw.products`，
+        # 静态交叉校验不可能，所以在这里（第一次能看到商品列表的地方）记一条可见的审计；
+        # 只记不阻断：一条过期的成本配置不该让当天所有指标都算不出来。
+        unmatched_data = {"sku_ids": unmatched_cost_skus, "count": len(unmatched_cost_skus)}
+        audits = append_audits(
+            {"audit": audits},  # type: ignore[arg-type]
+            [
+                make_audit_entry(
+                    node="compute_metrics",
+                    event="sku_costs.unmatched",
+                    data=unmatched_data,
+                )
+            ],
+        )
+        _log_audit(
+            state,
+            node="compute_metrics",
+            event="sku_costs.unmatched",
+            level="warn",
+            message=(
+                f"成本表里有 {len(unmatched_cost_skus)} 个 SKU 不在本次商品列表中"
+                "（这些条目的成本不会参与毛利计算，检查是否下架/改 sku_id 后没同步）"
+            ),
+            data=unmatched_data,
+        )
 
     return {
         "metrics": metrics,
         "history": history[-9:],
-        "audit": _audit(
-            state,
-            node="compute_metrics",
-            event="metrics.computed",
-            data={
-                "date": metrics["date"],
-                "gmv_cents": metrics["gmv_cents"],
-                "history_days": len(history),
-                "gmv_7d_avg_cents": metrics["gmv_7d_avg_cents"],
-            },
-            at=str(metrics["computed_at"]),
-        ),
+        "audit": audits,
     }
 
 
@@ -793,20 +1544,63 @@ async def detect_anomalies_node(state: AgentState, config: RunnableConfig) -> di
             )
         )
     anomalies: list[Anomaly] = evaluation.anomalies
-    return {
-        "anomalies": anomalies,
-        "errors": _errors(state, errors),
-        "audit": _audit(
+    #: `kind` 是**同一 event 名下两种 schema 的判别键**（v1.5.2）：`anomaly.detected` 既写一条
+    #: 汇总、又给每条异常写一条明细。过去消费方只能靠"data 里有没有 rule_id"来猜两种形状
+    #: （明细没有 `count`、汇总没有 `rule_id`），猜错的代价是 `.get()` 满天飞 + 静默把汇总当明细。
+    #: 这与同文件 `collect.*` 事件已有的风格一致（它们的 `data.kind` 是 `units` /
+    #: `zero_revenue_paid` / `row_rejected`），所以这里补的不是新发明，而是把已有的约定补齐。
+    summary = {
+        "kind": "summary",
+        "count": len(anomalies),
+        "rule_ids": [item["rule_id"] for item in anomalies],
+        "skipped": [rule_id for rule_id, _ in evaluation.skipped],
+        "dropped": evaluation.dropped,
+    }
+    audits = _audit(
+        state, node="detect_anomalies", event="anomaly.detected", data=summary
+    )
+    # 一条**汇总**行（命中几条、跳过/截断几条）：level 恒为 info——它是"这次检测跑了"的心跳，
+    # 不是告警本身；真正的告警在下面每条异常一行、按 severity 定 level。
+    _log_audit(
+        state,
+        node="detect_anomalies",
+        event="anomaly.detected",
+        level="info",
+        message=(
+            f"异常检测完成：命中 {len(anomalies)} 条，跳过 "
+            f"{len(evaluation.skipped)} 条规则，截断 {evaluation.dropped} 条"
+        ),
+        data=summary,
+    )
+    for anomaly in anomalies:
+        # 每条异常一条独立事件（v1.5.1 的根因修复）：只写汇总的话，`loss_making` 这类
+        # "只告警、不产生 approval_request"的规则仍然没有出口——审批台看不到（没有待办），
+        # 日志页也查不到（event 里只有 count/rule_ids，没有 observed）。
+        _log_audit(
             state,
             node="detect_anomalies",
             event="anomaly.detected",
+            level=_SEVERITY_LEVEL[str(anomaly["severity"])],
+            message=str(anomaly["message"]),
             data={
-                "count": len(anomalies),
-                "rule_ids": [item["rule_id"] for item in anomalies],
-                "skipped": [rule_id for rule_id, _ in evaluation.skipped],
-                "dropped": evaluation.dropped,
+                # 与上面那条汇总用同一个 `kind` 判别键（`"detail"` / `"summary"`）：
+                # 消费方按 `kind` 取，不再靠"有没有 rule_id"猜这两种形状。
+                "kind": "detail",
+                "anomaly_id": anomaly["anomaly_id"],
+                "rule_id": anomaly["rule_id"],
+                "metric": anomaly["metric"],
+                "observed": anomaly["observed"],
+                "threshold": anomaly["threshold"],
+                "comparator": anomaly["comparator"],
+                "severity": str(anomaly["severity"]),
+                "window": anomaly["window"],
+                "detected_at": anomaly["detected_at"],
             },
-        ),
+        )
+    return {
+        "anomalies": anomalies,
+        "errors": _errors(state, errors),
+        "audit": audits,
     }
 
 
