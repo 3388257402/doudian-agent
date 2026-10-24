@@ -1,0 +1,466 @@
+"""`collect` 的行级契约（v1.5.3）：脏行**整行拒绝**、全被拒**硬失败**、拒绝率**可观测**。
+
+这组用例补的是 F1b/F1 之间的四个缝（独立审查在 HEAD `1b81fc3` 上实测出）：
+
+1. **P0-1 时间戳越界 500**：`create_time=9999999999999999` 让 `_business_date_of` 里的
+   `datetime.fromtimestamp` 在 Windows 抛 `OSError`，而 `_aggregate_orders` 只接
+   `(ValueError, TypeError)` → 逃出 `collect` → 图标 failed 后 re-raise → `POST /api/agent/run`
+   **500**。平台相关（Linux 上可能是 ValueError 被接住）→ CI 绿、线上红。
+2. **P0-2 解析不出的日期被算进"今天"**：`create_time="2026-13-45 99:99:99"` 回退
+   `fallback=window_end` → 垃圾日期虚增当天 GMV。与"猜不出含义就整行拒绝"相反。
+3. **P1 全行拒绝 → 静默 0 单 0 元**：两行 `pay_amount` 都是字符串时，旧实现是
+   `status=None / partial=False / gmv=0 / orders=0 / errors=[]`——零告警的"生意归零"。
+4. **P2 元素形状错被静默丢弃**：`{"shop_order_list": ["x", 1, None]}` 经 `_as_list` 过滤后
+   变成空列表，只有一条 `collect.done`；`sku_id` 是 dict 时被 `str()` 成 `"{'a': 1}"` 当 SKU 名。
+
+契约：**看到了行但一行都没解析出来 ≠ 今天没卖东西**。全被拒走 `_BatchContractError` 同一条
+路径（`status=failed`，不 500）；部分被拒保持 warn + `source["partial"]=True`；拒绝率
+（`rows_seen` / `rows_accepted`）进 `collect.done` 的审计。
+"""
+
+from __future__ import annotations
+
+from typing import Any
+
+import pytest
+from app.agent.nodes import collect
+from app.enums import RunStatus
+from app.observability.logging import JsonlLogSink
+
+from .conftest import TODAY, FakeDoudianClient, FakeResponse
+
+RUN_ID = "run_collect_row_contract"
+
+
+def _state(**overrides: Any) -> dict[str, Any]:
+    """`collect` 真正读的最小 state（其余键留空，避免顺手跑别的逻辑）。"""
+    state: dict[str, Any] = {
+        "run_id": RUN_ID,
+        "trace_id": "trace_collect_row_contract",
+        "shop_id": "12345678",
+        "status": RunStatus.RUNNING.value,
+        "raw": None,
+        "errors": [],
+        "audit": [],
+    }
+    state.update(overrides)
+    return state
+
+
+def _config(runtime: Any) -> dict[str, Any]:
+    from .conftest import FIXED_NOW
+
+    return {"configurable": {"now": FIXED_NOW, "runtime": runtime}}
+
+
+def _good_row(order_id: str = "o_good", *, pay_amount: int = 9_900) -> dict[str, Any]:
+    return {
+        "order_id": order_id,
+        "sku_id": "sku_a",
+        "pay_amount": pay_amount,
+        "product_count": 1,
+        "create_time": f"{TODAY} 10:00:00",
+    }
+
+
+def _rejected(update: dict[str, Any]) -> list[dict[str, Any]]:
+    return [entry for entry in update["audit"] if entry["event"] == "collect.row_rejected"]
+
+
+def _done(update: dict[str, Any]) -> dict[str, Any]:
+    entries = [entry for entry in update["audit"] if entry["event"] == "collect.done"]
+    assert len(entries) == 1, [entry["event"] for entry in update["audit"]]
+    return entries[0]["data"]
+
+
+# ======================================================================================
+# P0-1 / P0-2：行级日期解析（strict）
+# ======================================================================================
+
+
+async def test_out_of_range_timestamp_rejects_the_row_instead_of_http_500(
+    runtime: Any, sink: JsonlLogSink, fake_client: FakeDoudianClient
+) -> None:
+    """`create_time=9999999999999999` → `bad_create_time` 整行拒绝，**不**从节点逃出去。
+
+    值本身越界（毫秒/秒换算后是公元 30 万年），任何平台都表示不出来。旧实现里 Windows 上
+    `datetime.fromtimestamp` 抛 `OSError`（`[Errno 22] Invalid argument`），只被
+    `graph.ainvoke` 的 `except Exception` 兜住 → 标 failed 再 re-raise → API 500；Linux 上
+    可能抛 `ValueError` 被行级 `except` 接住 → 同一个入口两种行为（CI 绿、线上红）。
+    """
+    fake_client.orders = [
+        {
+            "order_id": "o_epoch_overflow",
+            "sku_id": "sku_a",
+            "pay_amount": 100,
+            "create_time": 9_999_999_999_999_999,  # 越界时间戳
+        },
+        _good_row(),
+    ]
+
+    update = await collect.__wrapped__(_state(), _config(runtime))  # type: ignore[attr-defined]
+
+    # 节点没有 failed（旧实现这里会是 status=failed + 异常逃出 → 500）
+    assert update.get("status") != RunStatus.FAILED.value
+    summary = update["raw"]["order_summary"]
+    assert summary["gmv_cents"] == 9_900, "越界时间戳那一行的 100 分不许进 GMV"
+    assert summary["order_count"] == 1
+
+    rejected = _rejected(update)
+    assert len(rejected) == 1
+    data = rejected[0]["data"]
+    assert data["count"] == 1
+    assert data["reasons"] == {"bad_create_time": 1}
+    sample = data["samples"][0]
+    assert sample["order_id"] == "o_epoch_overflow"
+    assert sample["reason"] == "bad_create_time"
+    assert "时间戳" in sample["error"]
+    # 有行被拒 = 这份采集不完整：raw 快照必须自证（P3）
+    assert update["raw"]["source"]["partial"] is True
+
+
+async def test_unparseable_create_time_is_rejected_instead_of_counted_as_today(
+    runtime: Any, sink: JsonlLogSink, fake_client: FakeDoudianClient
+) -> None:
+    """`create_time="2026-13-45 99:99:99"` → 整行拒绝，**绝不**回退成今天。
+
+    旧实现回退 `fallback=window_end`（今天），垃圾日期被当成一笔当日成交（审查实测
+    `gmv=555 / orders=1`）。这与"猜不出含义就整行拒绝"正好相反，而且是**虚增**。
+    """
+    fake_client.orders = [
+        {
+            "order_id": "o_bad_date",
+            "sku_id": "sku_a",
+            "pay_amount": 555,
+            "create_time": "2026-13-45 99:99:99",
+        },
+        _good_row(),
+    ]
+
+    update = await collect.__wrapped__(_state(), _config(runtime))  # type: ignore[attr-defined]
+
+    assert update.get("status") != RunStatus.FAILED.value
+    summary = update["raw"]["order_summary"]
+    assert summary["gmv_cents"] == 9_900, "无法解析的日期不许被算进今天（旧实现是 555）"
+    assert summary["order_count"] == 1
+    assert summary["paid_order_count"] == 1
+
+    data = _rejected(update)[0]["data"]
+    assert data["reasons"] == {"bad_create_time": 1}
+    assert data["samples"][0]["order_id"] == "o_bad_date"
+    assert data["samples"][0]["reason"] == "bad_create_time"
+    assert update["raw"]["source"]["partial"] is True
+
+
+# ======================================================================================
+# P1：三个区间的拒绝率（全拒 → failed；部分被拒 → warn + partial；零行才是真的零）
+# ======================================================================================
+
+
+async def test_all_rows_rejected_fails_like_a_broken_batch_instead_of_zero_metrics(
+    runtime: Any, sink: JsonlLogSink, fake_client: FakeDoudianClient
+) -> None:
+    """两行 `pay_amount` 都是字符串 → **failed**（不 500），不是静默的 0 单 0 元。
+
+    审查实测的旧状态：`status=None / partial=False / gmv=0 / orders=0 / anomalies=[] /
+    errors=[]`，run 正常 done、零告警。这正是 F1b 要避免的状态，只是从"整批契约坏"降级成
+    "逐行契约坏"。判据是 `rows_seen > 0 且 rows_accepted == 0`，走同一条
+    `_BatchContractError` 路径（记明确错误 + `status=failed`）。
+    """
+    fake_client.orders = [
+        {"order_id": "o1", "sku_id": "sku_a", "pay_amount": "199.00",
+         "create_time": f"{TODAY} 09:00:00"},
+        {"order_id": "o2", "sku_id": "sku_a", "pay_amount": "299.00",
+         "create_time": f"{TODAY} 11:00:00"},
+    ]
+
+    update = await collect.__wrapped__(_state(), _config(runtime))  # type: ignore[attr-defined]
+
+    assert update.get("status") == RunStatus.FAILED.value
+    assert "raw" not in update, "一行都没解析出来时不许交出一份全 0 的 raw"
+    messages = [str(item["message"]) for item in update["errors"]]
+    assert any("订单行全部被拒绝" in text for text in messages), messages
+    # 文案要说清"一行都没解析出来 ≠ 今天没卖东西"
+    assert any("一行都没解析出来 ≠ 今天没卖东西" in text for text in messages), messages
+
+    failed = [entry for entry in update["audit"] if entry["event"] == "collect.failed"]
+    assert len(failed) == 1
+    data = failed[0]["data"]
+    assert data["rows_seen"] == 2
+    assert data["rows_accepted"] == 0
+    assert data["rows_rejected"] == 2
+    assert data["reject_reasons"] == {"bad_pay_amount": 2}
+    assert data["source"]["partial"] is True
+
+
+async def test_partially_rejected_rows_stay_a_warning_with_partial_source(
+    runtime: Any, sink: JsonlLogSink, fake_client: FakeDoudianClient
+) -> None:
+    """中间区间：一行坏、一行好 → 正常算指标 + warn + `source.partial=True`。
+
+    旧实现里行级拒绝后 `partial` 仍是 False（审查实测）：`raw.source` 与 `collect.row_rejected`
+    两个出口对"这次采集完不完整"的口径互相矛盾。
+    """
+    fake_client.orders = [
+        {"order_id": "o_bad", "sku_id": "sku_a", "pay_amount": "199.00",
+         "create_time": f"{TODAY} 09:00:00"},
+        _good_row(pay_amount=19_900),
+    ]
+
+    update = await collect.__wrapped__(_state(), _config(runtime))  # type: ignore[attr-defined]
+
+    assert update.get("status") != RunStatus.FAILED.value
+    summary = update["raw"]["order_summary"]
+    assert summary["gmv_cents"] == 19_900
+    assert summary["order_count"] == 1
+    assert update["raw"]["source"]["partial"] is True, "有行被拒时 raw.source 必须自证不完整"
+
+    data = _rejected(update)[0]["data"]
+    assert data["count"] == 1
+    assert data["reasons"] == {"bad_pay_amount": 1}
+
+    done = _done(update)
+    assert done["rows_seen"] == 2
+    assert done["rows_accepted"] == 1
+    assert done["rows_rejected"] == 1
+    assert done["partial"] is True
+
+
+async def test_zero_rows_is_a_legitimate_empty_day_not_a_failure(
+    runtime: Any, sink: JsonlLogSink, fake_client: FakeDoudianClient
+) -> None:
+    """`orders=[]` → 合法空结果（真的没卖东西），不能因为 `rows_accepted == 0` 就误判 failed。
+
+    阈值是"看到了行但一行都没接受"，`rows_seen == 0` 不在其中：空列表与"全部被拒"是两件事。
+    """
+    fake_client.orders = []
+
+    update = await collect.__wrapped__(_state(), _config(runtime))  # type: ignore[attr-defined]
+
+    assert update.get("status") != RunStatus.FAILED.value
+    summary = update["raw"]["order_summary"]
+    assert summary["gmv_cents"] == 0
+    assert summary["order_count"] == 0
+    assert _rejected(update) == []
+    assert update["raw"]["source"]["partial"] is False
+    done = _done(update)
+    assert (done["rows_seen"], done["rows_accepted"], done["rows_rejected"]) == (0, 0, 0)
+
+
+async def test_all_rows_accepted_reports_full_acceptance_rate(
+    runtime: Any, sink: JsonlLogSink, fake_client: FakeDoudianClient
+) -> None:
+    """全部被接受 → `rows_seen == rows_accepted`、`rows_rejected == 0`、`partial=False`。
+
+    第三个区间的正向对照：拒绝率不是"有数就算"，分子分母都要对。
+    """
+    fake_client.orders = [_good_row("o1"), _good_row("o2", pay_amount=19_900)]
+
+    update = await collect.__wrapped__(_state(), _config(runtime))  # type: ignore[attr-defined]
+
+    assert update.get("status") != RunStatus.FAILED.value
+    assert update["raw"]["source"]["partial"] is False
+    done = _done(update)
+    assert done["rows_seen"] == 2
+    assert done["rows_accepted"] == 2
+    assert done["rows_rejected"] == 0
+
+
+# ======================================================================================
+# P2：元素形状错 / sku_id 形状错
+# ======================================================================================
+
+
+async def test_non_object_order_elements_are_counted_as_rejected_rows(
+    monkeypatch: pytest.MonkeyPatch,
+    runtime: Any,
+    sink: JsonlLogSink,
+    fake_client: FakeDoudianClient,
+) -> None:
+    """`["x", 1, None]` 不是"没给数据"，是"给了但没解析出来" → `not_an_object` 计入拒绝率。
+
+    旧实现经 `_as_list` 静默过滤成空列表：`gmv=0 / orders=0`，只有一条 `collect.done`。
+    """
+
+    async def _raw_orders(**_kwargs: Any) -> FakeResponse:
+        # 夹具的 search_orders 会 `dict(item)` 复制每一行，非对象元素过不去；这里直接给原始 payload。
+        return FakeResponse(data={"shop_order_list": ["x", 1, None]})
+
+    monkeypatch.setattr(fake_client, "search_orders", _raw_orders)
+
+    update = await collect.__wrapped__(_state(), _config(runtime))  # type: ignore[attr-defined]
+
+    assert update.get("status") == RunStatus.FAILED.value
+    messages = [str(item["message"]) for item in update["errors"]]
+    assert any("订单行全部被拒绝" in text for text in messages), messages
+
+    failed = next(entry for entry in update["audit"] if entry["event"] == "collect.failed")
+    data = failed["data"]
+    assert data["rows_seen"] == 3
+    assert data["rows_accepted"] == 0
+    assert data["reject_reasons"] == {"not_an_object": 3}
+
+
+async def test_one_non_object_element_among_valid_rows_is_a_partial_rejection(
+    monkeypatch: pytest.MonkeyPatch,
+    runtime: Any,
+    sink: JsonlLogSink,
+    fake_client: FakeDoudianClient,
+) -> None:
+    """混合：一行好、一行是字符串 → 好行照常算，坏元素记 `not_an_object`（不是静默丢弃）。"""
+
+    async def _raw_orders(**_kwargs: Any) -> FakeResponse:
+        return FakeResponse(data={"shop_order_list": [_good_row(), "oops"]})
+
+    monkeypatch.setattr(fake_client, "search_orders", _raw_orders)
+
+    update = await collect.__wrapped__(_state(), _config(runtime))  # type: ignore[attr-defined]
+
+    assert update.get("status") != RunStatus.FAILED.value
+    assert update["raw"]["order_summary"]["gmv_cents"] == 9_900
+    data = _rejected(update)[0]["data"]
+    assert data["reasons"] == {"not_an_object": 1}
+    assert data["samples"][0]["reason"] == "not_an_object"
+    assert data["samples"][0]["where"] == "order[1]"
+    done = _done(update)
+    assert (done["rows_seen"], done["rows_accepted"]) == (2, 1)
+
+
+async def test_dict_sku_id_is_rejected_instead_of_becoming_a_fake_sku_name(
+    runtime: Any, sink: JsonlLogSink, fake_client: FakeDoudianClient
+) -> None:
+    """`sku_id={"a": 1}` → `bad_sku_id` 整行拒绝，不许被 `str()` 成 "{'a': 1}" 进 `by_sku`。
+
+    那个假 SKU 名永远匹配不上成本表，只会把 `cost_coverage_ratio` 拉低而让人不明所以。
+    """
+    fake_client.orders = [
+        {
+            "order_id": "o_bad_sku",
+            "sku_id": {"a": 1},
+            "pay_amount": 299_000,
+            "product_count": 1,
+            "create_time": f"{TODAY} 09:00:00",
+        },
+        _good_row(pay_amount=19_900),
+    ]
+
+    update = await collect.__wrapped__(_state(), _config(runtime))  # type: ignore[attr-defined]
+
+    assert update.get("status") != RunStatus.FAILED.value
+    summary = update["raw"]["order_summary"]
+    assert summary["gmv_cents"] == 19_900, "假 SKU 行的金额不许进 GMV"
+    assert summary["by_sku"] == {"sku_a": {"gmv_cents": 19_900, "units": 1}}
+
+    data = _rejected(update)[0]["data"]
+    assert data["reasons"] == {"bad_sku_id": 1}
+    sample = data["samples"][0]
+    assert sample["order_id"] == "o_bad_sku"
+    assert sample["reason"] == "bad_sku_id"
+    assert "sku_id" in sample["error"]
+
+
+# ======================================================================================
+# P3：可观测性（样本截断 + staged 降级不被合并）
+# ======================================================================================
+
+
+async def test_row_rejection_samples_are_bounded_and_the_audit_says_so(
+    runtime: Any, sink: JsonlLogSink, fake_client: FakeDoudianClient
+) -> None:
+    """7 条坏行 → `count=7` 但 `samples` 只有前 5 条，且审计显式给出 `sample_limit` /
+    `samples_truncated`，文案写"仅前 5 条样本"。
+
+    旧实现只给 `count` + `items[:5]`，文案说"样本见 data.samples"——读者很容易把
+    "贴了 5 条"读成"一共 5 条"。
+    """
+    fake_client.orders = [
+        {"order_id": f"o_bad_{index}", "sku_id": "sku_a", "pay_amount": "199.00",
+         "create_time": f"{TODAY} 09:00:00"}
+        for index in range(7)
+    ] + [_good_row()]
+
+    update = await collect.__wrapped__(_state(), _config(runtime))  # type: ignore[attr-defined]
+
+    data = _rejected(update)[0]["data"]
+    assert data["count"] == 7
+    assert data["sample_limit"] == 5
+    assert data["samples_truncated"] is True
+    assert len(data["samples"]) == 5
+    assert [sample["order_id"] for sample in data["samples"]] == [
+        f"o_bad_{index}" for index in range(5)
+    ]
+
+    rows = sink.read(run_id=RUN_ID, event_prefix="collect.row_rejected")
+    assert len(rows) == 1
+    assert "仅前 5 条样本" in rows[0]["message"]
+    assert "其余已截断" in rows[0]["message"]
+
+
+async def test_staged_degradation_is_discarded_when_the_row_is_later_rejected(
+    runtime: Any, sink: JsonlLogSink, fake_client: FakeDoudianClient
+) -> None:
+    """行内先出现"件数缺失"、随后 `refund_amount` 坏 → 整行拒绝，**件数降级不许被合并**。
+
+    旧实现把降级现场先并进 `units_degraded`、再校验：一个后面又被拒的行会在审计里留下
+    "缺失件数"的痕迹，可它根本没进任何指标——审计会自己骗自己。本用例钉住"接受后才合并"。
+    """
+    fake_client.orders = [
+        {
+            "order_id": "o_degraded_then_rejected",
+            "sku_id": "sku_a",
+            "pay_amount": 199_000,
+            # 没有 product_count：解析到这里会往 staged_degraded 写一条 missing
+            "refund_amount": "1.00",  # 随后金额解析失败 → 整行拒绝
+            "create_time": f"{TODAY} 09:00:00",
+        },
+        _good_row(pay_amount=19_900),
+    ]
+
+    update = await collect.__wrapped__(_state(), _config(runtime))  # type: ignore[attr-defined]
+
+    assert update.get("status") != RunStatus.FAILED.value
+    # 被拒行不许留下"件数降级"的痕迹：没有 units_degraded 审计
+    assert [entry for entry in update["audit"] if entry["event"] == "collect.units_degraded"] == []
+    assert sink.read(run_id=RUN_ID, event_prefix="collect.units_degraded") == []
+
+    data = _rejected(update)[0]["data"]
+    assert data["reasons"] == {"bad_refund_amount": 1}
+    assert data["samples"][0]["order_id"] == "o_degraded_then_rejected"
+    # 好行本身没有降级：只有一条 warn，且它不是件数降级
+    assert update["raw"]["order_summary"]["by_sku"] == {
+        "sku_a": {"gmv_cents": 19_900, "units": 1}
+    }
+
+
+@pytest.mark.parametrize("bad_units", [0, -1])
+async def test_accepted_rows_with_units_degradation_mark_the_source_partial(
+    runtime: Any,
+    sink: JsonlLogSink,
+    fake_client: FakeDoudianClient,
+    bad_units: int,
+) -> None:
+    """被**接受**的行发生件数降级（0/负数 → 按 1 件）时，`source.partial` 也要是 True。
+
+    `partial` 的含义是"这份采集不完整/有降级"，不是"有行被拒"。降级发生在被接受的行上，
+    但 raw 快照同样不该声称这是一份干净数据。
+    """
+    fake_client.orders = [
+        {
+            "order_id": "o_unit_degraded",
+            "sku_id": "sku_a",
+            "pay_amount": 199_000,
+            "product_count": bad_units,
+            "create_time": f"{TODAY} 09:00:00",
+        }
+    ]
+
+    update = await collect.__wrapped__(_state(), _config(runtime))  # type: ignore[attr-defined]
+
+    assert update.get("status") != RunStatus.FAILED.value
+    assert update["raw"]["source"]["partial"] is True
+    degraded = [entry for entry in update["audit"] if entry["event"] == "collect.units_degraded"]
+    assert len(degraded) == 1
+    assert degraded[0]["data"]["count"] == 1
+    done = _done(update)
+    assert done["rows_seen"] == done["rows_accepted"] == 1
+    assert done["partial"] is True
