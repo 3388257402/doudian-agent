@@ -1,19 +1,24 @@
-# 抖店智能运营 Agent —— 后端依赖（Python 3.12.8）
-# 解释器固定：G:\SN\doudian-agent\.venv\Scripts\python.exe
-# 安装：  .venv\Scripts\python.exe -m pip install -r backend\requirements.txt
-# 版本依据 docs/ENV.md §2 的实测索引结果；任何一行改动都要重跑 backend 全量测试。
+# Backend dependencies for the doudian-agent project (Python 3.12.x).
 #
-# 刻意不引入（理由见 docs/DECISIONS.md 附 A，不是遗漏）：
-#   tenacity            —— 重试语义由 DoudianClient 自实现（要按 mutating/分类/Retry-After 定制）
-#   APScheduler/Celery  —— 效果调度是「表 + 60s 轮询」，调度状态在库里可审计
-#   python-json-logger  —— JSON 日志用标准库 formatter（30 行）
-#   alembic             —— dev 用 create_all；生产建表由 init SQL/alembic 单独引入，不进 dev 依赖
+# ASCII-only on purpose: `pip install -r requirements.txt` reads this file with the
+# *system locale* encoding, and on a Chinese Windows (GBK) any non-ASCII byte here
+# makes pip crash with "UnicodeDecodeError: 'gbk' codec can't decode byte ...".
+# A requirements file that only installs on the author's machine is a bug, not a
+# dependency list. Keep every line ASCII, comments included.
 #
-# 与共享 venv 的关系（t3 独占安装，见 backend/.deps-ready）：
-#   venv 里额外存在 apscheduler==3.11.0（按 captain 安装清单预置）与 tenacity==9.2.1
-#   （langchain-core 的传递依赖）。**本仓库代码不 import 它们**，所以本文件不 pin：
-#   部署清单只包含真正被 import 的包，避免"镜像里装了没人用 / 代码用了镜像里没有"两头踩。
-#   若将来确有代码 import，必须同时在这里补 pin（否则 Docker 构建会缺包）。
+# Install:
+#   python -m venv .venv
+#   .venv\Scripts\python.exe -m pip install -r backend\requirements.txt     # Windows
+#   .venv/bin/python -m pip install -r backend/requirements.txt             # macOS / Linux
+#
+# Deliberately NOT added (see docs/DECISIONS.md appendix A -- omission is a decision):
+#   tenacity             retry semantics are implemented by DoudianClient itself
+#                        (it must branch on mutating / error category / Retry-After)
+#   APScheduler, Celery  effect scheduling is "table + 60s poll", so the schedule
+#                        state stays auditable in the database
+#   python-json-logger   JSON logging is a 30-line stdlib formatter
+#   alembic              dev creates tables via create_all; production schema
+#                        migration is a separate deploy step, not a dev dependency
 
 # --- Web / API ---
 fastapi==0.161.1
@@ -21,23 +26,23 @@ uvicorn[standard]==0.54.0
 pydantic==2.14.1
 pydantic-settings==2.16.1
 
-# --- HTTP 客户端（抖店开放平台）---
+# --- HTTP client (Doudian open platform) ---
 httpx==0.28.1
 
-# --- 持久化（dev: sqlite / prod: postgres，仅换 DATABASE_URL）---
+# --- Persistence (dev: sqlite / prod: postgres, only DATABASE_URL changes) ---
 sqlalchemy[asyncio]==2.1.6
 aiosqlite==0.22.1
 psycopg[binary,pool]==3.3.6
 
-# --- 配置 ---
+# --- Config ---
 PyYAML==6.0.3
 
-# --- Agent 状态机 ---
-langgraph==1.2.16                      # 传递依赖 langgraph-checkpoint==4.3.0，不单独 pin
-langgraph-checkpoint-sqlite==3.1.2     # dev 检查点（AsyncSqliteSaver）
-langgraph-checkpoint-postgres==3.2.0   # prod 检查点（AsyncPostgresSaver）
+# --- Agent state machine ---
+langgraph==1.2.16                      # pulls langgraph-checkpoint==4.3.0, not pinned separately
+langgraph-checkpoint-sqlite==3.1.2     # dev checkpointer (AsyncSqliteSaver)
+langgraph-checkpoint-postgres==3.2.0   # prod checkpointer (AsyncPostgresSaver)
 
-# --- 测试 ---
+# --- Tests ---
 pytest==9.1.1
 pytest-asyncio==1.4.0
 respx==0.23.1
