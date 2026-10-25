@@ -2228,9 +2228,15 @@ doudian:
 agent:
   max_anomalies: 20
   max_actions_per_run: 5
-  approval_timeout_min: 1440    # 调度器把超时未裁决的置 expired
+  approval_timeout_min: 1440    # ⚠ 只是配置位：本仓**没有**任何代码会把 pending 置 expired（见下方说明）
   auto_approve_risk: none       # none | low
   recursion_limit: 50
+
+**`approval_timeout_min` 的真相（v1.5.3 记账，别读成"会自动过期"）**：这个值**只被配置校验读过**，全仓没有任何代码把 `pending` 写成 `expired`。`ApprovalStatus.EXPIRED` 目前只出现在三处：枚举定义、`/api/alerts` 的 `status` 过滤器、以及裁决时"终态一律 409"的判断。也就是说：
+
+- 一条没人裁决的审批**会一直挂在 `pending`**，不会自动失效、也不会自动放行（放行更是危险的：那是"沉默即同意"）。
+- 运营看到的"待办"不会自己消失，这是**当前行为**，不是 bug；要做超时处理，必须先回答"过期后这个动作算放弃还是降级"，那是产品决策 + 契约变更，不是一个定时器。
+- 同理 `run_effect_evaluator_once()` 目前**没有生产调用方**（只有 demo 脚本调），T+1 自动评估是设计目标、未接线（README 已知限制里也写了）。
 notifier:
   mode: dry_run                 # dry_run | feishu
   feishu_webhook_env: FEISHU_WEBHOOK_URL

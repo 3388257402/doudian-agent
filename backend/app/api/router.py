@@ -19,12 +19,23 @@ __all__ = ["build_api_router"]
 
 
 def build_api_router() -> APIRouter:
-    """把 6 个端点收成一个 router（`/api` 前缀由调用方加）。"""
+    """把 6 个端点收成一个 router（`/api` 前缀由调用方加）。
+
+    保证：返回的 router 含 6 个端点（healthz / alerts / approve / run / metrics / logs）；
+        `/api` 前缀**不在**这里加。
+    不保证：不注册错误处理器、不加中间件——那些是 `create_app` 的事。
+    调用方坑：每次调用都新建一个 `APIRouter`（不复用模块级实例），所以同一个进程里
+        建多个 app 不会共享路由表（测试并行时这一点很重要）。
+    """
     router = APIRouter()
+    # 顺序只影响 OpenAPI 文档里的分组顺序，不影响路由匹配（path 是唯一的）。
+    # 每个子 router 自带 tag（health/alerts/approval/agent/metrics/logs），前端按 tag 分组。
     for sub in (
+        # healthz 放第一个：OpenAPI 里它排在最前，运维/前端找起来最方便。
         health_router,
         alerts_router,
         approve_router,
+        # run 与 approve 分属两个 tag，但都在这一个 router 上（前缀统一）。
         run_router,
         metrics_router,
         logs_router,

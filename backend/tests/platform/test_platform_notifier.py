@@ -227,11 +227,19 @@ def test_build_notifier_selects_by_mode(tmp_path: Path) -> None:
     assert dry.mode == "dry_run"
 
 
-def test_build_notifier_feishu_without_webhook_is_startup_error(monkeypatch) -> None:
-    """静默降级成 dry_run 会让"以为有告警、其实没有"活到生产。"""
+def test_build_notifier_feishu_without_webhook_is_startup_error(
+    monkeypatch, tmp_path: Path
+) -> None:
+    """静默降级成 dry_run 会让"以为有告警、其实没有"活到生产。
+
+    为什么用 `tmp_path` 而不是仓库内固定文件名：Windows 上 `close()` 之后文件句柄
+    未必立刻释放，紧接着 `unlink()` 会偶发 `[WinError 32] 另一个程序正在使用此文件`——
+    单独跑绿、全量跑红，这类"顺序相关的假红"最消耗人。`tmp_path` 每个用例一个目录，
+    既不共享路径也不需要手动清理（评审实测：全量跑时这条曾单个失败）。
+    """
     monkeypatch.delenv("FEISHU_WEBHOOK_URL", raising=False)
     settings = build_settings({"notifier": {"mode": "feishu"}})
-    sink = JsonlLogSink(Path(__file__).parent / "_tmp_feishu.jsonl")
+    sink = JsonlLogSink(tmp_path / "feishu.jsonl")
     try:
         with pytest.raises(ConfigError) as excinfo:
             build_notifier(
@@ -242,13 +250,12 @@ def test_build_notifier_feishu_without_webhook_is_startup_error(monkeypatch) -> 
         assert "FEISHU_WEBHOOK_URL" in str(excinfo.value)
     finally:
         sink.close()
-        (Path(__file__).parent / "_tmp_feishu.jsonl").unlink(missing_ok=True)
 
 
-def test_build_notifier_feishu_with_webhook_env(monkeypatch) -> None:
+def test_build_notifier_feishu_with_webhook_env(monkeypatch, tmp_path: Path) -> None:
     monkeypatch.setenv("FEISHU_WEBHOOK_URL", "https://open.feishu.test/hook/abc")
     settings = build_settings({"notifier": {"mode": "feishu"}})
-    sink = JsonlLogSink(Path(__file__).parent / "_tmp_feishu2.jsonl")
+    sink = JsonlLogSink(tmp_path / "feishu2.jsonl")
     try:
         notifier = build_notifier(
             settings,
@@ -259,7 +266,6 @@ def test_build_notifier_feishu_with_webhook_env(monkeypatch) -> None:
         assert notifier.mode == "feishu"
     finally:
         sink.close()
-        (Path(__file__).parent / "_tmp_feishu2.jsonl").unlink(missing_ok=True)
 
 
 # --------------------------------------------------------------------------------------

@@ -67,6 +67,8 @@ class _Lifecycle:
 
     def __init__(self, settings: Settings) -> None:
         self.settings = settings
+        # 四个"我创建的"资源槽：None 当哨兵，`shutdown()` 靠它实现幂等
+        # （关过一次就置 None，重复关不会重复释放/重复报错）。
         self.sink: JsonlLogSink | None = None
         self.saver_cm: Any = None
         self.runtime: adapters.AgentRuntime | None = None
@@ -87,6 +89,7 @@ class _Lifecycle:
             失败路径由 `lifespan_for` 调 `shutdown()` 收尾，这里不吞异常。
         """
         settings = self.settings
+        # 1) 日志汇最先建：后面任何一步失败都要留痕，否则"起不来"只剩一行 traceback。
         sink = JsonlLogSink(
             settings.observability.log_file,
             redact_keys=settings.observability.redact_keys,
@@ -99,7 +102,13 @@ class _Lifecycle:
         # 在这里抛 ConfigError（→ 进程非 0 退出），而不是等第一次跑 Agent 时才表现成
         # "毛利率算得不对"。文件缺失是正常状态（这家店没配成本）：只记 warn，返回空表，
         # 于是 gross_margin 恒为 None、loss_making 永不触发——宁可漏报，不可误判为亏本。
+        # 成本表（§8.5）必须在**启动期**加载并完成校验：负数/非 int/重复 sku_id 这类错误
+        # 在这里抛 ConfigError（→ 进程非 0 退出），而不是等第一次跑 Agent 时才表现成
+        # "毛利率算得不对"。文件缺失是正常状态（这家店没配成本）：只记 warn，返回空表，
+        # 于是 gross_margin 恒为 None、loss_making 永不触发——宁可漏报，不可误判为亏本。
         cost_table = get_sku_costs()
+        # 这一条日志是"成本表到底加载了没有"的唯一出口：`gross_margin` 恒为 None 时，
+        # 读这条日志才知道是"没配成本"还是"配了但读失败"。
         logger.info(
             "SKU 成本表已加载：%d 个 SKU%s",
             len(cost_table),
@@ -111,19 +120,26 @@ class _Lifecycle:
         )
 
         engine = create_engine_from_settings(settings)
+        # 建表在运行时之前：`run_agent` 一被请求触发就会写 `agent_traces`，
+        # 表必须比"能接请求"更早存在（生产由 alembic 负责，这里仍跑一次幂等的 create_all）。
         init_db(engine)  # 建表 + WAL；engine 由 db 模块持有，关机时 reset_engine() 释放
 
         adapters.set_log_sink(sink)
+        # 2) 运行时：一个进程一个 client（ADR-004）+ 一个规则集 + 一个 notifier。
         runtime = adapters.build_runtime(settings)
         self.runtime = runtime
         adapters.set_runtime(runtime)
 
+        # 3) checkpointer：HITL 的持久化基础（§5.7）。手动 `__aenter__` 是为了把 saver
+        # 的关闭时机交给 `shutdown()`（它要按反序关，不能靠 with 块的缩进表达）。
         self.saver_cm = checkpoint_saver(settings)
         saver = await self.saver_cm.__aenter__()
         set_checkpointer(saver)
 
+        # 4) 对账最后：它读 JSONL 与 `agent_traces`，两者都得先就位。
         await self._reconcile_active_runs(sink)
         self.running = True
+        # 启动完成日志带全四个关键配置：排障时第一件事就是确认"这个进程用的是哪份配置"。
         logger.info(
             "应用启动完成：db=%s checkpoint=%s dry_run=%s log_file=%s",
             settings.database.url,
@@ -146,6 +162,8 @@ class _Lifecycle:
     def _log_startup_warnings(self) -> None:
         """把启动期风险横幅写进**结构化日志**（§8.2：禁止静默）。"""
         for warning in startup_warnings(self.settings):
+            # 逐条打（不是 join 成一行）：每一条都要能被单独 grep 到，
+            # 而 `config.startup_warning` 事件名是运维的过滤条件。
             logger.error(
                 "启动期配置风险：%s",
                 warning,
@@ -167,6 +185,7 @@ class _Lifecycle:
         try:
             rows = await list_active_runs()
         except Exception:  # noqa: BLE001 - 列表都读不到 = 库还没准备好：这是启动失败
+            # 列表读不到 = 库/连接都没通，这是**启动失败**（不是某个 run 的问题）。
             logger.exception("读取非终态 run 失败（启动中止）")
             raise
         for row in rows:
@@ -176,12 +195,15 @@ class _Lifecycle:
                         session=session, run_id=row["run_id"], sink=sink
                     )
             except Exception:  # noqa: BLE001 - 单个 run 的问题不阻断启动
+                # 单个 run 的 checkpoint 坏了不该让整个服务起不来——但必须留痕，
+                # 否则"这个 run 的步数永远不对"会变成一个没人知道的长期偏差。
                 logger.warning(
                     "run %s 的 step_count 对账失败（跳过，不阻断启动）",
                     row["run_id"],
                     extra={"event": "app.reconcile_failed", "run_id": row["run_id"]},
                 )
         if rows:
+            # 有行才打（启动日志已经够长）：0 个非终态 run 是常态，不必占一行。
             logger.info(
                 "启动对账完成：%d 个非终态 run",
                 len(rows),
@@ -202,16 +224,21 @@ class _Lifecycle:
         """
         saver_cm, self.saver_cm = self.saver_cm, None
         if saver_cm is not None:
+            # 先摘登记再关连接：反过来的话，关的过程中还有请求进来会拿到一个死 saver。
             set_checkpointer(None)
             try:
                 await saver_cm.__aexit__(None, None, None)
             except Exception:  # noqa: BLE001 - 关连接失败不该掩盖真正的启动错误
+                # 这里**必须**吞：启动失败时真正的错误是 startup 抛的那个，
+                # 关连接再抛一次会把它盖掉，日志里只剩"关闭失败"。
                 logger.exception("关闭 checkpointer 失败")
 
         runtime, self.runtime = self.runtime, None
         if runtime is not None:
             client = getattr(runtime, "client", None)
             aclose = getattr(client, "aclose", None)
+            # 用 `getattr` 找 `aclose` 而不是直接调：测试注入的假 client 可能没有它，
+            # 那不该让关停失败（关停是"尽力而为"的路径）。
             if callable(aclose):
                 try:
                     await aclose()
@@ -223,6 +250,7 @@ class _Lifecycle:
         adapters.set_log_sink(None)
         if sink is not None:
             sink.close()
+        # 日志汇最后关（在 `_detach_logging` 之前）：前面任何一步的失败都还能被记下来。
         _detach_logging()
         reset_engine()
         self.running = False
@@ -238,6 +266,8 @@ def _detach_logging() -> None:
 
     root = logging.getLogger()
     for handler in list(root.handlers):
+        # 只摘自己装的（`_doudian_agent` 是 `configure_logging` 打的标记）：
+        # 把 uvicorn 自己的 handler 也摘掉，日志会彻底消失。
         if getattr(handler, "_doudian_agent", False):
             root.removeHandler(handler)
             try:
@@ -261,6 +291,7 @@ def lifespan_for(settings: Settings):
 
     @asynccontextmanager
     async def lifespan(_: FastAPI) -> AsyncIterator[None]:
+        # 每个 app 实例一份 `_Lifecycle`：它只持有自己创建的资源，关停时按反序释放。
         lifecycle = _Lifecycle(settings)
         try:
             await lifecycle.startup()
@@ -271,6 +302,7 @@ def lifespan_for(settings: Settings):
         try:
             yield
         finally:
+            # 正常关停也走同一个 `shutdown()`：两条路径共用一份"怎么拆"的知识。
             await lifecycle.shutdown()
 
     return lifespan
@@ -290,19 +322,24 @@ def create_app(settings: Settings | None = None) -> FastAPI:
     手动进入 `app.router.lifespan_context(app)`（见 `tests/api/conftest.py`）。
     """
     resolved = load_settings() if settings is None else settings
+    # 安全闸在**构造时就执行一次**（不等到 lifespan）：测试/CLI/uvicorn 三条入口
+    # 都得到同一个结论，不存在"某条启动路径漏了闸"。
     assert_serving_safe(resolved)
 
     app = FastAPI(
         title=f"{resolved.app.name} API",
         version=API_VERSION,
+        # lifespan 与这份 `resolved` 绑定（工厂函数把 settings 关进去），不用全局 get_settings()。
         lifespan=lifespan_for(resolved),
     )
+    # 挂实例而不是模块级全局：一个进程里可能同时存在多个 app（测试每例一个，--reload 并存）。
     app.state.settings = resolved
     app.state.inflight = InFlightRuns()
 
     app.add_middleware(
         CORSMiddleware,
         allow_origins=list(resolved.app.cors_origins),
+        # 不带凭据：本服务不用 cookie 鉴权，`allow_credentials=True` 与 `*` 组合是常见误配。
         allow_credentials=False,
         allow_methods=["*"],
         allow_headers=["*"],
@@ -312,10 +349,12 @@ def create_app(settings: Settings | None = None) -> FastAPI:
     # 最后 add = 最外层：错误响应（含 CORS 短路、未捕获异常）也必须带 X-Trace-Id
     app.add_middleware(TraceIdMiddleware)
 
+    # 错误包络是 HTTP 语义，只在入口层注册（§7.1）；路由前缀只在这里拼一次。
     register_error_handlers(app)
     app.include_router(build_api_router(), prefix=resolved.app.api_prefix)
     return app
 
 
 #: `uvicorn app.main:app --app-dir backend` 的入口。导入期即完成配置加载与安全闸。
+#: 放在模块级是 uvicorn 的要求；代价是"配置错误在 import 时就炸"（这正是 §8.1 要的）。
 app = create_app()

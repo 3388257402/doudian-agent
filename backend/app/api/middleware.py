@@ -31,10 +31,19 @@ _TRACE_ID_RE = re.compile(r"^[A-Za-z0-9_.-]{1,64}$")
 
 
 def _incoming_trace_id(scope: Scope) -> str | None:
+    """读请求头里的 trace id；格式不符或没有 → `None`（由调用方生成新的）。
+
+    保证：返回值若不为 `None`，一定匹配 `^[A-Za-z0-9_.-]{1,64}$`。
+    不保证：不保证它是"我们发出去的"那个——外部可以是任意网关，沿用是**信任**上游的选择
+        （跨服务对账需要它）。
+    调用方坑：不合规的值被**丢弃**而不是报错：头注入/超长内容不该让请求失败，
+        但更不能被写进日志（那是日志伪造）。
+    """
     raw = Headers(scope=scope).get(TRACE_HEADER)
     if raw is None:
         return None
     candidate = raw.strip()
+    # 只做"形状"过滤：不做大小写/前缀校验（trace id 的语义由上游定）。
     return candidate if _TRACE_ID_RE.match(candidate) else None
 
 
@@ -56,26 +65,34 @@ class TraceIdMiddleware:
     """
 
     def __init__(self, app: ASGIApp) -> None:
+        # 纯 ASGI 中间件只包一层 `app`：不构造请求对象、不解析 body（那才是
+        # `BaseHTTPMiddleware` 的代价）。
         self.app = app
 
     async def __call__(self, scope: Scope, receive: Receive, send: Send) -> None:
         if scope["type"] != "http":  # pragma: no cover - 本应用没有 websocket/lifespan 走这里
+            # 非 HTTP 流量原样放行：给 websocket/lifespan 加 trace 头没有意义。
             await self.app(scope, receive, send)
             return
 
         trace_id = _incoming_trace_id(scope) or new_trace_id()
         # 路由与异常处理器都通过 `get_trace_id()` 读它（同一 context 内传播）
+        # `setdefault` 兼容 Starlette 不同版本对 `scope["state"]` 的初始化行为。
         scope.setdefault("state", {})
         scope["state"]["trace_id"] = trace_id
         token = set_trace_id(trace_id)
 
         async def send_with_trace(message: Message) -> None:
+            # 只改 `http.response.start`（响应头只能在那一条消息里设置）。
             if message["type"] == "http.response.start":
                 MutableHeaders(scope=message)[TRACE_HEADER] = trace_id
+            # 其它消息（`http.response.body`）原样透传：中间件不碰响应体。
             await send(message)
 
         try:
             await self.app(scope, receive, send_with_trace)
         finally:
             # 必须还原：uvicorn 的 worker 复用 context，泄漏会让下一个请求继承上一个的 id。
+            # `reset_trace_id(token)` 用的是"自己设的那个 token"，所以下游自己设过的值
+            # 不会被这里误清（它只还原到本中间件进入之前的状态）。
             reset_trace_id(token)

@@ -30,9 +30,11 @@ router = APIRouter(tags=["logs"])
 )
 async def list_logs(
     run_id: str | None = Query(default=None),
+    # `level` 用 Literal：枚举外的值由 FastAPI 直接 400，不会走到 sink 查询。
     level: LogLevel | None = Query(default=None),
     event: str | None = Query(default=None, description="事件名前缀，如 action."),
     limit: int = Query(default=100, ge=1, le=500),
+    # 严格小于：传上一页 `next_cursor` 的 int 值即可，不会把上一页最后一条再取一次。
     before_seq: int | None = Query(default=None, ge=1, description="取 seq < before_seq"),
 ) -> LogList:
     """查询执行日志（JSONL 日志汇，`seq DESC`）。
@@ -42,6 +44,9 @@ async def list_logs(
         - `event` 是**前缀**匹配（`action.` 命中 `action.executed`），不是模糊/正则/大小写不敏感匹配；
         - `limit` 1..500（默认 100）；`before_seq` 取**严格小于**它的行（把上一页 `next_cursor` 转 int 传来）；
         - 排序固定 `seq DESC`（最新在前），不支持升序：要时间序列请在前端反转。
+
+    保证：返回的每一行都过了 `LogItem` 校验（§7.6 的 9 个字段齐全）。
+    不保证：不保证 `level=info` 就等于"没出事"——挂起也是 info（ADR-016），判据是 `data.outcome`。
 
     错误：只有 `400 VALIDATION_ERROR`（`limit` 越界/`level` 枚举外/`before_seq <= 0`）。
           查不到数据不是错误：`200 + items=[] + next_cursor=null`。
@@ -63,9 +68,11 @@ async def list_logs(
     sink = get_log_sink()
     if sink is None:
         # 装配漏了就要炸：返回空列表会把"装配错误"伪装成"没发生过事"。
+        # 500 在这里是**对的**：lifespan 没跑，是本服务的 bug，不是查询的问题。
         raise RuntimeError("日志汇未装配：lifespan 未执行（§7.6 / ADR-015）")
 
     # 全量扫描读文件是阻塞 IO：丢到线程池，别在事件循环里读盘（与 `arun_db` 同一理由）。
+    # 多取一条（`limit + 1`）判断"还有没有下一页"，与 `/api/alerts` 同一套分页手法。
     rows = await asyncio.to_thread(
         sink.read,
         run_id=run_id,
@@ -76,8 +83,11 @@ async def list_logs(
     )
     page = rows[:limit]
     has_more = len(rows) > limit
+    # 逐行过 `LogItem`：写入端已经保证形状，这里再校验一次是**读出口**的契约保证
+    # （老日志文件里可能有历史版本的字段，缺了会让 pydantic 报错而不是静默丢行）。
     items = [LogItem.model_validate(row) for row in page]
     return LogList(
         items=items,
+        # 游标是最后一条的 `seq`；`has_more and page` 两个条件都要（空页时 `page[-1]` 会 IndexError）。
         next_cursor=str(page[-1]["seq"]) if has_more and page else None,
     )

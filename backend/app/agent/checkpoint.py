@@ -6,6 +6,13 @@ HITL 的全部价值在于"人可以在几小时甚至几天后做决定"。把 
 
 所以 `app/` 下**禁止**出现 `MemorySaver` / `InMemorySaver`（只在 `tests/` 允许，用来跑纯图
 逻辑）。dev 用 SQLite 文件、prod 用 Postgres，切换只体现在 `settings.checkpoint.type`。
+
+## 为什么 serde 的 allowlist 必须**显式**登记类型
+
+LangGraph 用 `msgpack` 序列化 checkpoint，反序列化时对"未登记的类型"目前只打 warning，
+下个版本会直接拒绝。我们的 state 里合法地存着 `Verdict`/`Attribution` 这类枚举，不登记
+不是"现在没事"，而是"升级 LangGraph 那天 HITL 恢复全线炸"——而且炸在最不该炸的地方
+（人已经批了，图恢复不起来）。登记清单按模块里的 `Enum` 动态生成，新增枚举自动覆盖。
 """
 
 from __future__ import annotations
@@ -48,6 +55,8 @@ def _build_serde() -> JsonPlusSerializer:
     allowed = tuple(
         value
         for value in vars(enums_module).values()
+        # 三个条件缺一不可：是类、是 Enum 子类、**定义在本模块**。第三条排掉
+        # `from enum import StrEnum` 这类"导入进来的类"（它会被误收进白名单）。
         if isinstance(value, type)
         and issubclass(value, Enum)
         and value.__module__ == "app.enums"
@@ -70,6 +79,7 @@ async def checkpoint_saver(settings: Settings | None = None) -> AsyncIterator[Ba
         from langgraph.checkpoint.sqlite.aio import AsyncSqliteSaver
 
         path = Path(checkpoint.path)
+        # 目录必须自己建：SQLite 不会为父目录 `mkdir`，缺目录时首个请求才会炸。
         path.parent.mkdir(parents=True, exist_ok=True)
         # 用 `aiosqlite.connect` + 显式 `serde`，而不是 `from_conn_string(...)`：
         # 后者只能传 conn_string，构造 `AsyncSqliteSaver(conn)` 时用的是默认 serde，
@@ -78,13 +88,18 @@ async def checkpoint_saver(settings: Settings | None = None) -> AsyncIterator[Ba
         # 我们的 checkpoint 里合法地存着 `Verdict` / `Attribution` 等枚举（state 结构的一部分），
         # 所以要把它们显式登记进 allowlist——不登记不是"现在没事"，是"下个版本直接坏"。
         async with aiosqlite.connect(str(path)) as conn:
+            # 自己造 saver 而不是 `from_conn_string(...)`：后者不传 serde，反序列化会为
+            # 每个 `app.enums.*` 打一条"will be blocked in a future version"警告。
             saver = AsyncSqliteSaver(conn, serde=_build_serde())
+            # `setup()` 建表（`CREATE TABLE IF NOT EXISTS`），幂等，重复调用安全。
             await saver.setup()
             yield saver
         return
     if checkpoint.type == "postgres":
         if not checkpoint.url:
             # §8.2：type=postgres 时 url 必填，缺失是启动期配置错误（不是运行期 500）。
+            # 这条必须在这里再拦一次：`build_settings` 只校验"形如 postgresql://"，
+            # 而"空串"在别的路径上（测试直接构造 Settings）也可能被塞进来。
             raise ConfigError("checkpoint.type=postgres 但 checkpoint.url 为空")
         from langgraph.checkpoint.postgres.aio import AsyncPostgresSaver
 
@@ -100,13 +115,24 @@ async def checkpoint_saver(settings: Settings | None = None) -> AsyncIterator[Ba
 
 
 def set_checkpointer(saver: BaseCheckpointSaver[str] | None) -> None:
-    """登记进程级 saver（`app.main` lifespan 里用它复用同一个连接池）。"""
+    """登记进程级 saver（`app.main` lifespan 里用它复用同一个连接池）。
+
+    保证：登记后 `get_checkpointer()` 立刻返回它（同一进程内可见）。
+    不保证：不做线程/协程隔离——这是**进程级单例**，测试并行跑时要在夹具里还原。
+    调用方坑：传 `None` 是"注销"（关停路径用），不是"什么都不做"。
+    """
     global _active_saver
     _active_saver = saver
 
 
 def get_checkpointer() -> BaseCheckpointSaver[str] | None:
-    """返回 lifespan 登记的 saver；未登记返回 `None`（调用方退化为"每次调用开一个"）。"""
+    """返回 lifespan 登记的 saver；未登记返回 `None`（调用方退化为"每次调用开一个"）。
+
+    保证：只读；不会顺手建一个（`/api/healthz` 用它判断"lifespan 到底装配了没有"）。
+    不保证：不保证那个 saver 还活着（连接可能已关）。
+    调用方坑：`None` 在 `/healthz` 里是 degraded 的依据；在入口路径里则意味着
+        "退回临时打开"——审批窗口仍然是持久的，只是每次多开一个连接。
+    """
     return _active_saver
 
 
@@ -116,12 +142,20 @@ async def resolve_checkpointer(
     *,
     settings: Settings | None = None,
 ) -> AsyncIterator[BaseCheckpointSaver[str] | None]:
-    """入口统一取 saver：显式传入 > lifespan 登记 > 临时打开一个（仍落盘，仍是持久的）。"""
+    """入口统一取 saver：显式传入 > lifespan 登记 > 临时打开一个（仍落盘，仍是持久的）。
+
+    保证：**永远**给出一个可用的 saver（三种来源都会 `setup()` 过）；绝不会退回内存实现。
+    不保证：不保证三次调用拿到同一个 —— 没有登记时每次都会新开一个连接（用完即关）。
+    调用方坑：显式传入的 saver **不会被关闭**（所有权在调用方）；只有本函数自己打开的
+        才在退出时关。传 `None` 是"用默认的"，不是"不要 checkpointer"。
+    """
     if checkpointer is not None:
+        # 所有权在调用方：只 yield，不 __aexit__（否则调用方下次用同一 saver 会崩）。
         yield checkpointer
         return
     active = get_checkpointer()
     if active is not None:
+        # lifespan 登记的那个：进程生命周期内一直活着，这里同样不负责关。
         yield active
         return
     async with checkpoint_saver(settings) as saver:
@@ -129,10 +163,16 @@ async def resolve_checkpointer(
 
 
 def checkpoint_info(settings: Settings | None = None) -> dict[str, Any]:
-    """给 `/api/healthz` 用的一行状态（不连库，只报配置意图）。"""
+    """给 `/api/healthz` 用的一行状态（不连库，只报配置意图）。
+
+    保证：只读配置与进程级标志，**不出网、不连库**（探活本身不该拖慢或打挂依赖）。
+    不保证：不保证 saver 真能用——`shared=True` 只说明"lifespan 登记过"。
+    调用方坑：`path` 只在 sqlite 下有值（Postgres 的 url 里可能带密码，不回显）。
+    """
     resolved = settings or get_settings()
     return {
         "type": resolved.checkpoint.type,
+        # 只回 path 不回 url：url 可能带口令，健康检查不是泄密入口。
         "path": resolved.checkpoint.path if resolved.checkpoint.type == "sqlite" else None,
         "shared": _active_saver is not None,
     }

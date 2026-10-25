@@ -30,8 +30,11 @@ def iso_z(value: str) -> str:
     坏数据必须暴露，不能悄悄替换成"现在"。
     """
     if not value:
+        # 空串 → 空串（而不是抛）：有些字段允许空（`interrupt_id`），
+        # 空值不是"坏时间"，是"还没有值"。
         return ""
     parsed = parse_utc_iso(value)
+    # 固定毫秒三位 + `Z`：§0 的对外形状。`// 1000` 是截断微秒到毫秒（不是四舍五入）。
     return parsed.strftime("%Y-%m-%dT%H:%M:%S.") + f"{parsed.microsecond // 1000:03d}Z"
 
 
@@ -63,6 +66,12 @@ def alert_item(pending: PendingApproval) -> AlertItem:
 
 
 def alert_items(pending: Sequence[PendingApproval]) -> list[AlertItem]:
+    """`alert_item` 的批量版本（顺序保持，逐个校验）。
+
+    保证：返回条数与入参相同；任何一条校验失败都会抛（不会静默跳过那一条）。
+    不保证：不排序——顺序是仓储/图给出的顺序，入口层不重新排序。
+    调用方坑：空序列返回 `[]`（不是 None）：§7 的 `pending_approvals` 必须是数组。
+    """
     return [alert_item(item) for item in pending]
 
 
@@ -72,5 +81,8 @@ def effect_report(report: Mapping[str, Any] | None) -> EffectReport | None:
     `None` 原样返回 `None`：没有执行过动作就没有效果报告，不能编一个空报告出来。
     """
     if not report:
+        # `None` 与 `{}` 都折成 None：空 dict 不是"一份报告"，它是"没有报告"的另一种写法。
         return None
+    # `model_validate` 做形状校验：域外值（未知 attribution / 未知 status）会抛 → 500，
+    # 宁可炸也不要把未知枚举透给前端。
     return EffectReport.model_validate(dict(report))
