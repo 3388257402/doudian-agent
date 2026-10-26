@@ -4,8 +4,8 @@
 
 **是**：节点需要的进程级依赖从哪来。契约 §4.3 把节点签名冻结成 `(state, config)` —— 节点
 不能多收一个 `client` 或 `session`。于是"节点怎么拿到 `DoudianClient` / `Notifier` / `Rules`
-/ `now`"必须有一个统一答案：`config["configurable"]` 显式注入优先，其次进程级单例。
-散在 8 个节点里各自 `create_doudian_client()` 会出现 8 份连接池（ADR-004 禁止：限流桶与
+/ `now` / `LLM 客户端`"必须有一个统一答案：`config["configurable"]` 显式注入优先，其次进程级
+单例。散在 9 个节点里各自 `create_doudian_client()` 会出现 9 份连接池（ADR-004 禁止：限流桶与
 并发信号量必须挂在同一个 `httpx.AsyncClient` 上）。
 
 **不是**：任何表的仓储。**本文件禁止出现 `insert_*` / `update_*` / `select(...)` 之类的
@@ -37,6 +37,7 @@ __all__ = [
     "AgentRuntime",
     "build_runtime",
     "digest_of",
+    "get_llm_client",
     "get_log_sink",
     "get_runtime",
     "refresh_log_sink",
@@ -45,6 +46,7 @@ __all__ = [
     "resolve_client",
     "resolve_now",
     "resolve_runtime",
+    "set_llm_client",
     "set_log_sink",
     "set_runtime",
 ]
@@ -129,6 +131,43 @@ def require_log_sink() -> JsonlLogSink:
     if sink is not None:
         return sink
     return refresh_log_sink()
+
+
+# --------------------------------------------------------------------------------------
+# LLM 旁路客户端（`explain` 节点用；与 `*_sink` 同一风格：装配层注入，节点只读）
+# --------------------------------------------------------------------------------------
+
+#: 进程级 LLM 客户端。`None` 是**有意义的值**（= 没配 key，`explain` 据此跳过），
+#: 不是"还没装配"——所以这里没有 `require_llm_client()` 那种"没有就建一个"的兜底：
+#: 兜底会凭空造出一个没有 key 的客户端，于是"没配"变成"配了但一直降级"。
+_llm_client: Any = None
+# 取/换引用的窗口同理有撕裂风险：关停时 lifespan 会把它设成 `None`，而某个 run 可能正在取它。
+# 加锁只保护这一瞬的配对（网络调用本身不持锁）。
+_llm_lock = threading.Lock()
+
+
+def set_llm_client(client: Any) -> None:
+    """装配进程级 LLM 客户端（`app.main` lifespan 装配；`None` = 这条旁路不在场）。
+
+    保证：加锁写入，`get_llm_client()` 之后一定看到同一份引用。
+    不保证：不保证旧客户端被关闭——所有权在调用方（lifespan 的 `shutdown` 负责 `aclose()`）。
+    调用方坑：`None` 是**合法且常见**的装配结果（没配 `LLM_API_KEY`），不是错误；
+        测试注入假客户端后记得在退出夹具时设回 `None`，否则会泄漏到下一个用例。
+    """
+    global _llm_client
+    with _llm_lock:
+        _llm_client = client
+
+
+def get_llm_client() -> Any:
+    """当前已装配的 LLM 客户端；未装配/没配 key → `None`（只读、无副作用）。
+
+    保证：返回 `None` 或一个实现了 `services.llm.LlmClient` 协议的对象。
+    不保证：不保证非 `None` 的客户端真能连通（旁路失败一律降级，见 `services.llm`）。
+    调用方坑：`None` 必须被节点当成"跳过"（并写一条 `llm.skipped`），**不要**在这里新建一个
+        客户端：那样"没配"与"配了但坏"在审计里会长得一模一样。
+    """
+    return _llm_client
 
 
 # --------------------------------------------------------------------------------------

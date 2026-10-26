@@ -98,8 +98,8 @@ async def test_restart_reconciles_step_count_of_non_terminal_run(
             trace = await get_run_trace(shop_id=SHOP_ID, run_id=run["run_id"])
             assert trace is not None
             real_steps = trace["step_count"]
-            # collect / compute_metrics / detect_anomalies / propose_actions / approval_gate
-            assert real_steps == 5
+            # collect / compute_metrics / detect_anomalies / explain / propose_actions / approval_gate
+            assert real_steps == 6
             assert trace["status"] == "awaiting_approval"
 
             # 人为把库里的步数改小（= 进程在"写日志"与"写库"之间被杀留下的偏差）

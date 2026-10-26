@@ -195,7 +195,7 @@ async def test_approve_resumes_same_thread_and_writes_action_log(api: ApiHarness
 
     # run 摘要行是 done（终态）
     trace = await get_run_trace(shop_id=SHOP_ID, run_id=run["run_id"])
-    assert trace is not None and trace["status"] == "done" and trace["step_count"] == 9
+    assert trace is not None and trace["status"] == "done" and trace["step_count"] == 10
 
     # 已终态的同一 run 再 POST：200（回放，不是 202）——§7.2 末段
     replay = await api.http.post(
@@ -265,8 +265,9 @@ async def test_logs_show_interrupted_node_trace_and_desc_paging(api: ApiHarness)
     assert response.status_code == 200
     assert response.headers.get("x-trace-id")
     items = response.json()["items"]
-    # 8 个节点 + approval_gate 重放一次 = 9 条（§4.7 不变量）
-    assert len(items) == 9
+    # 9 个节点 + approval_gate 重放一次 = 10 条（§4.7 不变量；v1.6.0 节点数 8 → 9，
+    # 多出来的是旁路节点 `explain`，它同样走 traced，因此**必然**多一条 trace）。
+    assert len(items) == 10
     seqs = [item["seq"] for item in items]
     assert seqs == sorted(seqs, reverse=True)
     assert all(item["event"] == "node.trace" for item in items)
@@ -299,7 +300,10 @@ async def test_logs_show_interrupted_node_trace_and_desc_paging(api: ApiHarness)
     )
     second_page = page2.json()
     assert second_page["next_cursor"] is None
-    assert len(second_page["items"]) == 6
+    # 不写死数字：第二页的条数由"总数 − 第一页取走的条数"决定。写死 7 的话，
+    # 将来节点数再变（或多/少一条 trace）时，这条断言会跟着漂移而失去回归意义——
+    # 而"分页是否丢行"正是它真正要守的东西。
+    assert len(second_page["items"]) == len(items) - len(first_page["items"])
     assert all(item["seq"] < int(first_page["next_cursor"]) for item in second_page["items"])
 
     # level 过滤：本 run 有**一条** critical 异常（`refund_spike`），它必须落成 `level=error`。

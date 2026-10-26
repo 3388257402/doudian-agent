@@ -26,6 +26,11 @@ reducer 规则（§3.1，硬性，违反即 bug）：
   最终参数**（人可能改价），幂等键必须在审批之后由"最终参数"算出（§4.5）。审批前它就
   该"缺省/None"，强制必需会逼出一串假键（例如用旧参数算出来的那份），而假键会让两次
   不同的改动共享同一个 `action_log` 行 —— 那正是幂等要防的事。
+- v1.6.0 又加了**两个** `NotRequired`：`AgentState.explanations` / `AgentState.suggestions`。
+  它们同属一族：那是**旁路**节点 `explain`（LLM 解释）的输出，缺了不影响任何决策，
+  而且老 checkpoint（升级前跑的 run）里确实没有这两个键——标成必需会让"读一个旧 run"
+  从 `.get(...) or {}` 变成 `KeyError`。判据是"这个字段是不是某条主链路的输入"，
+  不是"它重不重要"：`explanations` 再重要也不进 `propose_actions`。
 - 子结构（`Decision` / `ApprovalState` / `ExecutionResult` …）同样是全必需：它们的构造点
   都在本仓内部，缺字段属于 bug，不该用可选字段把它藏起来。
 """
@@ -290,15 +295,19 @@ class AuditEntry(TypedDict):
 
 
 class AgentState(TypedDict):
-    """整个 run 的状态（§3.2）：LangGraph 的唯一数据载体，19 个字段全部**必需**。
+    """整个 run 的状态（§3.2）：LangGraph 的唯一数据载体，21 个字段（19 必需 + 2 旁路可选）。
 
-    ## 为什么全必需（`total=True`）
+    ## 为什么（几乎）全必需（`total=True`）
 
     节点第一句就直取 `state["run_id"]` / `state["shop_id"]`；把键标成可选会让"漏建 state"
     从 KeyError（立即、指到出错的节点）变成 `None` 顺着往下传（几十行后炸在一个无关的地方）。
-    `graph._initial_state` 因此必须把 19 个字段一次给全 —— 那是本类型的**唯一**首次构造点。
+    `graph._initial_state` 因此必须把 21 个字段一次给全 —— 那是本类型的**唯一**首次构造点。
 
-    保证：`status` 是 `RunStatus` 的**值**（字符串）；三个列表（`errors`/`audit`/`history`）
+    仅有的两个例外是 `explanations` / `suggestions`（旁路输出，见类体注释的 `NotRequired`
+    说明）：缺了不影响任何决策，而老 checkpoint 里确实没有。即便标了 `NotRequired`，
+    `_initial_state` **仍然**把它们写成空 dict —— 读的人因此不必再区分"没有这个键"与"它是空的"。
+
+    保证：`status` 是 `RunStatus` 的**值**（字符串）；`errors`/`audit`/`history` 三个列表
         一定存在且是列表（空列表 ≠ 缺失）。
     不保证：不保证"有时序"——除了 `history`，其余字段都是"当前值"，历史要看 checkpoint。
     调用方坑：**replace 语义**（§3.1）：往 `state["errors"]` 里 append 不会生效，必须返回
@@ -319,6 +328,15 @@ class AgentState(TypedDict):
     # 是唯一"带时序"的字段，其余字段都只表达"当前值"。
     history: list[MetricsSnapshot]
     anomalies: list[Anomaly]
+    # ---- 旁路节点 `explain` 的产物（v1.6.0 新增，见 `nodes.explain_node`）----
+    #: `anomaly_id` → 一句中文解释（"这条异常意味着什么"）。
+    #: **只给人看**：不进 `pending_actions`、不参与审批、不影响执行（动作永远只由规则产出）。
+    #: `NotRequired` 的两个理由：① 老 checkpoint 里没有这两个键，读它的人必须能容忍缺失
+    #: （一律 `state.get(...) or {}`）；② 它们是**旁路的**输出，缺了不代表 state 不合法——
+    #: 而其余字段缺一个都是"漏建 state"的 bug。
+    explanations: NotRequired[dict[str, str]]
+    #: `anomaly_id` → 一句建议草稿（人话，**不是** `ActionProposal`，没有参数、没有风险等级）。
+    suggestions: NotRequired[dict[str, str]]
     # 提议 → 审批 → 执行的三段：`pending_actions` 是提议快照，审批后**不清空**；
     # `approved_actions`（含 edit 后的最终参数）才是 `execute` 的输入；拒绝的只进
     # `rejected_actions`（不产 `action_log`，所以永远没有幂等键）。

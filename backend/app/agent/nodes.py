@@ -1,15 +1,29 @@
-"""8 个图节点（CONTRACT §4.3 逐字签名）+ 节点运行期依赖。
+"""9 个图节点（CONTRACT §4.3 逐字签名）+ 节点运行期依赖。
 
-## 节点怎么拿到 client / session / notifier
+## 节点怎么拿到 client / session / notifier / LLM
 
 契约把节点签名冻结成 `(state, config)` —— 节点不能多收一个 `client` 或 `session` 参数。
 所以依赖走两处，且只有这两处：
 
 1. `config["configurable"]["runtime"] / ["client"] / ["now"]`：测试与上层显式注入；
-2. 进程级单例 `AgentRuntime`（`app.main` lifespan 里 `set_runtime()`）。
+2. 进程级单例 `AgentRuntime` / `adapters.get_llm_client()`（`app.main` lifespan 里装配）。
 
-散在 8 个节点里各自 `create_doudian_client()` 是不行的：ADR-004 要求一个进程一个
+散在 9 个节点里各自 `create_doudian_client()` 是不行的：ADR-004 要求一个进程一个
 `httpx.AsyncClient`，限流桶与并发信号量都挂在那个实例上。
+
+## 唯一的旁路节点：`explain`（v1.6.0）
+
+`explain` 是全图唯一**可以失败而流程照常**的节点：它调 LLM 产出"这个异常意味着什么"
+（`explanations`）与"一句建议草稿"（`suggestions`），两样都只写 state 与审计，
+**不进** `pending_actions`、不进审批、不影响执行。动作永远只由 `propose_actions`（规则）产出。
+
+它的三条硬规则（`services/llm.py` 负责实现，本节点负责编排）：
+
+- 没配 key / 没装配客户端 → 直接返回，写一条 `llm.skipped`（warn），**不报错、不阻塞**；
+- 超时 / HTTP 错 / 非 JSON / schema 不匹配 → 写 `llm.degraded`（warn，带 `reason` 枚举），
+  本轮不产出解释，流程继续；**不重试**（旁路没有资格占用第二次机会）；
+- 输入输出都必须脱敏（`redact_any`，两层）：喂给模型的摘要可能带上游原文，
+  模型的回答也可能把我们发过去的东西回吐出来。
 
 ## 重放与幂等（ADR-010）
 
@@ -59,6 +73,7 @@ from langgraph.errors import GraphBubbleUp
 from sqlalchemy import select
 
 from app.agent.adapters import (
+    get_llm_client,
     require_log_sink,
     resolve_client,
     resolve_now,
@@ -87,6 +102,7 @@ from app.db import arun_db, session_scope
 from app.enums import ActionLogStatus, ActionType, Attribution, ErrorCategory, RunStatus, Verdict
 from app.errors import ApprovalValidationError, ConfigError, ParamValidationError
 from app.models import ActionLog
+from app.observability.logging import redact_any
 from app.services.errors import (
     DoudianAmbiguousOutcomeError,
     DoudianAuthError,
@@ -101,6 +117,7 @@ __all__ = [
     "compute_metrics_node",
     "detect_anomalies_node",
     "execute",
+    "explain_node",
     "finalize",
     "insert_action_log",
     "is_retryable_doudian_error",
@@ -2602,7 +2619,211 @@ async def detect_anomalies_node(state: AgentState, config: RunnableConfig) -> di
 
 
 # ======================================================================================
-# 4) propose_actions
+# 4) explain（旁路：LLM 只产"给人看的文字"，绝不产动作）
+# ======================================================================================
+
+#: 喂给模型的**指标**字段白名单。逐字段列出来，而不是 `dict(metrics)`：
+#: `MetricsSnapshot` 以后加字段（店铺名、成本明细……）时，裸 dict 会让那个新字段**自动**
+#: 进入发往外部模型的请求——一条没人评审过的数据外流通道。白名单让"多喂一个字段"必须改
+#: 这一行，也就必然过一次 review。
+_EXPLAIN_METRIC_KEYS: tuple[str, ...] = (
+    "date",
+    "gmv_cents",
+    "order_count",
+    "paid_order_count",
+    "refund_order_count",
+    "refund_amount_cents",
+    "aov_cents",
+    "refund_rate",
+    "uv",
+    "cvr",
+    "gmv_7d_avg_cents",
+    "gross_margin",
+    "cost_coverage_ratio",
+)
+
+#: 喂给模型的**异常**字段白名单（同上：白名单不是 `dict(anomaly)`）。
+#: `detected_at` 不在里面：它是机器时间戳，对"这条异常意味着什么"没有任何信息量。
+_EXPLAIN_ANOMALY_KEYS: tuple[str, ...] = (
+    "anomaly_id",
+    "rule_id",
+    "metric",
+    "observed",
+    "threshold",
+    "comparator",
+    "severity",
+    "window",
+    "message",
+)
+
+
+def _explain_input(
+    anomalies: Sequence[Mapping[str, Any]], metrics: Mapping[str, Any] | None
+) -> dict[str, Any]:
+    """拼出发给模型的输入摘要（**未脱敏**：调用点必须紧接着过 `redact_any`）。
+
+    保证：只包含两份白名单里的字段；值都是 JSON 原生类型（`severity` 转 `str`，
+        因为 `json.dumps` 对 `StrEnum` 的输出依赖它自己的 `__str__`，不如显式转一次）。
+    不保证：不保证内容里没有上游原文——`message` 来自规则模板，而模板里可能拼进上游字段；
+        这正是调用点**必须**脱敏的原因（本函数不脱，是因为它拿不到 `redact_keys`，
+        而"两处各脱一次"必然走散）。
+    调用方坑：返回值会被 `json.dumps` 后发给外部模型，所以不要往里加非 JSON 原生类型。
+    """
+    summary = metrics if isinstance(metrics, Mapping) else None
+    return {
+        # `metrics` 缺失时给 `None` 而不是 `{}`：空 dict 会被模型/读者理解成"所有指标都是空值"。
+        "business_date": summary.get("date") if summary is not None else None,
+        "metrics": (
+            {key: summary.get(key) for key in _EXPLAIN_METRIC_KEYS}
+            if summary is not None
+            else None
+        ),
+        "anomalies": [
+            {
+                # `severity` 显式 `str()`：其余字段都是 JSON 原生类型，只有它是枚举。
+                key: (str(anomaly.get(key)) if key == "severity" else anomaly.get(key))
+                for key in _EXPLAIN_ANOMALY_KEYS
+                if key in anomaly
+            }
+            for anomaly in anomalies
+        ],
+    }
+
+
+def _explain_degraded(
+    state: Mapping[str, Any], *, result: Any, anomalies: int
+) -> list[AuditEntry]:
+    """把一次 LLM 降级折成**双出口**审计（`llm.degraded`，warn，带 reason 枚举）。
+
+    为什么 degrade 也要写 `state.audit`（而不只是 JSONL）：降级之后 state 里的
+    `explanations` 是空 dict，而"空 dict"本身**分不清**三种情况——没有异常、没配 key、
+    模型挂了。只读 checkpoint 的人必须能看出是哪种，否则这条旁路的故障永远是隐形的。
+
+    保证：`data.reason` ∈ `timeout` / `http_error` / `bad_json` / `schema_mismatch`
+        （枚举唯一来源是 `services.llm`）；`unexplained` 是"本轮没解释的异常条数"。
+    不保证：不保证 `detail` 是稳定文本（它是异常类名／pydantic 错误类型，只用于定位）。
+    调用方坑：`state` 必须是 `Mapping`（本函数只读，不 try 改它）。
+    """
+    data = {
+        "reason": str(result.reason),
+        # 只留"哪一类失败"：模型/网关的原始文本一律不落盘（它可能带回我们发过去的摘要）。
+        "detail": str(result.detail or ""),
+        "unexplained": int(anomalies),
+    }
+    _log_audit(
+        state,
+        node="explain",
+        event="llm.degraded",
+        level="warn",
+        message=f"LLM 解释降级（{data['reason']}）：本轮不产出解释，流程继续",
+        data=data,
+    )
+    return _audit(state, node="explain", event="llm.degraded", data=data)
+
+
+@traced("explain")
+async def explain_node(state: AgentState, config: RunnableConfig) -> dict[str, Any]:
+    """给每条异常补一句人话解释 + 一句建议草稿（旁路，失败不影响任何决策）。
+
+    保证：只要返回，`explanations` / `suggestions` 的键都是**本次 `state.anomalies` 的
+        `anomaly_id`**（模型编出来的 id 由 `services.llm` 丢掉）；成功写 `llm.explained`、
+        没客户端写 `llm.skipped`、失败写 `llm.degraded`（三者都进 `state.audit` + JSONL）。
+    不保证：不保证有解释——没配 key / 超时 / 模型乱答时两个字段都是空 dict，而**流程照常**。
+    调用方坑：本节点**绝不**碰 `pending_actions` / `status` / `approval`：动作只由
+        `propose_actions` 的规则产出。谁想"让模型顺手给个动作"，请先读本模块顶部的旁路说明。
+    """
+    from app.services import llm
+
+    if _aborted(state):
+        # 上游已经判死：不再产生任何外部副作用（也就不会白花一次模型调用费）。
+        return {}
+    anomalies = list(state.get("anomalies") or [])
+    if not anomalies:
+        # 没有异常 = 没有"这个异常意味着什么"可解释：直接返回，不发请求、不写审计。
+        # 不写审计的理由：`detect_anomalies` 的 `anomaly.detected(count=0)` 已经把这轮
+        # "一条异常都没有"说清了；在这里再补一条只是同一件事的第二个出口（日志翻倍、可查性不变）。
+        return {"explanations": {}, "suggestions": {}}
+
+    client = get_llm_client()
+    if client is None:
+        # 没配 key（或装配层没装）：这是**开关**不是故障，所以只留一条 warn 让"这条旁路不在场"
+        # 可查，然后立刻返回。绝不抛异常、绝不阻塞——`explain` 没有资格让主链路失败。
+        data = {"reason": "no_client", "anomalies": len(anomalies)}
+        _log_audit(
+            state,
+            node="explain",
+            event="llm.skipped",
+            level="warn",
+            message="未装配 LLM 客户端（LLM_API_KEY 为空），本轮不产出解释，流程继续",
+            data=data,
+        )
+        return {
+            "explanations": {},
+            "suggestions": {},
+            "audit": _audit(state, node="explain", event="llm.skipped", data=data),
+        }
+
+    redact_keys = resolve_runtime(config).settings.observability.redact_keys
+    # 脱敏在**发送之前**：喂进去的是指标/异常摘要，但 `message` 可能带着上游原文
+    # （规则模板会把字段拼进去）。用项目已有的两层脱敏（键名层 + 值级 scrub），不另写一份。
+    request = llm.ExplainRequest(
+        anomaly_ids=tuple(str(item["anomaly_id"]) for item in anomalies),
+        payload=redact_any(_explain_input(anomalies, state.get("metrics")), redact_keys),
+    )
+    result = await client.explain(request)
+    if not result.ok:
+        return {
+            "explanations": {},
+            "suggestions": {},
+            "audit": _explain_degraded(state, result=result, anomalies=len(anomalies)),
+        }
+
+    # 输出也要脱敏：模型可能把我们发过去的原文（或它自己"补"出来的东西）回吐回来，
+    # 而 state 会进 checkpoint——那是与 JSONL 并列的第二个落盘出口，sink 的脱敏覆盖不到它。
+    explanations = {
+        key: str(redact_any(value, redact_keys)) for key, value in result.explanations.items()
+    }
+    suggestions = {
+        key: str(redact_any(value, redact_keys)) for key, value in result.suggestions.items()
+    }
+    explained = {"count": len(explanations), "suggestions": len(suggestions)}
+    audits = _audit(state, node="explain", event="llm.explained", data=explained)
+    _log_audit(
+        state,
+        node="explain",
+        event="llm.explained",
+        level="info",
+        # 只报计数，不带模型原文：日志里出现"模型说了什么"没有排查价值，却会把一段
+        # 不可控文本搬进我们唯一的可信通道。
+        message=(
+            f"LLM 解释完成：{len(explanations)} 条解释、{len(suggestions)} 条建议草稿"
+            "（仅供人工参考，不参与决策）"
+        ),
+        data=explained,
+    )
+    if result.dropped:
+        # 模型给出了本次输入之外的 id（或空白文案）：那几条已被 `services.llm` 丢掉。
+        # 这是"prompt 被理解歪了"的唯一信号，静默丢弃会让模型质量慢慢退化而没人发现。
+        drift = {
+            "reason": "schema_mismatch",
+            "detail": "unknown_or_blank_id",
+            "dropped": int(result.dropped),
+            "unexplained": len(anomalies) - len(explanations),
+        }
+        _log_audit(
+            state,
+            node="explain",
+            event="llm.degraded",
+            level="warn",
+            message=f"LLM 输出了 {drift['dropped']} 条不属于本次异常的条目，已丢弃（其余照常使用）",
+            data=drift,
+        )
+        audits = _audit({"audit": audits}, node="explain", event="llm.degraded", data=drift)
+    return {"explanations": explanations, "suggestions": suggestions, "audit": audits}
+
+
+# ======================================================================================
+# 5) propose_actions
 # ======================================================================================
 
 
@@ -2706,7 +2927,7 @@ def route_after_propose_actions(state: AgentState) -> str:
 
 
 # ======================================================================================
-# 5) approval_gate（interrupt 发生在这里，§4.4 逐字）
+# 6) approval_gate（interrupt 发生在这里，§4.4 逐字）
 # ======================================================================================
 
 
@@ -3013,7 +3234,7 @@ async def approval_gate(state: AgentState, config: RunnableConfig) -> dict[str, 
 
 
 # ======================================================================================
-# 6) execute
+# 7) execute
 # ======================================================================================
 
 
@@ -3308,7 +3529,7 @@ async def execute(state: AgentState, config: RunnableConfig) -> dict[str, Any]:
 
 
 # ======================================================================================
-# 7) record_effect（图内**不等待** T+N，ADR-003）
+# 8) record_effect（图内**不等待** T+N，ADR-003）
 # ======================================================================================
 
 
@@ -3375,7 +3596,7 @@ async def record_effect(state: AgentState, config: RunnableConfig) -> dict[str, 
 
 
 # ======================================================================================
-# 8) finalize
+# 9) finalize
 # ======================================================================================
 
 

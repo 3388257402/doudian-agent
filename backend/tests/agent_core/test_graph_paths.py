@@ -3,7 +3,7 @@
 覆盖 t2 验收清单的 (d) 与 (e)：
 
 - (d) 无异常 → 不进审批节点、直接 END、`status=done`；
-- (e) 带审批的一次 run：JSONL 节点事件数 == `agent_traces.step_count` == 9
+- (e) 带审批的一次 run：JSONL 节点事件数 == `agent_traces.step_count` == 10（v1.6.0 起 9 节点 + 重放一次）
   （8 个节点 + `approval_gate` 被重放一次）。
 """
 
@@ -37,7 +37,11 @@ from .conftest import (
 async def test_no_anomaly_ends_without_approval(
     runtime: Any, sink: JsonlLogSink, fake_client: FakeDoudianClient
 ) -> None:
-    """无异常 = 无提议 = 不进审批：图从 propose_actions 直接到 finalize（§4.2 的"直通"）。"""
+    """无异常 = 无提议 = 不进审批：`propose_actions` 之后直接到 finalize（§4.2 的"直通"）。
+
+    v1.6.0 起 `detect_anomalies` 与 `propose_actions` 之间多了一个旁路节点 `explain`
+    （模型只写解释与建议草稿，不产生动作），因此这条链多一步。
+    """
     fake_client.orders = history_then_today(history_gmv=1_000_000, today_gmv=2_000_000)
 
     result = await run_agent(SHOP_ID, "run_no_anomaly")
@@ -52,6 +56,7 @@ async def test_no_anomaly_ends_without_approval(
         "collect",
         "compute_metrics",
         "detect_anomalies",
+        "explain",
         "propose_actions",
         "finalize",
     ]
@@ -65,10 +70,13 @@ async def test_no_anomaly_ends_without_approval(
         await resume_agent(result.thread_id, [])
 
 
-async def test_approval_run_step_count_is_nine(
+async def test_approval_run_step_count_is_ten(
     runtime: Any, sink: JsonlLogSink, fake_client: FakeDoudianClient
 ) -> None:
-    """带审批的 run：8 个节点 + `approval_gate` 重放一次 = 9 条事件 = step_count 9。"""
+    """带审批的 run：9 个节点 + `approval_gate` 重放一次 = 10 条事件 = step_count 10。
+
+    v1.6.0 起节点数 8 → 9（插入旁路节点 `explain`），因此这条不变量从 9 变 10。
+    """
     run_id = "run_with_approval"
     result = await run_agent(SHOP_ID, run_id)
     assert result.status == RunStatus.AWAITING_APPROVAL.value
@@ -81,16 +89,16 @@ async def test_approval_run_step_count_is_nine(
     # 9900 → 9603 的跌幅是 297/9900 = 3%，落在"否则"分支，因此是 low（不是 medium）。
     assert pending.risk == "low"
 
-    # 挂起阶段：5 次执行（collect/compute/detect/propose/approval_gate 的那一次）
+    # 挂起阶段：6 次执行（collect/compute/detect/explain/propose/approval_gate 的那一次）
     events = node_events(sink, run_id)
-    assert len(events) == 5
+    assert len(events) == 6
     interrupted = events[-1]
     assert interrupted["node"] == "approval_gate"
     assert interrupted["data"]["outcome"] == "interrupted"
     assert interrupted["level"] == "info"
     assert interrupted["data"]["error"] is None
     assert interrupted["data"]["output_digest"] is None
-    assert (await trace_row(SHOP_ID, run_id))["step_count"] == 5
+    assert (await trace_row(SHOP_ID, run_id))["step_count"] == 6
 
     resumed = await resume_agent(
         result.thread_id,
@@ -106,6 +114,7 @@ async def test_approval_run_step_count_is_nine(
         "collect",
         "compute_metrics",
         "detect_anomalies",
+        "explain",
         "propose_actions",
         "approval_gate",  # 第一次：interrupt 挂起
         "approval_gate",  # 第二次：恢复后从节点开头重放
@@ -113,8 +122,8 @@ async def test_approval_run_step_count_is_nine(
         "record_effect",
         "finalize",
     ]
-    assert (await trace_row(SHOP_ID, run_id))["step_count"] == 9
-    assert len(events) == 9
+    assert (await trace_row(SHOP_ID, run_id))["step_count"] == 10
+    assert len(events) == 10
 
     # 执行真的发生了一次，且参数是审批后的生效参数
     assert fake_client.price_updates == [
@@ -150,6 +159,7 @@ async def test_graph_has_expected_nodes_and_retry_policy(runtime: Any) -> None:
         "collect",
         "compute_metrics",
         "detect_anomalies",
+        "explain",
         "propose_actions",
         "approval_gate",
         "execute",

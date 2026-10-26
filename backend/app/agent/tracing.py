@@ -12,7 +12,7 @@
 两者不是两份各自为政的真相：写事件与 +1 步数在**同一段代码**里顺序执行（§4.7 规则 6），
 `reconcile_step_count()` 能把崩溃窗口造成的偏差校准回来，
 `tests/agent_core/test_trace_invariant.py` 断言「同一 run 的 `node.trace` 行数 ==
-`agent_traces.step_count`」（8 个节点 + 一次审批重放 = 9）。
+`agent_traces.step_count`」（9 个节点 + 一次审批重放 = 10）。
 
 ## 中断不是错误（契约 v1.2.0 / ADR-016）
 
