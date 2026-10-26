@@ -67,11 +67,13 @@ class _Lifecycle:
 
     def __init__(self, settings: Settings) -> None:
         self.settings = settings
-        # 四个"我创建的"资源槽：None 当哨兵，`shutdown()` 靠它实现幂等
+        # 五个"我创建的"资源槽：None 当哨兵，`shutdown()` 靠它实现幂等
         # （关过一次就置 None，重复关不会重复释放/重复报错）。
         self.sink: JsonlLogSink | None = None
         self.saver_cm: Any = None
         self.runtime: adapters.AgentRuntime | None = None
+        #: LLM 旁路客户端（`None` = 没配 `LLM_API_KEY`，这是**合法**状态，不是失败）。
+        self.llm: Any = None
         self.running = False
 
     # --- 启动 ---
@@ -130,6 +132,13 @@ class _Lifecycle:
         self.runtime = runtime
         adapters.set_runtime(runtime)
 
+        # 2.5) LLM 旁路（`explain` 节点用）：**没配 key 就装配 None**，节点据此写 `llm.skipped`
+        # 并跳过。为什么"没配"与"配了但坏"必须在装配层就分开：两者的降级事件在审计里长得一样
+        # （`llm.degraded(http_error)`），但一个是正常开关、一个是故障——用 None 把"没配"
+        # 固定在这里，`explain` 才能写出正确的 skipped。
+        self.llm = self._build_llm()
+        adapters.set_llm_client(self.llm)
+
         # 3) checkpointer：HITL 的持久化基础（§5.7）。手动 `__aenter__` 是为了把 saver
         # 的关闭时机交给 `shutdown()`（它要按反序关，不能靠 with 块的缩进表达）。
         self.saver_cm = checkpoint_saver(settings)
@@ -158,6 +167,41 @@ class _Lifecycle:
                 },
             },
         )
+
+    def _build_llm(self) -> Any:
+        """装配 LLM 旁路客户端（`explain` 节点用）；没配 key 时返回 `None`。
+
+        保证：返回 `None`（没启用）或一个 `services.llm.LlmClient`；返回前已写一条
+            `llm.ready` 启动日志，因此"这条旁路为什么一直是空的"不必再靠猜。
+        不保证：不保证客户端可用——没有网络也能构造成功，真正的失败在第一次调用时降级。
+        调用方坑：`LLM_TIMEOUT_S` / `LLM_BASE_URL` 写坏会抛 `ConfigError`，这是**启动期**失败
+            （与 §8.1「配置问题不许等到第一个请求才炸」同一条规矩）；但 `LLM_API_KEY` 为空
+            **不**算错——那是"没启用"，不是"配错了"。
+        """
+        config = llm.config_from_env()
+        client = llm.build_llm_client(config)
+        enabled = client is not None
+        logger.info(
+            "LLM 旁路：%s",
+            (
+                f"已装配（model={config.model}, base_url={config.base_url}, "
+                f"timeout={config.timeout_s}s）"
+                if enabled
+                else "未启用（LLM_API_KEY 为空，explain 节点将跳过并写 llm.skipped）"
+            ),
+            extra={
+                "event": "llm.ready",
+                # 只放"在不在场 / 哪个模型 / 哪个地址 / 多长超时"：`api_key` 永远不出现，
+                # 这条日志会在启动时打到 stdout 与 JSONL 两处。
+                "data": {
+                    "enabled": enabled,
+                    "model": config.model if enabled else None,
+                    "base_url": config.base_url if enabled else None,
+                    "timeout_s": config.timeout_s,
+                },
+            },
+        )
+        return client
 
     def _log_startup_warnings(self) -> None:
         """把启动期风险横幅写进**结构化日志**（§8.2：禁止静默）。"""
@@ -232,6 +276,18 @@ class _Lifecycle:
                 # 这里**必须**吞：启动失败时真正的错误是 startup 抛的那个，
                 # 关连接再抛一次会把它盖掉，日志里只剩"关闭失败"。
                 logger.exception("关闭 checkpointer 失败")
+
+        llm, self.llm = self.llm, None
+        # 先摘登记再关连接：关的过程中还有请求进来时，`get_llm_client()` 会得到 None
+        # （= 旁路"不在场"），而不是一个正在关的连接池。`None` 本来就是合法装配值。
+        adapters.set_llm_client(None)
+        if llm is not None:
+            aclose_llm = getattr(llm, "aclose", None)
+            if callable(aclose_llm):
+                try:
+                    await aclose_llm()
+                except Exception:  # noqa: BLE001 - 同上：关停失败不该掩盖启动错误
+                    logger.exception("关闭 LLM 客户端失败")
 
         runtime, self.runtime = self.runtime, None
         if runtime is not None:

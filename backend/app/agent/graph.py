@@ -3,13 +3,18 @@
 ## 图拓扑（§4.2 冻结）
 
 ```
-START → collect ──(ok)──> compute_metrics → detect_anomalies → propose_actions
+START → collect ──(ok)──> compute_metrics → detect_anomalies → explain → propose_actions
            │                                                        │
            │                                          (无提议)      ├──> finalize → END
            │                                                        └──> approval_gate ← interrupt()
            └──(fail)──> finalize → END                                     │
                                                             (恢复后) → execute → record_effect → finalize
 ```
+
+`explain` 是**旁路**节点（v1.6.0）：它读 `anomalies` + `metrics`，写 `explanations` /
+`suggestions`（都只是给人看的文字），然后把控制权原样交给 `propose_actions`。它不产生
+`ActionProposal`、不改 `status`、也不进审批链——动作**永远**只由规则产出，模型的话最多
+变成一句解释（见 `nodes.explain_node` 的模块说明）。
 
 `approval_gate` 只有一条入边和一条出边：它就是"等人"这件事本身，不靠边上的条件判断
 要不要等人——要不要进审批由 `propose_actions` 之后的条件边决定（无提议 = 不进审批）。
@@ -124,19 +129,22 @@ def _execute_retry_policy(settings: Settings) -> RetryPolicy:
 def build_graph(checkpointer: BaseCheckpointSaver | None = None) -> CompiledStateGraph:
     """构建并编译状态机。`checkpointer=None` 时不启用持久化（仅限内部工具/单测）。
 
-    保证：产出的图与 §4.2 的拓扑逐边一致——8 个节点、2 条条件边、5 条普通边、`finalize → END`。
+    保证：产出的图与 §4.2 的拓扑逐边一致——9 个节点、2 条条件边、8 条普通边
+        （含 `START → collect` 与 `finalize → END`）。
     不保证：不保证能跑。这里只**装配**：没有表、没有运行时、没有日志汇时图照样能编译成功，
         第一个节点执行才会炸。
     调用方坑：`checkpointer=None` 只给单测/画图用；`app/` 下必须走
         `resolve_checkpointer()`（§5.7 禁止 `MemorySaver`），否则审批挂起点在进程重启后消失。
 
-    ## 8 个节点各自的边（凡是"为什么是这条边"都在这里说清）
+    ## 9 个节点各自的边（凡是"为什么是这条边"都在这里说清）
 
     - `collect`：`START` 进来；出边**条件化**（`route_after_collect`）——`raw` 缺失或
       `status=failed` 时直奔 `finalize`，否则去 `compute_metrics`。这是全图唯一的"入口分流"，
       也是 §4.2 那条 `collect --(fail)--> finalize`。
-    - `compute_metrics` / `detect_anomalies`：普通边串联。它们不决定去向，"缺数据"一律通过
-      `status=failed` + `_aborted` 短路表达，出口只有 `finalize` 一个。
+    - `compute_metrics` / `detect_anomalies` / `explain`：普通边串联。它们不决定去向，"缺数据"
+      一律通过 `status=failed` + `_aborted` 短路表达，出口只有 `finalize` 一个。`explain` 卡在
+      `detect_anomalies` 与 `propose_actions` 之间的理由是"它需要 anomalies 已经落地"——放到
+      `detect_anomalies` 之前就得自己去求值规则，那是第二份规则真相。
     - `propose_actions`：出边**条件化**（`route_after_propose_actions`）——`pending_actions`
       为空就直通 `finalize`（没有提议就没有可审批的东西），否则进 `approval_gate`。
     - `approval_gate`：单入单出。它"是不是要等人"不由自己判断，而由上游条件边决定；
@@ -150,6 +158,11 @@ def build_graph(checkpointer: BaseCheckpointSaver | None = None) -> CompiledStat
     两个函数都先看 `_aborted(state)`（`status == failed`）再看业务条件：失败是**终局**，
     它必须能压过"看起来还有活要干"的判断——否则一个失败的 run 会带着残缺数据继续往下跑，
     最后在更深的节点里以另一种面貌再炸一次。
+
+    `explain` 没有引入第三條条件边，这是刻意的：它没有任何"要不要走另一条路"的判断。
+    它降级（无 key / 超时 / JSON 坏）时返回空解释并让流程继续，判死与否由上游的
+    `status=failed` 决定（`_aborted` 在节点开头短路）——把降级画成一条分支边等于让
+    "旁路坏了"和"run 失败了"在图上长得一样。
 
     ## 为什么挂起**不走** failure
 
@@ -173,6 +186,12 @@ def build_graph(checkpointer: BaseCheckpointSaver | None = None) -> CompiledStat
     )
     builder.add_node("compute_metrics", nodes.compute_metrics_node)
     builder.add_node("detect_anomalies", nodes.detect_anomalies_node)
+    # `explain` **不挂** RetryPolicy / TimeoutPolicy，这是设计而不是遗漏：
+    #   ① 旁路的设计规则是"失败一律降级、不重试"——LangGraph 的 RetryPolicy 会对可重试错误
+    #      重发，那正是这里禁止的行为；它自己的降级与墙钟预算在 `services/llm.py` 里。
+    #   ② 节点的 TimeoutPolicy 取自 `app.request_timeout_s`（30s），比 LLM 的 5s 预算长得多：
+    #      套上它只会产生第二个"谁先超时"的真相，而内层永远先到。
+    builder.add_node("explain", nodes.explain_node)
     builder.add_node("propose_actions", nodes.propose_actions_node)
     builder.add_node("approval_gate", nodes.approval_gate)
     builder.add_node(
@@ -190,7 +209,11 @@ def build_graph(checkpointer: BaseCheckpointSaver | None = None) -> CompiledStat
         {"compute_metrics": "compute_metrics", "finalize": "finalize"},
     )
     builder.add_edge("compute_metrics", "detect_anomalies")
-    builder.add_edge("detect_anomalies", "propose_actions")
+    # `detect_anomalies --(旧直连)--> propose_actions` 在 v1.6.0 被拆成两段：中间插入 `explain`。
+    # 两条都保持**普通边**（不是条件边）：`explain` 降级时也要继续往下走，而"这一轮死了没有"
+    # 由节点自己的 `_aborted` 短路表达，不需要在边上再判一次。
+    builder.add_edge("detect_anomalies", "explain")
+    builder.add_edge("explain", "propose_actions")
     builder.add_conditional_edges(
         "propose_actions",
         nodes.route_after_propose_actions,
@@ -244,7 +267,7 @@ def _initial_state(*, shop_id: str, run_id: str, thread_id: str, trace_id: str,
                    trigger: str, started_at: Any) -> AgentState:
     """§3.2 全字段初始值：一个字段都不省（缺字段的 state 会在节点里变成 KeyError）。
 
-    保证：19 个 §3.2 字段全部就位，且列表类字段是**空列表**而不是 `None`（节点普遍写
+    保证：21 个 §3.2 字段全部就位，且列表类/字典类字段是**空容器**而不是 `None`（节点普遍写
         `state.get("errors") or []`，但 `_initial_state` 是唯一的"第一份 state"，
         这里给 None 会让第一轮就分流到不同的代码路径）。
     不保证：不保证业务上"没有数据"。`raw`/`metrics`/`approval`/`effect_report` 全是 `None`，
@@ -267,6 +290,10 @@ def _initial_state(*, shop_id: str, run_id: str, thread_id: str, trace_id: str,
         # history 是"近 8 天"的累积序列（含今天），由 compute_metrics 逐日 append。
         history=[],
         anomalies=[],
+        # 旁路节点 explain 的产物（§3.2 的 NotRequired 两字段）：这里也给空 dict，
+        # 让"读 state 的人"不必区分"没有这个键"与"它是空的"（老 checkpoint 才会缺键）。
+        explanations={},
+        suggestions={},
         pending_actions=[],
         approved_actions=[],
         rejected_actions=[],
