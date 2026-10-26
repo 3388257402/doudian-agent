@@ -45,7 +45,7 @@ async def list_logs(
         - `limit` 1..500（默认 100）；`before_seq` 取**严格小于**它的行（把上一页 `next_cursor` 转 int 传来）；
         - 排序固定 `seq DESC`（最新在前），不支持升序：要时间序列请在前端反转。
 
-    保证：返回的每一行都过了 `LogItem` 校验（§7.6 的 9 个字段齐全）。
+    保证：返回的每一行都过了 `LogItem` 校验（§7.6 的 10 个字段齐全）。
     不保证：不保证 `level=info` 就等于"没出事"——挂起也是 info（ADR-016），判据是 `data.outcome`。
 
     错误：只有 `400 VALIDATION_ERROR`（`limit` 越界/`level` 枚举外/`before_seq <= 0`）。

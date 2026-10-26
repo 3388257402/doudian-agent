@@ -32,6 +32,16 @@ import type {
 import { buildApproveRequest, type DecisionDraft } from "../src/lib/approve";
 import { formatCents, formatDuration, formatPercent } from "../src/lib/format";
 import { deriveDashboard, MARGIN_NULL_LABEL, summarize } from "../src/lib/metrics";
+
+/**
+ * 工作流节点数（v1.6.0 起 **9**：8 个业务节点 + 旁路 `explain`）。
+ *
+ * 下面所有"步数 = 节点数 + 审批重放 1 次"的断言都从它派生，**不要写死 10**：
+ * 写死的数字在下次改节点时会被顺手改绿，而"挂起点提前/推后一步"这种回归
+ * 恰好只能靠这个数字暴露。改节点数时只改这里。
+ */
+const NODE_COUNT = 9;
+
 import {
   deriveRunSummaries,
   durationOf,
@@ -327,10 +337,13 @@ check("§7.6.1 不变量：同一 run 的 node.trace 条数 == 派生出的步�
   for (const [runId, count] of perRun) {
     assert(count > 0, `run ${runId} 步数为 0`);
   }
-  // 14:25 那个 run（从真实 demo 导出）：8 个节点各一次 + `approval_gate` 的恢复重放 = 9 条。
-  // 数字跟着 fixture 走：mock/logs.json 由 backend 的 export_event_log.py --mock-out 重新生成，
-  // 想改这里先重导 fixture（不要在 JSON 里手写一条假的）。
-  assertEqual(perRun.get("run_20261023T142530Z_9f3c1a7b"), 9, "run B 的步数（8 个节点 + 审批恢复重放）");
+  // 14:25 那个 run（从真实 demo 导出）：9 个节点各一次 + `approval_gate` 的恢复重放 = 10 条。
+  // 数字从 `NODE_COUNT` 派生（见文件顶部）：节点数 8 → 9 时它自动跟着变，不必手改断言。
+  assertEqual(
+    perRun.get("run_20261023T142530Z_9f3c1a7b"),
+    NODE_COUNT + 1,
+    "run B 的步数（节点数 + 审批恢复重放）",
+  );
 });
 
 // ————————————————————————— §7.5 派生指标 —————————————————————————
@@ -737,8 +750,12 @@ check("§7.6.1 不变量：派生 run 摘要的步数 = 该 run 的 node.trace �
   const b = byRun.get("run_20261023T142530Z_9f3c1a7b");
   assert(b !== undefined, "缺少 run B 的摘要");
   if (!b) return;
-  assertEqual(b.steps, 9, "run B 步数（8 个节点 + 审批恢复重放）");
-  assertEqual([b.ok, b.interrupted, b.error], [8, 1, 0], "run B 三态计数（approval_gate 挂起一条）");
+  assertEqual(b.steps, NODE_COUNT + 1, "run B 步数（节点数 + 审批恢复重放）");
+  assertEqual(
+    [b.ok, b.interrupted, b.error],
+    [NODE_COUNT, 1, 0],
+    "run B 三态计数（approval_gate 挂起一条）",
+  );
   const failed = byRun.get("run_20261023T080000Z_5e6f7a8b");
   // 失败 run 来自真实 demo 的 `collect-failure` 场景：collect 的 node.trace 是 error，
   // finalize 照常 ok（它把 run 收口成 failed），所以 error 计数恰好是 1。

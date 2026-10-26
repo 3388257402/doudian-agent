@@ -1,36 +1,36 @@
 {
   "items": [
     {
-      "seq": 63,
-      "ts": "2026-10-24T20:54:22.136Z",
+      "seq": 70,
+      "ts": "2026-10-26T17:49:31.179Z",
       "level": "info",
       "event": "node.trace",
       "run_id": "run_20261023T080000Z_5e6f7a8b",
-      "trace_id": "7b936235a98f4a3c96b66c1bb0afe1f7",
+      "trace_id": "2f6255cd8b664a6f8f44e81ea56b4c8f",
       "shop_id": "12345678",
       "node": "finalize",
       "message": "node ok",
       "data": {
         "outcome": "ok",
-        "duration_ms": 87.5,
+        "duration_ms": 98.8,
         "input_digest": "d4e24dab0cb1726e",
         "output_digest": "28178a6f764f8015",
         "error": null
       }
     },
     {
-      "seq": 62,
-      "ts": "2026-10-24T20:54:22.015Z",
+      "seq": 69,
+      "ts": "2026-10-26T17:49:31.018Z",
       "level": "error",
       "event": "node.trace",
       "run_id": "run_20261023T080000Z_5e6f7a8b",
-      "trace_id": "7b936235a98f4a3c96b66c1bb0afe1f7",
+      "trace_id": "2f6255cd8b664a6f8f44e81ea56b4c8f",
       "shop_id": "12345678",
       "node": "collect",
       "message": "node failed",
       "data": {
         "outcome": "error",
-        "duration_ms": 3.0,
+        "duration_ms": 3.7,
         "input_digest": "83ba02f1909c6d76",
         "output_digest": null,
         "error": {
@@ -40,12 +40,12 @@
       }
     },
     {
-      "seq": 61,
-      "ts": "2026-10-24T20:54:22.015Z",
+      "seq": 68,
+      "ts": "2026-10-26T17:49:31.018Z",
       "level": "error",
       "event": "collect.failed",
       "run_id": "run_20261023T080000Z_5e6f7a8b",
-      "trace_id": "7b936235a98f4a3c96b66c1bb0afe1f7",
+      "trace_id": "2f6255cd8b664a6f8f44e81ea56b4c8f",
       "shop_id": "12345678",
       "node": "collect",
       "message": "采集失败（reason=batch_contract）：订单响应不满足契约（data / 订单列表字段 / summary 形状不对），整批不可用，本轮没有产出任何指标",
@@ -71,36 +71,37 @@
         "rows_seen": 0,
         "rows_accepted": 0,
         "rows_rejected": 0,
+        "rows_out_of_window": 0,
         "reject_reasons": {},
         "row_reject_samples": [],
         "row_reject_samples_truncated": false
       }
     },
     {
-      "seq": 52,
-      "ts": "2026-10-24T20:54:17.132Z",
+      "seq": 58,
+      "ts": "2026-10-26T17:49:23.974Z",
       "level": "info",
       "event": "node.trace",
       "run_id": "run_20261023T090000Z_1a2b3c4d",
-      "trace_id": "2ac3967352e249c5b5609118d7813965",
+      "trace_id": "34307ab5f24d4b0d95f6c3a060902931",
       "shop_id": "12345678",
       "node": "approval_gate",
       "message": "node interrupted (awaiting human decision)",
       "data": {
         "outcome": "interrupted",
-        "duration_ms": 143.6,
+        "duration_ms": 116.4,
         "input_digest": "f454c485eb89b90f",
         "output_digest": null,
         "error": null
       }
     },
     {
-      "seq": 51,
-      "ts": "2026-10-24T20:54:16.899Z",
+      "seq": 57,
+      "ts": "2026-10-26T17:49:23.779Z",
       "level": "info",
       "event": "node.trace",
       "run_id": "run_20261023T090000Z_1a2b3c4d",
-      "trace_id": "2ac3967352e249c5b5609118d7813965",
+      "trace_id": "34307ab5f24d4b0d95f6c3a060902931",
       "shop_id": "12345678",
       "node": "propose_actions",
       "message": "node ok",
@@ -113,30 +114,63 @@
       }
     },
     {
-      "seq": 50,
-      "ts": "2026-10-24T20:54:16.845Z",
+      "seq": 56,
+      "ts": "2026-10-26T17:49:23.680Z",
       "level": "info",
       "event": "node.trace",
       "run_id": "run_20261023T090000Z_1a2b3c4d",
-      "trace_id": "2ac3967352e249c5b5609118d7813965",
+      "trace_id": "34307ab5f24d4b0d95f6c3a060902931",
+      "shop_id": "12345678",
+      "node": "explain",
+      "message": "node ok",
+      "data": {
+        "outcome": "ok",
+        "duration_ms": 0.3,
+        "input_digest": "eac950034b608cf4",
+        "output_digest": "d45ba240de14a675",
+        "error": null
+      }
+    },
+    {
+      "seq": 55,
+      "ts": "2026-10-26T17:49:23.680Z",
+      "level": "warn",
+      "event": "llm.skipped",
+      "run_id": "run_20261023T090000Z_1a2b3c4d",
+      "trace_id": "34307ab5f24d4b0d95f6c3a060902931",
+      "shop_id": "12345678",
+      "node": "explain",
+      "message": "未装配 LLM 客户端（LLM_API_KEY 为空），本轮不产出解释，流程继续",
+      "data": {
+        "reason": "no_client",
+        "anomalies": 2
+      }
+    },
+    {
+      "seq": 54,
+      "ts": "2026-10-26T17:49:23.607Z",
+      "level": "info",
+      "event": "node.trace",
+      "run_id": "run_20261023T090000Z_1a2b3c4d",
+      "trace_id": "34307ab5f24d4b0d95f6c3a060902931",
       "shop_id": "12345678",
       "node": "detect_anomalies",
       "message": "node ok",
       "data": {
         "outcome": "ok",
-        "duration_ms": 2.0,
+        "duration_ms": 2.1,
         "input_digest": "341e75363b9012d4",
         "output_digest": "f8ae2a4de266ad07",
         "error": null
       }
     },
     {
-      "seq": 49,
-      "ts": "2026-10-24T20:54:16.845Z",
+      "seq": 53,
+      "ts": "2026-10-26T17:49:23.607Z",
       "level": "error",
       "event": "anomaly.detected",
       "run_id": "run_20261023T090000Z_1a2b3c4d",
-      "trace_id": "2ac3967352e249c5b5609118d7813965",
+      "trace_id": "34307ab5f24d4b0d95f6c3a060902931",
       "shop_id": "12345678",
       "node": "detect_anomalies",
       "message": "退款率超过 8%（refund_rate=0.333333，条件 refund_rate is not None and refund_rate > 0.08）",
@@ -154,12 +188,12 @@
       }
     },
     {
-      "seq": 48,
-      "ts": "2026-10-24T20:54:16.845Z",
+      "seq": 52,
+      "ts": "2026-10-26T17:49:23.607Z",
       "level": "error",
       "event": "anomaly.detected",
       "run_id": "run_20261023T090000Z_1a2b3c4d",
-      "trace_id": "2ac3967352e249c5b5609118d7813965",
+      "trace_id": "34307ab5f24d4b0d95f6c3a060902931",
       "shop_id": "12345678",
       "node": "detect_anomalies",
       "message": "有成本覆盖的成交额整体低于商品成本价（加权毛利率 < 0，且成本覆盖 ≥ 60%）（gross_margin=-0.113106，条件 gross_margin is not None and gross_margin < 0.0 and cost_coverage_ratio is not None and cost_coverage_ratio >= 0.6）",
@@ -177,12 +211,12 @@
       }
     },
     {
-      "seq": 47,
-      "ts": "2026-10-24T20:54:16.845Z",
+      "seq": 51,
+      "ts": "2026-10-26T17:49:23.607Z",
       "level": "info",
       "event": "anomaly.detected",
       "run_id": "run_20261023T090000Z_1a2b3c4d",
-      "trace_id": "2ac3967352e249c5b5609118d7813965",
+      "trace_id": "34307ab5f24d4b0d95f6c3a060902931",
       "shop_id": "12345678",
       "node": "detect_anomalies",
       "message": "异常检测完成：命中 2 条，跳过 0 条规则，截断 0 条",
@@ -198,30 +232,30 @@
       }
     },
     {
-      "seq": 46,
-      "ts": "2026-10-24T20:54:16.769Z",
+      "seq": 50,
+      "ts": "2026-10-26T17:49:23.518Z",
       "level": "info",
       "event": "node.trace",
       "run_id": "run_20261023T090000Z_1a2b3c4d",
-      "trace_id": "2ac3967352e249c5b5609118d7813965",
+      "trace_id": "34307ab5f24d4b0d95f6c3a060902931",
       "shop_id": "12345678",
       "node": "compute_metrics",
       "message": "node ok",
       "data": {
         "outcome": "ok",
-        "duration_ms": 1.5,
+        "duration_ms": 1.7,
         "input_digest": "fbec8ebc704ba0cd",
         "output_digest": "38af34f4c0a012a2",
         "error": null
       }
     },
     {
-      "seq": 45,
-      "ts": "2026-10-24T20:54:16.769Z",
+      "seq": 49,
+      "ts": "2026-10-26T17:49:23.518Z",
       "level": "info",
       "event": "metrics.computed",
       "run_id": "run_20261023T090000Z_1a2b3c4d",
-      "trace_id": "2ac3967352e249c5b5609118d7813965",
+      "trace_id": "34307ab5f24d4b0d95f6c3a060902931",
       "shop_id": "12345678",
       "node": "compute_metrics",
       "message": "指标已计算：2026-10-23 gmv=55700 分 gross_margin=-0.113106 cost_coverage_ratio=1.0",
@@ -235,30 +269,30 @@
       }
     },
     {
-      "seq": 44,
-      "ts": "2026-10-24T20:54:16.697Z",
+      "seq": 48,
+      "ts": "2026-10-26T17:49:23.453Z",
       "level": "info",
       "event": "node.trace",
       "run_id": "run_20261023T090000Z_1a2b3c4d",
-      "trace_id": "2ac3967352e249c5b5609118d7813965",
+      "trace_id": "34307ab5f24d4b0d95f6c3a060902931",
       "shop_id": "12345678",
       "node": "collect",
       "message": "node ok",
       "data": {
         "outcome": "ok",
-        "duration_ms": 4.2,
+        "duration_ms": 4.1,
         "input_digest": "be69b400c0f40a6a",
         "output_digest": "af5dfa26724a1074",
         "error": null
       }
     },
     {
-      "seq": 43,
-      "ts": "2026-10-24T20:54:16.697Z",
+      "seq": 47,
+      "ts": "2026-10-26T17:49:23.453Z",
       "level": "warn",
       "event": "collect.units_degraded",
       "run_id": "run_20261023T090000Z_1a2b3c4d",
-      "trace_id": "2ac3967352e249c5b5609118d7813965",
+      "trace_id": "34307ab5f24d4b0d95f6c3a060902931",
       "shop_id": "12345678",
       "node": "collect",
       "message": "有 3 条订单行缺件数/件数非正，已按 1 件计入成本口径（方向偏乐观：会漏报亏本）",
@@ -311,12 +345,12 @@
       }
     },
     {
-      "seq": 42,
-      "ts": "2026-10-24T20:54:16.696Z",
+      "seq": 46,
+      "ts": "2026-10-26T17:49:23.453Z",
       "level": "info",
       "event": "collect.done",
       "run_id": "run_20261023T090000Z_1a2b3c4d",
-      "trace_id": "2ac3967352e249c5b5609118d7813965",
+      "trace_id": "34307ab5f24d4b0d95f6c3a060902931",
       "shop_id": "12345678",
       "node": "collect",
       "message": "采集完成：上游给 3 行订单，3 行进入指标，0 行整行被拒（partial=true）",
@@ -334,106 +368,107 @@
         "partial": true,
         "rows_seen": 3,
         "rows_accepted": 3,
-        "rows_rejected": 0
+        "rows_rejected": 0,
+        "rows_out_of_window": 0
       }
     },
     {
-      "seq": 27,
-      "ts": "2026-10-24T20:54:11.820Z",
+      "seq": 30,
+      "ts": "2026-10-26T17:49:17.050Z",
       "level": "info",
       "event": "node.trace",
       "run_id": "run_20261023T142530Z_9f3c1a7b",
-      "trace_id": "0a9c009f6e374d39ba27019765a753b0",
+      "trace_id": "ff09bfecb44c4e83a7bafff833a23835",
       "shop_id": "12345678",
       "node": "finalize",
       "message": "node ok",
       "data": {
         "outcome": "ok",
-        "duration_ms": 80.9,
+        "duration_ms": 39.7,
         "input_digest": "aacb86b3458b2160",
         "output_digest": "3310cf88fd65c1e6",
         "error": null
       }
     },
     {
-      "seq": 26,
-      "ts": "2026-10-24T20:54:11.707Z",
+      "seq": 29,
+      "ts": "2026-10-26T17:49:16.979Z",
       "level": "info",
       "event": "node.trace",
       "run_id": "run_20261023T142530Z_9f3c1a7b",
-      "trace_id": "0a9c009f6e374d39ba27019765a753b0",
+      "trace_id": "ff09bfecb44c4e83a7bafff833a23835",
       "shop_id": "12345678",
       "node": "record_effect",
       "message": "node ok",
       "data": {
         "outcome": "ok",
-        "duration_ms": 37.1,
+        "duration_ms": 28.0,
         "input_digest": "aacb86b3458b2160",
         "output_digest": "aa6d9d352639f735",
         "error": null
       }
     },
     {
-      "seq": 25,
-      "ts": "2026-10-24T20:54:11.641Z",
+      "seq": 28,
+      "ts": "2026-10-26T17:49:16.920Z",
       "level": "info",
       "event": "node.trace",
       "run_id": "run_20261023T142530Z_9f3c1a7b",
-      "trace_id": "0a9c009f6e374d39ba27019765a753b0",
+      "trace_id": "ff09bfecb44c4e83a7bafff833a23835",
       "shop_id": "12345678",
       "node": "execute",
       "message": "node ok",
       "data": {
         "outcome": "ok",
-        "duration_ms": 132.5,
+        "duration_ms": 145.9,
         "input_digest": "ef03a99b7765ea5e",
         "output_digest": "daaa8e97dec44a9f",
         "error": null
       }
     },
     {
-      "seq": 22,
-      "ts": "2026-10-24T20:54:11.480Z",
+      "seq": 25,
+      "ts": "2026-10-26T17:49:16.752Z",
       "level": "info",
       "event": "node.trace",
       "run_id": "run_20261023T142530Z_9f3c1a7b",
-      "trace_id": "0a9c009f6e374d39ba27019765a753b0",
+      "trace_id": "ff09bfecb44c4e83a7bafff833a23835",
       "shop_id": "12345678",
       "node": "approval_gate",
       "message": "node ok",
       "data": {
         "outcome": "ok",
-        "duration_ms": 73.9,
+        "duration_ms": 53.4,
         "input_digest": "d29a18460985b76f",
         "output_digest": "5a997eb414152875",
         "error": null
       }
     },
     {
-      "seq": 19,
-      "ts": "2026-10-24T20:54:10.930Z",
+      "seq": 22,
+      "ts": "2026-10-26T17:49:16.337Z",
       "level": "info",
       "event": "node.trace",
       "run_id": "run_20261023T142530Z_9f3c1a7b",
-      "trace_id": "0a9c009f6e374d39ba27019765a753b0",
+      "trace_id": "ff09bfecb44c4e83a7bafff833a23835",
       "shop_id": "12345678",
       "node": "approval_gate",
       "message": "node interrupted (awaiting human decision)",
       "data": {
         "outcome": "interrupted",
-        "duration_ms": 91.6,
+        "duration_ms": 109.5,
         "input_digest": "d29a18460985b76f",
         "output_digest": null,
         "error": null
       }
     },
     {
-      "seq": 18,
-      "ts": "2026-10-24T20:54:10.788Z",
+      "seq": 21,
+      "ts": "2026-10-26T17:49:16.172Z",
       "level": "info",
       "event": "node.trace",
       "run_id": "run_20261023T142530Z_9f3c1a7b",
-      "trace_id": "0a9c009f6e374d39ba27019765a753b0",
+      "trace_id": "ff09bfecb44c4e83a7bafff833a23835",
       "shop_id": "12345678",
       "node": "propose_actions",
       "message": "node ok",
@@ -446,30 +481,63 @@
       }
     },
     {
-      "seq": 17,
-      "ts": "2026-10-24T20:54:10.730Z",
+      "seq": 20,
+      "ts": "2026-10-26T17:49:16.117Z",
       "level": "info",
       "event": "node.trace",
       "run_id": "run_20261023T142530Z_9f3c1a7b",
-      "trace_id": "0a9c009f6e374d39ba27019765a753b0",
+      "trace_id": "ff09bfecb44c4e83a7bafff833a23835",
+      "shop_id": "12345678",
+      "node": "explain",
+      "message": "node ok",
+      "data": {
+        "outcome": "ok",
+        "duration_ms": 0.3,
+        "input_digest": "f1935e729fb8ea94",
+        "output_digest": "d45ba240de14a675",
+        "error": null
+      }
+    },
+    {
+      "seq": 19,
+      "ts": "2026-10-26T17:49:16.117Z",
+      "level": "warn",
+      "event": "llm.skipped",
+      "run_id": "run_20261023T142530Z_9f3c1a7b",
+      "trace_id": "ff09bfecb44c4e83a7bafff833a23835",
+      "shop_id": "12345678",
+      "node": "explain",
+      "message": "未装配 LLM 客户端（LLM_API_KEY 为空），本轮不产出解释，流程继续",
+      "data": {
+        "reason": "no_client",
+        "anomalies": 2
+      }
+    },
+    {
+      "seq": 18,
+      "ts": "2026-10-26T17:49:16.063Z",
+      "level": "info",
+      "event": "node.trace",
+      "run_id": "run_20261023T142530Z_9f3c1a7b",
+      "trace_id": "ff09bfecb44c4e83a7bafff833a23835",
       "shop_id": "12345678",
       "node": "detect_anomalies",
       "message": "node ok",
       "data": {
         "outcome": "ok",
-        "duration_ms": 20.5,
+        "duration_ms": 2.0,
         "input_digest": "36d6d5af5052ca38",
         "output_digest": "14677a2feff64f95",
         "error": null
       }
     },
     {
-      "seq": 16,
-      "ts": "2026-10-24T20:54:10.730Z",
+      "seq": 17,
+      "ts": "2026-10-26T17:49:16.063Z",
       "level": "error",
       "event": "anomaly.detected",
       "run_id": "run_20261023T142530Z_9f3c1a7b",
-      "trace_id": "0a9c009f6e374d39ba27019765a753b0",
+      "trace_id": "ff09bfecb44c4e83a7bafff833a23835",
       "shop_id": "12345678",
       "node": "detect_anomalies",
       "message": "退款率超过 8%（refund_rate=0.333333，条件 refund_rate is not None and refund_rate > 0.08）",
@@ -487,12 +555,12 @@
       }
     },
     {
-      "seq": 15,
-      "ts": "2026-10-24T20:54:10.730Z",
+      "seq": 16,
+      "ts": "2026-10-26T17:49:16.063Z",
       "level": "error",
       "event": "anomaly.detected",
       "run_id": "run_20261023T142530Z_9f3c1a7b",
-      "trace_id": "0a9c009f6e374d39ba27019765a753b0",
+      "trace_id": "ff09bfecb44c4e83a7bafff833a23835",
       "shop_id": "12345678",
       "node": "detect_anomalies",
       "message": "有成本覆盖的成交额整体低于商品成本价（加权毛利率 < 0，且成本覆盖 ≥ 60%）（gross_margin=-0.113106，条件 gross_margin is not None and gross_margin < 0.0 and cost_coverage_ratio is not None and cost_coverage_ratio >= 0.6）",
@@ -510,12 +578,12 @@
       }
     },
     {
-      "seq": 14,
-      "ts": "2026-10-24T20:54:10.730Z",
+      "seq": 15,
+      "ts": "2026-10-26T17:49:16.063Z",
       "level": "info",
       "event": "anomaly.detected",
       "run_id": "run_20261023T142530Z_9f3c1a7b",
-      "trace_id": "0a9c009f6e374d39ba27019765a753b0",
+      "trace_id": "ff09bfecb44c4e83a7bafff833a23835",
       "shop_id": "12345678",
       "node": "detect_anomalies",
       "message": "异常检测完成：命中 2 条，跳过 0 条规则，截断 0 条",
@@ -531,30 +599,30 @@
       }
     },
     {
-      "seq": 13,
-      "ts": "2026-10-24T20:54:10.654Z",
+      "seq": 14,
+      "ts": "2026-10-26T17:49:16.007Z",
       "level": "info",
       "event": "node.trace",
       "run_id": "run_20261023T142530Z_9f3c1a7b",
-      "trace_id": "0a9c009f6e374d39ba27019765a753b0",
+      "trace_id": "ff09bfecb44c4e83a7bafff833a23835",
       "shop_id": "12345678",
       "node": "compute_metrics",
       "message": "node ok",
       "data": {
         "outcome": "ok",
-        "duration_ms": 54.3,
+        "duration_ms": 1.1,
         "input_digest": "73946c389ff5e564",
         "output_digest": "38af34f4c0a012a2",
         "error": null
       }
     },
     {
-      "seq": 12,
-      "ts": "2026-10-24T20:54:10.654Z",
+      "seq": 13,
+      "ts": "2026-10-26T17:49:16.007Z",
       "level": "info",
       "event": "metrics.computed",
       "run_id": "run_20261023T142530Z_9f3c1a7b",
-      "trace_id": "0a9c009f6e374d39ba27019765a753b0",
+      "trace_id": "ff09bfecb44c4e83a7bafff833a23835",
       "shop_id": "12345678",
       "node": "compute_metrics",
       "message": "指标已计算：2026-10-23 gmv=55700 分 gross_margin=-0.113106 cost_coverage_ratio=1.0",
@@ -568,30 +636,30 @@
       }
     },
     {
-      "seq": 11,
-      "ts": "2026-10-24T20:54:10.498Z",
+      "seq": 12,
+      "ts": "2026-10-26T17:49:15.932Z",
       "level": "info",
       "event": "node.trace",
       "run_id": "run_20261023T142530Z_9f3c1a7b",
-      "trace_id": "0a9c009f6e374d39ba27019765a753b0",
+      "trace_id": "ff09bfecb44c4e83a7bafff833a23835",
       "shop_id": "12345678",
       "node": "collect",
       "message": "node ok",
       "data": {
         "outcome": "ok",
-        "duration_ms": 4.0,
+        "duration_ms": 4.7,
         "input_digest": "70be5413499451de",
         "output_digest": "af5dfa26724a1074",
         "error": null
       }
     },
     {
-      "seq": 10,
-      "ts": "2026-10-24T20:54:10.497Z",
+      "seq": 11,
+      "ts": "2026-10-26T17:49:15.931Z",
       "level": "warn",
       "event": "collect.units_degraded",
       "run_id": "run_20261023T142530Z_9f3c1a7b",
-      "trace_id": "0a9c009f6e374d39ba27019765a753b0",
+      "trace_id": "ff09bfecb44c4e83a7bafff833a23835",
       "shop_id": "12345678",
       "node": "collect",
       "message": "有 3 条订单行缺件数/件数非正，已按 1 件计入成本口径（方向偏乐观：会漏报亏本）",
@@ -644,12 +712,12 @@
       }
     },
     {
-      "seq": 9,
-      "ts": "2026-10-24T20:54:10.497Z",
+      "seq": 10,
+      "ts": "2026-10-26T17:49:15.931Z",
       "level": "info",
       "event": "collect.done",
       "run_id": "run_20261023T142530Z_9f3c1a7b",
-      "trace_id": "0a9c009f6e374d39ba27019765a753b0",
+      "trace_id": "ff09bfecb44c4e83a7bafff833a23835",
       "shop_id": "12345678",
       "node": "collect",
       "message": "采集完成：上游给 3 行订单，3 行进入指标，0 行整行被拒（partial=true）",
@@ -667,7 +735,8 @@
         "partial": true,
         "rows_seen": 3,
         "rows_accepted": 3,
-        "rows_rejected": 0
+        "rows_rejected": 0,
+        "rows_out_of_window": 0
       }
     }
   ],

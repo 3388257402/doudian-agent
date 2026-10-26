@@ -31,6 +31,29 @@ const OUT_DIR = resolve(ROOT, ".verify");
 const LOGS_FIXTURE = JSON.parse(readFileSync(resolve(ROOT, "mock/logs.json"), "utf8"));
 const LOG_TRACE_ROWS = LOGS_FIXTURE.items.filter((item) => item.event === "node.trace");
 
+/**
+ * 某个 run 的 node.trace 条数（= 页面上 run 摘要的"步数"列）。
+ *
+ * 为什么在这里算而不是写常量：这个数字等于"节点数 + 审批重放"，节点数每加一个就要手改一次，
+ * 而手改的那次最容易顺手把**真实的回归**（比如挂起点提前/推后一步）也一起改绿。
+ * 直接从导出的 fixture 数出来，数字就永远和页面同源。
+ */
+function stepCountOf(runId) {
+  // 参数本身有问题时不要落到"fixture 缺行"那条提示上：那会把排查引向重导，
+  // 而真实原因是调用方传了空值/拼错的常量。
+  if (runId === null || runId === undefined || runId === "") {
+    throw new Error("stepCountOf 收到空 runId —— 调用点写错了，与 fixture 无关");
+  }
+  const rows = LOG_TRACE_ROWS.filter((item) => item.run_id === runId);
+  if (rows.length === 0) {
+    const known = [...new Set(LOG_TRACE_ROWS.map((item) => item.run_id))].join(", ");
+    throw new Error(
+      `fixture 里没有 run ${runId} 的 node.trace —— 先重导 mock/logs.json（现有 run：${known}）`,
+    );
+  }
+  return rows.length;
+}
+
 /** 与 `src/lib/format.ts` 的 `formatDuration` 同一口径（本脚本是纯 Node，不经过 bundler，不能直接 import .ts）。 */
 function formatDuration(ms) {
   if (ms === null || ms === undefined || !Number.isFinite(ms) || ms < 0) return "—";
@@ -63,6 +86,63 @@ function assertEqual(name, actual, expected) {
   const a = JSON.stringify(actual);
   const e = JSON.stringify(expected);
   record(name, a === e, `期望 ${e}，实际 ${a}`);
+}
+
+/**
+ * 区间断言：`lower <= actual <= upper`（actual 在**中间**，参数顺序写死，避免调用方写反）。
+ *
+ * 为什么不是精确相等：精确值会在工作流加节点时被顺手改成"当前数字"，那条断言就成了
+ * 抄写员。为什么也不是只有下限：整段**重复导出**会让步数翻倍，而那正是导出脚本最常见的
+ * 损坏形态——只保留下限会把它全绿放过。所以留出 `upper` 余量：允许扩容，挡住翻倍。
+ */
+function assertBetween(name, actual, lower, upper) {
+  // 边界自己坏了（NaN）先报边界，别报成"写反了"——后者括号里的 `NaN > x` 是假话，
+  // 会把人引向调用点参数顺序，而真正的错在产出边界的上游。
+  if (!Number.isFinite(lower) || !Number.isFinite(upper)) {
+    throw new Error(
+      `${name}: 区间边界不是有限数字（lower=${String(lower)}, upper=${String(upper)}）`,
+    );
+  }
+  if (lower > upper) {
+    throw new Error(`${name}: 区间参数写反了（lower=${lower} > upper=${upper}）`);
+  }
+  // 格式化必须自己不抛：这行处在"记录一条失败"的路径上，若它抛了，
+  // 一条普通失败会变成整个脚本中断（`String()` 对无原型对象 / 自定义 toPrimitive 会抛）。
+  const safeStr = (v) => {
+    try {
+      return String(v);
+    } catch {
+      return Object.prototype.toString.call(v);
+    }
+  };
+  // 只挡"会静默变成 0/1"的几类：Number(null)/Number([])/Number("")=0、Number(true)=1。
+  // 数字字符串**保留**——页面 textContent / 属性取回来就是字符串，一刀切 typeof
+  // 会把本来通过的检查批量变红，而且失败原因会误报成"上游数据不对"。
+  const isBlankStr = typeof actual === "string" && actual.trim() === "";
+  const notANumber =
+    actual === null ||
+    actual === undefined ||
+    isBlankStr ||
+    typeof actual === "boolean" ||
+    Array.isArray(actual);
+  if (notANumber) {
+    record(name, false, `期望 ${lower} ≤ n ≤ ${upper}，实际 ${safeStr(actual)}（空值/布尔/数组）`);
+    return;
+  }
+  // `Number(Symbol())` 会抛 TypeError（而不是给 NaN），所以转换本身也要兜住：
+  // 这行的设计是"把问题记成一条失败"，不是让整轮检查在这里中断。
+  let n;
+  try {
+    n = Number(actual);
+  } catch {
+    record(name, false, `期望 ${lower} ≤ n ≤ ${upper}，实际 ${safeStr(actual)}（无法转成数字）`);
+    return;
+  }
+  if (!Number.isFinite(n)) {
+    record(name, false, `期望 ${lower} ≤ n ≤ ${upper}，实际 ${safeStr(actual)}（不是有限数字）`);
+    return;
+  }
+  record(name, n >= lower && n <= upper, `期望 ${lower} ≤ n ≤ ${upper}，实际 ${n}`);
 }
 
 function sleep(ms) {
@@ -450,13 +530,36 @@ async function checkLogs(cdp) {
       send,
       "[...document.querySelectorAll('.run-summary-table tbody tr')].map((tr) => tr.querySelector('code').textContent + '/' + tr.children[1].textContent)",
     ),
-    // 三个 run 都是真实 demo 跑出来的（collect-failure 2 步 / 成功含审批重放 9 步 / 挂起未裁决 5 步）。
+    // 三个 run 都是真实 demo 跑出来的。步数**从 fixture 数出来**，不写常量。
+    //
+    // 为什么这样不会变成"自己验自己"：断言的**实际值来自浏览器 DOM**（页面渲染了几行），
+    // 期望值来自 fixture —— 两侧独立。页面少渲染/多渲染一行都会红，这正是本用例要守的东西。
+    // 唯一的盲区是"fixture 自己在导出时丢了行"，所以下面另有一条 run 集合与条数的下限断言。
     [
-      "run_20261023T080000Z_5e6f7a8b/2",
-      "run_20261023T142530Z_9f3c1a7b/9",
-      "run_20261023T090000Z_1a2b3c4d/5",
+      `run_20261023T080000Z_5e6f7a8b/${stepCountOf("run_20261023T080000Z_5e6f7a8b")}`,
+      `run_20261023T142530Z_9f3c1a7b/${stepCountOf("run_20261023T142530Z_9f3c1a7b")}`,
+      `run_20261023T090000Z_1a2b3c4d/${stepCountOf("run_20261023T090000Z_1a2b3c4d")}`,
     ],
   );
+  // fixture 完整性区间：重导若丢行，上面那条同源对比照样会通过——这条不会；
+  // 整段重复导出（步数翻倍）也只有这条能挡住。
+  //
+  // 上界怎么来的（不要写成"当前值 + 1"，那只是把抄写员从一个数字变成两个）：
+  //   上限 = 下限 + 4。`4` 是**允许未来的工作流再插 4 个节点**而不必改这里的余量；
+  //   它同时严格小于下限的 2 倍（10→14 < 20，6→10 < 12，2→6 ≥ 4 但 collect-failure
+  //   那个 run 只跑 collect+finalize，重复导出会变成 4 条、落在区间内——这条对它只挡丢行）。
+  //   也就是说：扩容不会误红，整段翻倍必然越界。
+  const STEP_BOUNDS = {
+    // 走完全程 + 审批恢复重放（9 个节点各一次 + approval_gate 重放 = 10）
+    run_20261023T142530Z_9f3c1a7b: [10, 14],
+    // 挂起后无人裁决：collect→compute_metrics→detect_anomalies→explain→propose_actions→approval_gate(interrupted) = 6
+    run_20261023T090000Z_1a2b3c4d: [6, 10],
+    // 整批契约坏：collect(error) + finalize(ok) = 2
+    run_20261023T080000Z_5e6f7a8b: [2, 6],
+  };
+  for (const [runId, [lower, upper]] of Object.entries(STEP_BOUNDS)) {
+    assertBetween(`日志：run ${runId} 步数在 [${lower}, ${upper}] 内（防丢行/重复导出）`, stepCountOf(runId), lower, upper);
+  }
   assertEqual(
     "日志：节点列展示节点名（collect/approval_gate/execute…）",
     await evaluate(

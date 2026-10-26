@@ -1,6 +1,6 @@
 # CONTRACT.md — 抖店智能运营 Agent 契约（单一事实源）
 
-- 版本：**1.5.2**（冻结；**v1.5.2 = 行级账目补全（纯增量）**——把 v1.5.1 漏登记/漏实现的四处补上：①`collect.row_rejected` 的 `data` **确实**带 `rows_seen` / `rows_accepted`（v1.5.1 的代码已写，本版把"不在 JSONL"那句改成事实），并新增 `rows_out_of_window`；②`collect.done` / `collect.failed` / `collect.row_rejected` 三处都带 `rows_out_of_window`，冻结行级恒等式 `rows_seen == rows_accepted + rows_rejected + rows_out_of_window`（`collect.row_rejected` 里"被拒"项就是它自己的 `count`，不重复等值键），由代码显式断言；③行级判定表补 **`no_known_fields`** 档（`{}` / `{"foo": 1}` 不是"一笔 0 元订单"）；④新增 **`collect.date_fallback`**（warn）：行被**接受**但 `create_time` 存在却不可用、靠 `pay_time` 才解析成功时必须留痕且 `source.partial=true`，**不计入** `row_rejected`。**`node.trace` 键集合、REST 形状、错误码、路由、DB 表列均未改**；v1.5.1 = 审计事件登记（§7.6.3），纯增量**——把 `backend/app/agent/nodes.py` 已经在写、契约里却没有位置的 6 个审计事件（`metrics.computed`、`anomaly.detected` 的 `summary` 与 `detail` 两形态、`collect.row_rejected`、`collect.units_degraded`、`collect.zero_revenue_paid`、`sku_costs.unmatched`）按**代码实际字段**登记进 §7.6，并补采集层**行级判定表**、`samples` 截断语义与 `source.partial` 的含义；**`node.trace` 键集合一个字都没改**，`/api/logs` 的 `event` 仍是自由字符串（前端不需要改）；v1.5.0 = 成本/毛利率落地，纯增量——§3.3 `MetricsSnapshot` 新增 `gross_margin` / `cost_coverage_ratio`（**店铺级**成本口径）、§5.3 `compute_metrics(..., cost_table=…)` 由"已入册未实现"转为**已实现**并新增数据面 `order_summary["by_sku"]`、§8.3.3 `ALLOWED_NAMES` 新增这两个名字且冻结「SKU 侧必须叫 `sku_gross_margin`」、§8.3 新增 `loss_making` 规则（**只告警不给动作**）、§8.5 补成本表实现细节并把"启动期交叉校验"改写为**运行期审计**；**未完成项见 §13 的 1.5.0 行**；v1.3.1 补 §4.7 规则 5c2 与 §7.6.1 的 `error.type`；v1.3.2 登记 `app/api/queries.py` 的只读边界与 §7.5 数据源；**v1.4.0 合并此前未登记的两批增量**——原拟 1.3.3 的 **§7.6.2 脱敏两层与「必须测通道」**（并入本版，不再单独计版本）+ 正文里**已存在但 §13 未登记**的 **SKU 维度与成本表**条文（§3.3 / §5.1 / §5.3.1 / §5.4 / §8.3.3 / §8.5 / §10.3 / §11 的 `v1.4.0` 标注自此有 §13 依据），并结清「正文标 1.4.0、版本行停在 1.3.x」的欠账；**纯增量**：不改既有签名（新增参数全部 keyword-only 带默认值）、不改表列、不改 JSON 键、不改错误码，见 §13）
+- 版本：**1.6.0**（冻结；**v1.6.0 = 新增 `explain` 旁路节点（纯增量）**——节点数 **8 → 9**，链变成 `collect → compute_metrics → detect_anomalies → explain → propose_actions → …`；`explain` 走**普通边**（它没有"要不要走另一条路"的判断，理由见 §4.2）。它读 `anomalies` + `metrics`，只写 `state.explanations` / `state.suggestions` 两段**给人看的文字**（§3.3）：**不产动作、不改 `status`、不进审批**——动作永远只由规则产出。配置走四个**新增的环境变量** `LLM_API_KEY` / `LLM_BASE_URL` / `LLM_MODEL` / `LLM_TIMEOUT_S`（不进 `config/settings.yaml`，见 §8.6）；**没配 key = 这条旁路关闭，这是合法状态**，demo 仍可离线跑。审计新增 `llm.explained` / `llm.skipped` / `llm.degraded` 三个**旁路**事件（§7.6.3）。**兼容性：`/api/*` 的响应形状未变**（`explanations` / `suggestions` 不进任何 REST 响应，§7 一个字没动）、**`node.trace` 的 5 键未变**（§7.6.1）、新增的只有 state 两个字段 + 三个审计事件 + 四个环境变量；唯一变化的数值是 §4.7 的 `step_count`（9 → 10，构成见该节）；v1.5.2 = 行级账目补全（纯增量）——把 v1.5.1 漏登记/漏实现的四处补上：①`collect.row_rejected` 的 `data` **确实**带 `rows_seen` / `rows_accepted`（v1.5.1 的代码已写，本版把"不在 JSONL"那句改成事实），并新增 `rows_out_of_window`；②`collect.done` / `collect.failed` / `collect.row_rejected` 三处都带 `rows_out_of_window`，冻结行级恒等式 `rows_seen == rows_accepted + rows_rejected + rows_out_of_window`（`collect.row_rejected` 里"被拒"项就是它自己的 `count`，不重复等值键），由代码显式断言；③行级判定表补 **`no_known_fields`** 档（`{}` / `{"foo": 1}` 不是"一笔 0 元订单"）；④新增 **`collect.date_fallback`**（warn）：行被**接受**但 `create_time` 存在却不可用、靠 `pay_time` 才解析成功时必须留痕且 `source.partial=true`，**不计入** `row_rejected`。**`node.trace` 键集合、REST 形状、错误码、路由、DB 表列均未改**；v1.5.1 = 审计事件登记（§7.6.3），纯增量**——把 `backend/app/agent/nodes.py` 已经在写、契约里却没有位置的 6 个审计事件（`metrics.computed`、`anomaly.detected` 的 `summary` 与 `detail` 两形态、`collect.row_rejected`、`collect.units_degraded`、`collect.zero_revenue_paid`、`sku_costs.unmatched`）按**代码实际字段**登记进 §7.6，并补采集层**行级判定表**、`samples` 截断语义与 `source.partial` 的含义；**`node.trace` 键集合一个字都没改**，`/api/logs` 的 `event` 仍是自由字符串（前端不需要改）；v1.5.0 = 成本/毛利率落地，纯增量——§3.3 `MetricsSnapshot` 新增 `gross_margin` / `cost_coverage_ratio`（**店铺级**成本口径）、§5.3 `compute_metrics(..., cost_table=…)` 由"已入册未实现"转为**已实现**并新增数据面 `order_summary["by_sku"]`、§8.3.3 `ALLOWED_NAMES` 新增这两个名字且冻结「SKU 侧必须叫 `sku_gross_margin`」、§8.3 新增 `loss_making` 规则（**只告警不给动作**）、§8.5 补成本表实现细节并把"启动期交叉校验"改写为**运行期审计**；**未完成项见 §13 的 1.5.0 行**；v1.3.1 补 §4.7 规则 5c2 与 §7.6.1 的 `error.type`；v1.3.2 登记 `app/api/queries.py` 的只读边界与 §7.5 数据源；**v1.4.0 合并此前未登记的两批增量**——原拟 1.3.3 的 **§7.6.2 脱敏两层与「必须测通道」**（并入本版，不再单独计版本）+ 正文里**已存在但 §13 未登记**的 **SKU 维度与成本表**条文（§3.3 / §5.1 / §5.3.1 / §5.4 / §8.3.3 / §8.5 / §10.3 / §11 的 `v1.4.0` 标注自此有 §13 依据），并结清「正文标 1.4.0、版本行停在 1.3.x」的欠账；**纯增量**：不改既有签名（新增参数全部 keyword-only 带默认值）、不改表列、不改 JSON 键、不改错误码，见 §13）
 - 维护者：spec-lead（唯一有权修改本文件的人）
 - 适用方：agent-core / platform / frontend 三方**并行开发**
 - 冻结规则：本文件中的**路径、名称、签名、字段名、枚举值、JSON 键、错误码**均为契约正文。任何一方需要偏离，必须先提给 spec-lead 改本文件并升版本，**不得**在自己代码里"先这么写"。
@@ -58,7 +58,7 @@ doudian-agent/
 │  │  │  ├─ __init__.py        # 只 re-export 四个公开入口
 │  │  │  ├─ state.py           # AgentState + 子结构（§3）
 │  │  │  ├─ graph.py           # build_graph/run_agent/resume_agent/list_pending_approvals（§4）
-│  │  │  ├─ nodes.py           # 8 个节点（§4.3）
+│  │  │  ├─ nodes.py           # 9 个节点（§4.3；v1.6.0 插入旁路节点 explain）
 │  │  │  ├─ adapters.py         # 进程级运行时装配 + 依赖解析（§4.8，ADR-017；禁止任何表仓储）
 │  │  │  ├─ checkpoint.py      # checkpoint_saver()（§5.7）
 │  │  │  └─ tracing.py         # traced() 节点包装器（§4.7，唯一允许写 step_count 的地方）
@@ -73,6 +73,8 @@ doudian-agent/
 │  │  │  ├─ rules.py           # 白名单 AST 求值（§8.3）
 │  │  │  ├─ notifier.py        # Notifier 抽象 + DryRun + Feishu（§5.6）
 │  │  │  ├─ approvals.py       # approval_request 仓储（§5.8）
+│  │  │  ├─ costs.py           # SKU 成本表加载 + 校验（§5.3.4，ADR-021；v1.5.0 登记）
+│  │  │  ├─ llm.py             # LLM 旁路客户端 + 输出 schema 校验（§8.6；v1.6.0 登记）
 │  │  │  └─ effects.py         # 快照登记 + 调度器（§5.9）
 │  │  └─ api/
 │  │     ├─ __init__.py
@@ -325,6 +327,8 @@ class ApiErrorCode(StrEnum):
 | `metrics` | `MetricsSnapshot \| None` | compute_metrics | 指标（§3.3） |
 | `history` | `list[MetricsSnapshot]` | compute_metrics | 近 7 天（含今天），用于均值/环比 |
 | `anomalies` | `list[Anomaly]` | detect_anomalies | 异常 |
+| `explanations` | `NotRequired[dict[str, str]]`（默认 `{}`） | explain | **旁路（v1.6.0）**：`anomaly_id` → 一句中文解释。只给人看，**任何决策代码不许读**（§3.3） |
+| `suggestions` | `NotRequired[dict[str, str]]`（默认 `{}`） | explain | **旁路（v1.6.0）**：`anomaly_id` → 一句建议草稿。**不是** `ActionProposal`，同上不许读 |
 | `pending_actions` | `list[ActionProposal]` | propose_actions | 待审批提议 |
 | `approved_actions` | `list[ActionProposal]` | approval_gate | 审批通过/改写后的**生效**提议 |
 | `rejected_actions` | `list[ActionProposal]` | approval_gate | 被拒（保留证据） |
@@ -491,6 +495,10 @@ class AgentState(TypedDict):
     metrics: MetricsSnapshot | None
     history: list[MetricsSnapshot]
     anomalies: list[Anomaly]
+    # v1.6.0 旁路：anomaly_id -> 一句解释（只给人看，任何决策代码不许读）
+    explanations: NotRequired[dict[str, str]]
+    # v1.6.0 旁路：anomaly_id -> 一句建议草稿（不是 ActionProposal，没有参数、没有风险等级）
+    suggestions: NotRequired[dict[str, str]]
     pending_actions: list[ActionProposal]
     approved_actions: list[ActionProposal]
     rejected_actions: list[ActionProposal]
@@ -506,6 +514,13 @@ def append_audit(state: AgentState, entry: AuditEntry) -> list[AuditEntry]:
 ```
 
 `build_graph` 用 `StateGraph(AgentState)`，**不**给任何字段加 `Annotated[..., reducer]`。
+
+**`explanations` / `suggestions` 是旁路字段（v1.6.0 冻结）**：两个都是 `NotRequired[dict[str, str]]`，键是**本次 `state.anomalies` 里出现过的 `anomaly_id`**（模型编出来的 id 由 `services/llm.py` 丢掉，不会进 state），值是一句中文人话。四条硬语义：
+
+1. **只有 `explain` 节点写它们**（外加 `graph._initial_state` 写空 dict——那是"第一份 state"，让读的人不必区分"没有这个键"与"它是空的"）。其余节点一个都不许写。
+2. **任何决策代码不许读它们**：`propose_actions` / `approval_gate` / `execute` / `record_effect` 与规则求值都不得把它们当成输入。动作**永远**只由规则（`services/actions.py`）产出，模型的话最多变成一句解释。理由不是洁癖：把"模型说了什么"和"系统要做什么"焊在同一个数据流上，迟早有人从模型输出里读出一个动作。
+3. **`NotRequired` 的原因是老 checkpoint 里没有这两个键**：读它们一律 `state.get(...) or {}`，缺键不得当成"state 不合法"（其余字段缺一个都是"漏建 state"的 bug）。
+4. **空 dict 不等于"没事"**：没有异常 / 没配 key / 模型降级三种情况的 state 长得一样。要知道是哪种，只能读审计事件（`llm.skipped` / `llm.degraded`，§7.6.3）——这是"为什么降级也必须写 `state.audit`"的由来。
 
 **`history` 里 `skus` 必须为 `[]`（v1.4.0 冻结）**：`history` 是"近 7 天店铺级对比"用的，只读其店铺级字段；7 天的 SKU 明细塞进 state 会把 LangGraph checkpoint 放大到 8×N（N = SKU 数），且没有任何消费者（SKU 级 7 日均值由 `raw` 的 7 日聚合直接算出，见 §5.3.1）。**禁止**在 `history` 元素里填 `skus`，也**禁止**新增 `sku_history` 字段（要加得先提契约变更）。
 
@@ -629,9 +644,9 @@ class AppliedDecision:
 
 ```
 START
-  └─> collect ──(ok)──> compute_metrics ──> detect_anomalies ──> propose_actions
-        │                                                              │
-        └──(fail)──> finalize <───────────────────────────────────────┘
+  └─> collect ──(ok)──> compute_metrics ──> detect_anomalies ──> explain ──> propose_actions
+        │                                                                          │
+        └──(fail)──> finalize <────────────────────────────────────────────────────┘
                                     (等待审批 / 无提议时直通)
                                           │
                                      approval_gate   ← interrupt() 发生在这里
@@ -643,9 +658,11 @@ START
                                        finalize ──> END
 ```
 
-节点名（字符串常量，**就是这些**）：`collect`、`compute_metrics`、`detect_anomalies`、`propose_actions`、`approval_gate`、`execute`、`record_effect`、`finalize`。
+节点名（字符串常量，**就是这些**）：`collect`、`compute_metrics`、`detect_anomalies`、`explain`（v1.6.0）、`propose_actions`、`approval_gate`、`execute`、`record_effect`、`finalize`。共 **9** 个。
 
-条件边：`collect → route_after_collect(state) -> Literal["compute_metrics", "finalize"]`。其余为普通边。
+条件边**恰好两条**：`collect → route_after_collect(state) -> Literal["compute_metrics", "finalize"]` 与 `propose_actions → route_after_propose_actions(state) -> Literal["approval_gate", "finalize"]`（v1.5.2 及更早的正文只登记了第一条，这是漏登记，不是只有一条）。除这两条外**全部是普通边**，包括 v1.6.0 新增的 `detect_anomalies → explain` 与 `explain → propose_actions`。
+
+**`explain` 为什么是普通边（v1.6.0 冻结）**：它**没有"要不要走另一条路"的判断**——`detect_anomalies` 之后**总是**进 `explain`，`explain` 之后**总是**进 `propose_actions`。它降级（没配 key / 超时 / JSON 坏 / schema 不符）时返回两个空 dict 并让流程继续；"这一轮是不是已经死了"由节点开头的 `_aborted(state)` 短路表达（上游已判死时直接返回 `{}`，连模型都不调）。**不要**把降级画成一条条件边：那样"旁路坏了"与"run 失败了"在拓扑上会长得一样，而这正是本节要避免的第二份真相（`status` 迁移表里也没有为 `explain` 增加任何一行）。
 
 `status` 迁移：
 
@@ -664,6 +681,7 @@ START
 async def collect(state: AgentState, config: RunnableConfig) -> dict[str, Any]: ...
 async def compute_metrics_node(state: AgentState, config: RunnableConfig) -> dict[str, Any]: ...
 async def detect_anomalies_node(state: AgentState, config: RunnableConfig) -> dict[str, Any]: ...
+async def explain_node(state: AgentState, config: RunnableConfig) -> dict[str, Any]: ...
 async def propose_actions_node(state: AgentState, config: RunnableConfig) -> dict[str, Any]: ...
 async def approval_gate(state: AgentState, config: RunnableConfig) -> dict[str, Any]: ...
 async def execute(state: AgentState, config: RunnableConfig) -> dict[str, Any]: ...
@@ -677,7 +695,8 @@ async def finalize(state: AgentState, config: RunnableConfig) -> dict[str, Any]:
 2. 节点**体内**不得捕获 `GraphInterrupt`（LangGraph 内部异常），`except Exception` 必须显式排除它。唯一允许**观察**它的是 `traced()` 包装器（§4.7 规则 5），且它只记录、不吞（ADR-016：控制流中断 ≠ 失败）。
 3. `approval_gate` 在**同一个** state 上只允许一个 `interrupt()` 调用（否则恢复值顺序语义复杂化）。
 4. 节点抛出的非 `GraphBubbleUp` 异常由 `run_agent`/`resume_agent` 兜住 → `status=failed` + `errors` 追加 + `finalize`。`GraphBubbleUp`（含 `GraphInterrupt`）不在此列：它是挂起，不是失败（§4.7 / ADR-016）。
-5. 节点签名只有 `(state, config)`，**依赖只能经 `app/agent/adapters.py` 解析**（`resolve_runtime` / `resolve_client` / `resolve_now` / `require_log_sink`，§4.8）：**禁止**在节点体内现建 `create_doudian_client()` / `get_settings()` / `JsonlLogSink`，也**禁止**定义进程级单例（§4.8 禁令 4/5）。
+5. 节点签名只有 `(state, config)`，**依赖只能经 `app/agent/adapters.py` 解析**（`resolve_runtime` / `resolve_client` / `resolve_now` / `require_log_sink` / `get_llm_client`（v1.6.0），§4.8）：**禁止**在节点体内现建 `create_doudian_client()` / `get_settings()` / `JsonlLogSink`，也**禁止**定义进程级单例（§4.8 禁令 4/5）。
+6. `explain` **不挂** `RetryPolicy` / `TimeoutPolicy`（v1.6.0，这是设计而不是遗漏）：① 旁路的规则是"失败一律降级、不重试"，而 `RetryPolicy` 会对可重试错误重发；② 它的墙钟预算（`LLM_TIMEOUT_S`，默认 5s）在内层 `services/llm.py`，图形层的超时来自 `app.request_timeout_s`（30s），套上去只会产生第二个"谁先超时"的真相。
 
 ### 4.4 `approval_gate` 的 interrupt 协议（逐字，最重要的一段）
 
@@ -858,7 +877,7 @@ async def reconcile_step_count(*, session: Session, run_id: str, sink: JsonlLogS
 ```
 
 - 该等式在 `reconcile_step_count` 执行后**必须**成立；它由 `test_trace_invariant.py` 断言（见 §10.3）。
-- `step_count` 计的是**节点执行次数**（含 `interrupt` 恢复导致的重放，也含以 `outcome="interrupted"` 结束的那次执行），**不是**唯一节点数。8 节点的一次带审批 run 正常是 9 次执行（`approval_gate` 被重放一次）。
+- `step_count` 计的是**节点执行次数**（含 `interrupt` 恢复导致的重放，也含以 `outcome="interrupted"` 结束的那次执行），**不是**唯一节点数。v1.6.0 起是 **9 节点**，一次带审批 run 正常 **10** 次执行 = 9 个节点各执行 1 次 + `approval_gate` 被重放 1 次（v1.5.2 及更早：8 节点 / 9 次）。**这个数字是"节点数 + 重放次数"，会随节点数变：任何地方写它都必须同时写清它的构成**——只写"10"（或当年的"9"）会让下一次加/删节点时没人知道该改成几，而这正是 v1.6.0 要同步改四处旧数字的原因。
 - **`outcome` 与 `level` 的对应是硬规则**（v1.2.0，ADR-016）：`ok`→`info`、`interrupted`→`info`、`error`→`error`。HITL 挂起是**正常控制流**，不许在日志/看板里染成红色——否则告警永久为红，等于没有告警。`level` 是 `outcome` 的**派生**值，判 `level` 只许看 `outcome`，不许看"有没有异常抛出"（`interrupt` 就是靠抛异常挂起的）。
 - **`outcome="error"` 有两条来源**（v1.3.1，ADR-019）：①节点抛了非 `GraphBubbleUp` 异常（规则 5b）；②节点**正常返回但把 run 从非 `failed` 推进到 `failed`**（规则 5c2，`data.error.type="NodeDeclaredFailure"`）。判据是**状态迁移**而不是"返回值里有没有 errors"：后者会把 finalize 这类"在已失败的 run 上收尾"的节点也判成 error，一个失败 run 就会长出两盏红灯。`step_count` 不因这条分支改变——计数不看 `outcome`（ADR-016）。
 - 崩溃窗口是真实存在的：JSONL 写完、DB 未更新时进程死掉 → 等式暂时不成立。**这正是要 `reconcile_step_count` 的原因**：JSONL 是 `step_count` 的事实源，`agent_traces.step_count` 是它的物化值（为了看板能 SQL 聚合而不必扫日志）。所以处置不是"假装原子"，而是"启动即对账"。
@@ -879,16 +898,17 @@ async def reconcile_step_count(*, session: Session, run_id: str, sink: JsonlLogS
 
 ### 4.8 装配层：进程级运行时与依赖解析（`app/agent/adapters.py`，冻结 v1.3.0）
 
-**为什么必须有这个文件**：§4.3 把节点签名冻结成 `(state, config)`——节点不能多收一个 `client`、`session` 或 `settings`。那"节点怎么拿到 `DoudianClient` / `Notifier` / `RuleSet` / `now` / log sink"就必须有**唯一答案**。散在 8 个节点里各自 `create_doudian_client()` 会造出 8 个连接池，而 ADR-004 要求限流桶与并发信号量必须挂在**同一个** `httpx.AsyncClient` 上——那样一来限流形同虚设。这个文件就是那个唯一答案。
+**为什么必须有这个文件**：§4.3 把节点签名冻结成 `(state, config)`——节点不能多收一个 `client`、`session` 或 `settings`。那"节点怎么拿到 `DoudianClient` / `Notifier` / `RuleSet` / `now` / log sink / LLM 客户端"就必须有**唯一答案**。散在 9 个节点（v1.6.0 起）里各自 `create_doudian_client()` 会造出 9 个连接池，而 ADR-004 要求限流桶与并发信号量必须挂在**同一个** `httpx.AsyncClient` 上——那样一来限流形同虚设。这个文件就是那个唯一答案。
 
 **它是什么**：进程级运行时装配 + 依赖解析 + JSONL 汇装配 + 摘要工具。**它不是**：任何表的仓储，也不是业务逻辑。边界见下表与禁令。
 
-**导出符号（逐字，`__all__` 冻结）**
+**导出符号（逐字，`__all__` 冻结；v1.6.0 追加 `get_llm_client` / `set_llm_client`）**
 
 ```python
-__all__ = ["AgentRuntime", "build_runtime", "digest_of", "get_log_sink", "get_runtime",
-           "refresh_log_sink", "require_log_sink", "reset_runtime", "resolve_client",
-           "resolve_now", "resolve_runtime", "set_log_sink", "set_runtime"]
+__all__ = ["AgentRuntime", "build_runtime", "digest_of", "get_llm_client", "get_log_sink",
+           "get_runtime", "refresh_log_sink", "require_log_sink", "reset_runtime",
+           "resolve_client", "resolve_now", "resolve_runtime", "set_llm_client",
+           "set_log_sink", "set_runtime"]
 ```
 
 **`AgentRuntime` 形状（逐字）**
@@ -919,6 +939,7 @@ class AgentRuntime:
 3. 依赖解析：`resolve_runtime` / `resolve_client` / `resolve_now`——**先 config 注入、后进程单例**，顺序不许反过来（测试替身必须能盖住生产单例）。
 4. 摘要工具 `digest_of(value, *, redact_keys=None)`：脱敏后 canonical JSON 的 sha256 前 16 位（§7.6.1 的 `input_digest`/`output_digest` 由它产出）。
 5. 汇生命周期：`set_log_sink` / `get_log_sink` / `refresh_log_sink` / `require_log_sink`。
+6. 进程级 LLM 客户端：`set_llm_client` / `get_llm_client`（v1.6.0，§8.6）。`None` 在这里是**有意义的值**（= 没配 `LLM_API_KEY`，`explain` 据此跳过），所以**没有** `require_llm_client()` 这种"没有就建一个"的兜底——那会把"没配"伪装成"配了但坏了"。
 
 **禁令（越界即 bug，reviewer 机械检查项）**
 1. **禁止持有任何表的仓储**：本文件不得出现 `insert_*` / `update_*` / `select(...)` / `session` 之类的数据访问代码。
@@ -2027,7 +2048,7 @@ HITL 挂起（`outcome="interrupted"`，**这是正常控制流，不是故障**
 2. **反向验证必须真做**（改完就跑，不是写在文档里）：删掉 `write()` 里对 `message` 的 `_scrub_text(...)` → `test_sink_write_scrubs_message` 必须变红；把 `data` 的 `redact_any(...)` 换成原样透传 → `test_sink_write_scrubs_data_values` / `test_sink_write_scrubs_dict_key` 必须变红。**一条"删掉实现仍然全绿"的测试等于没有测试。**
 3. 两份文件都要在（命令见 §10.3）：`backend/tests/platform/test_platform_redaction_channel.py`（通道级）与 `backend/tests/platform/test_platform_redaction_scrub.py`（函数级对抗：复合键、`Bearer` 整段吞、JSON 合法性、误伤回归）。
 
-#### 7.6.3 审计事件（JSONL，v1.5.1 新增登记；v1.5.2 补登记行级账目与 `no_known_fields` / `date_fallback`）
+#### 7.6.3 审计事件（JSONL，v1.5.1 新增登记；v1.5.2 补登记行级账目与 `no_known_fields` / `date_fallback`；v1.6.0 补 LLM 旁路三事件）
 
 **为什么有这一节（根因，不是措辞补充）**：`backend/app/agent/nodes.py` 的 `_log_audit(...)` 已经在往同一个 JSONL 汇写 6 个事件名、7 个调用点，而 §7.6 只登记过 `node.trace`——也就是说**代码长期在发一种契约里没有位置的事件形状**。这正是本项目反复出事的同一个模式（`adapters.py`、`queries.py` 都是"树里没有的文件自己长出来"：没有位置的东西不会被审查，坏了也没人知道它坏了）。本节把这些形状按**代码实际字段**登记下来；它不是新发明的形状，而是把已经在生产路径上写出的形状补记为契约。
 
@@ -2057,6 +2078,17 @@ HITL 挂起（`outcome="interrupted"`，**这是正常控制流，不是故障**
 | `collect.row_rejected` | `warn` | 有订单行**整行被拒**（字段类型/负数金额/件数非 int/`sku_id` 形状错/元素不是对象/**一个已知订单字段都没有 → `reason="no_known_fields"`**），且**不是**"全行被拒"那一档（见下表） | `kind="row_rejected"`、`count`、`reasons`、`sample_limit`、`samples_truncated`、`samples`、`excluded_from_metrics`（恒 `true`）、`rows_seen`、`rows_accepted`、`rows_out_of_window`（v1.5.2） | 归因"GMV 为什么少一截"；qa 钉住"整行不进任何指标"与行级账目恒等式（被拒项 = `count`） |
 | `collect.date_fallback` | `warn` | 行**被接受**（进入指标），但 `create_time` **存在却不可用**（falsy / 解析失败），靠 `pay_time` 才解析成功；`create_time` 键根本不存在（只给 `pay_time`）**不算**降级 | `kind="date_fallback"`、`count`、`reasons`（`falsy_value` / `unparseable`）、`sample_limit`、`samples_truncated`、`samples` | 发现"上游把 `create_time` 系统性写坏、靠 `pay_time` 兜住"——指标看起来正常，日期口径却已经悄悄变了；该行**不**进 `collect.row_rejected`，但 `source.partial=true` |
 | `sku_costs.unmatched` | `warn` | 本次**商品列表非空**且成本表里有 `sku_id` 不在商品列表中（商品列表为空时**不报**：那会是一串假警报） | `sku_ids`（升序去重）、`count` | 成本配置漂移告警（§8.5）：只记不阻断 |
+| `llm.explained` | `info` | `explain` 拿到一次**成功**结果（`ExplainResult.ok=True`）后写；每轮**至多 1 条**（`explain` 不在 `interrupt` 的重放路径上——重放从 `approval_gate` 开头开始） | `count`（落进 `state.explanations` 的条数）、`suggestions`（落进 `state.suggestions` 的条数——**这个键名后面跟的是计数，不是文本**） | "这轮模型到底答上了几条"；**这是一个旁路事件：它出现不改变任何业务结论** |
+| `llm.skipped` | `warn` | **有异常**但装配层没装客户端（`LLM_API_KEY` 为空 → `build_llm_client` 返回 `None`）。这是**开关**不是故障：节点立刻返回，不抛、不阻塞、不重试。没有异常 / 上游已判死（`_aborted`）→ **一条都不写** | `reason`（恒 `"no_client"`）、`anomalies`（本轮异常条数） | 让"这条旁路不在场"可查，而不是被误读成"模型今天没说话"；**这是一个旁路事件：它出现不改变任何业务结论** |
+| `llm.degraded` | `warn` | 两种来源：①四类失败之一；②**成功但丢了条目**——模型给出本次输入之外的 `anomaly_id`、或给了空白文案（此时 `reason="schema_mismatch"`、`detail="unknown_or_blank_id"`，且同一轮**先**有一条 `llm.explained`） | `reason`（闭合枚举：`timeout` / `http_error` / `bad_json` / `schema_mismatch`）、`detail`（**不含模型原文**：异常类名 / pydantic 错误形状 `type@loc` / `"no_message_content"` / `"unknown_or_blank_id"`）、`unexplained`（本轮没解释的异常条数）、`dropped`（**只在来源②出现**：被丢掉的条目数） | 排障必须分叉：`bad_json` 是"模型/网关坏了"（改 prompt 没用）、`schema_mismatch` 是"prompt 被理解歪了"（要改 prompt）——合成一个 reason 就等于放弃这个判断；**这是一个旁路事件：它出现不改变任何业务结论** |
+
+**LLM 旁路三个事件的补充规则（v1.6.0，同样是代码事实，不是建议）**
+
+- **三条都是旁路事件：出现或消失都不改变任何业务结论**。它们不产 `ActionProposal`、不改 `status`、不影响审批与执行——"模型说了什么"只落在 `state.explanations` / `state.suggestions`（checkpoint 里），审计与日志只留"答上了几条"。
+- **写序是有意的**：`llm.explained` 先写、`llm.degraded` 后写（"成功但丢了条目"时两条并存）。反过来写会让日志读成"先坏了、后好了"。
+- **`llm.skipped` 只在"有异常但没客户端"时出现**：`state.anomalies` 为空时 `explain` 直接返回（一条都不写，连模型都不调）——"今天没有异常"由 `anomaly.detected(count=0)` 一张嘴说清，这里不再补第二张。
+- **`unexplained` 的两种口径**：降级那一支 = 本轮异常条数（一条都没解释）；"丢了条目"那一支 = `len(anomalies) - len(explanations)`（丢了之后还剩几条没解释）。两处都**不是**"失败次数"。
+- **`llm.ready` 故意不登记**：`app.main` 的 `_build_llm` 在**启动期**写一条进程级事件（`enabled` / `model` / `base_url` / `timeout_s`，**没有** `run_id`），它与 `app.started` / `app.sku_costs_loaded` / `config.startup_warning` 同属"启动横幅"，不是 run 的审计事实。要查"这条旁路在不在场"，用 `event=llm.` 前缀在 `/api/logs` 上能同时看到它与 run 级的三条。
 
 补充规则（每条都是代码事实，不是建议）：
 
@@ -2451,6 +2483,8 @@ LOG_LEVEL=INFO
 
 环境变量名与 yaml 字段的映射由 `Settings` 显式声明（`DATABASE_URL` → `database.url` 等），**不搞**自动前缀推导歧义。
 
+**上面这 10 个键是"覆盖 `settings.yaml`"的环境变量**（v1.6.0 没有往这套映射里加键）。LLM 旁路的四个变量（`LLM_API_KEY` / `LLM_BASE_URL` / `LLM_MODEL` / `LLM_TIMEOUT_S`，§8.6）**不在这个映射里**：它们由 `app/services/llm.py` 的 `config_from_env()` 直接读 `os.environ`，**根本不经过 `Settings`**。因此"把 `LLM_*` 写进 yaml"没有任何效果，生效判据只有"进程环境里有没有值"；同时本节的 10 键清单**不代表**环境变量的全集（`.env.example` 这个文件本身归 devops，§0.1，本契约只冻结变量名与语义，不逐个描述文件的当前行数）。
+
 ### 8.5 `config/sku_costs.yaml`（SKU 成本表，v1.4.0 入册 / **v1.5.0 已实现**，冻结）
 
 ```yaml
@@ -2491,6 +2525,23 @@ costs:
 1. **抖店开放平台没有成本字段**。任何"从历史售价/采购单反推成本"的做法都是猜测；猜测直接决定"是否亏本"的判断结果，比没有这个指标更危险。
 2. **缺失 ≠ 0**。把缺失当 0 成本时，覆盖部分的毛利额等于成交额 → `gross_margin = 1.0`（看起来暴利，规则永不触发，问题被藏起来）；而一旦有人写成**反方向**（缺成本时把该 SKU 当"成本 0 参与"，或干脆把 margin 当 0），`0 < 阈值` → 直接判亏本 → 触发改价/下架。**误报里最贵的一种**：Agent 主动把好货降价。所以缺失的唯一正确表达是 `None`，且 `None` 必须让规则**不触发**（§8.3.3）。
 3. **成本不进 DB**（不做第 5 张表）。原因是双向的：①它是**商家自维护的配置**，随部署走、要能 code review，不是运行时业务数据；②§4.7 断言 B′ 冻结"`__tablename__` 恰好 4 行"，加表要动断言、动迁移、动 §6——为一个几乎不变的映射表付这个代价不值得。若将来要支持"按时间生效的成本"（成本会变），那时再提契约变更加 `sku_cost_history` 表，别现在猜。
+
+### 8.6 LLM 旁路的环境变量（v1.6.0，只读 `os.environ`，**不进** `config/settings.yaml`）
+
+四个变量，全部由 `backend/app/services/llm.py` 的 `config_from_env()` **一处**读取，且只在**装配层**（`app.main` lifespan 的 `_build_llm`）调用一次：
+
+| 变量 | 默认 | 语义 | 坏值怎么办 |
+|---|---|---|---|
+| `LLM_API_KEY` | 空 | **空 = 关闭这条旁路**，这是**合法状态**（`LlmConfig.enabled=False` → `build_llm_client` 返回 `None` → `explain` 写一条 `llm.skipped` 后跳过） | **不校验有效性**：配了但没权限，只会在第一次调用时表现成 `llm.degraded(http_error)` |
+| `LLM_BASE_URL` | `https://api.deepseek.com` | OpenAI 兼容网关的**根**地址（代码自己拼 `/chat/completions`）；尾部斜杠会被去掉 | 不以 `http://` / `https://` 开头（例如漏了协议）→ **启动期** `ConfigError`。不这样做的话 httpx 要等到第一次请求才炸，那时进程早已"启动成功" |
+| `LLM_MODEL` | `deepseek-chat` | 请求体里的 `model` | 空串按"没配"取默认值 |
+| `LLM_TIMEOUT_S` | `5`（秒） | 整次解释的**墙钟**预算：外层 `asyncio.timeout` + httpx 四段超时，用同一个值 | 非数字 / ≤ 0 → **启动期** `ConfigError`（0 或负数等于"永远超时"，不是"关掉超时"）；空串按"没配"取默认值 |
+
+- **空串 = 没配**，与 `config.build_settings` 对 `FOO=` 的处理一致：`LLM_*=` 不是配置错误。
+- **写坏必须在启动期炸**：`LLM_TIMEOUT_S=abc`、`LLM_BASE_URL=api.deepseek.com` 一律让进程非 0 退出，与 §8.1「配置问题不许等到第一个请求才炸」是同一条规矩。理由具体到这条旁路——它失效的表现是"解释一直是空的"，没有任何人会因此怀疑"我把超时写坏了"。
+- **没配 key 时 demo 仍能离线跑**：`explain` 没有客户端就直接返回两个空 dict（外加一条 `llm.skipped`），主链路（采集→指标→异常→提议→审批→执行→效果）一行都不少，`node.trace` / `step_count` 也照旧（旁路节点的执行也算一次执行）。因此 §10.4 的"零网络、零凭据"跑法**不需要**这四个变量里的任何一个。
+- **为什么不开一个 `settings.yaml` 的 `llm:` 段**：§8.1 的段/键白名单是**冻结**的（未知字段一律 `ConfigError`），加一段要走契约变更流程；而这条旁路的第一原则是"没配就当它不存在"，它的开关天然是"有没有那把 key"，所以配置读取集中在一个模块里。
+- **地址与模型会进启动日志，`api_key` 永远不进**：`llm.ready`（§7.6.3 的「LLM 旁路三个事件的补充规则」最后一条）只写 `enabled` / `model` / `base_url` / `timeout_s`。
 
 ---
 
@@ -2589,7 +2640,8 @@ costs:
 | `test_idempotency_key.py` | 审批改价（9900→9600）产生的 `idempotency_key` 与改前不同；同参数重复执行第二次 `skipped_duplicate` |
 | `test_effects_scheduler.py` | 图内不 sleep：`record_effect` 用时 < 1s 且 `effect_snapshot` 有 4 行 `scheduled`；调度器把 `due_at<=now` 的置 `evaluated` |
 | `test_attribution_wording.py` | 非 A/B 的 `conclusion` 不含因果断言词（§5.9.3） |
-| `test_trace_invariant.py` | 跑完一次带审批的 run 后 `count(event=="node.trace") == agent_traces.step_count`（§4.7 不变量）；`approval_gate` 重放后计数为 9 而非 8；人为把 DB 计数改小后 `reconcile_step_count` 能校准回来；**挂起那次事件 `data.outcome=="interrupted"` 且 `level=="info"`、`data.error is None`**（不得是 `error`）；`collect` 抛 `DoudianUpstreamError` 时 `outcome=="error"` 且 `level=="error"`；`GraphRecursionError` 归 `error` 不归 `interrupted` |
+| `test_trace_invariant.py` | 跑完一次带审批的 run 后 `count(event=="node.trace") == agent_traces.step_count`（§4.7 不变量）；`approval_gate` 重放后计数为 **10 而非 9**（v1.6.0 起：9 个节点 + `approval_gate` 重放一次；v1.5.2 及更早是 9 而非 8）；人为把 DB 计数改小后 `reconcile_step_count` 能校准回来；**挂起那次事件 `data.outcome=="interrupted"` 且 `level=="info"`、`data.error is None`**（不得是 `error`）；`collect` 抛 `DoudianUpstreamError` 时 `outcome=="error"` 且 `level=="error"`；`GraphRecursionError` 归 `error` 不归 `interrupted` |
+| `test_llm_explain_node.py` | **`explain` 旁路（v1.6.0，§3.3 / §7.6.3）**：成功 → state 里有 `explanations` / `suggestions` 且写一条 info 级 `llm.explained`；**没装配客户端 → 两个空 dict + `llm.skipped`，绝不抛**；超时 → `llm.degraded(reason="timeout")` 且主链路照常；模型给出本次输入之外的 id / 空白文案 → 同一轮是 `["llm.explained", "llm.degraded"]`（后者 `reason="schema_mismatch"` + `dropped`）；**没有异常 / 上游已判死 → 一次模型调用都不发**；配置侧：`LLM_API_KEY` 为空 = 关闭（合法状态，不是错误）、`LLM_TIMEOUT_S` 坏值在 `config_from_env` 就抛 `ConfigError`（启动期，不是等第一次请求） |
 | `test_api_contract.py` | 5 个端点的成功/400/404/409/502 全绿；错误包络字段齐全；响应头有 `X-Trace-Id` |
 | `test_platform_redaction_channel.py` | **通道级**脱敏断言（v1.3.3，§7.6.2；与 `test_platform_redaction_scrub.py` 是一对）：`JsonlLogSink.write` 的 `message` 带 `access_token=SECRET-abc123` → **落盘文件里查不到该串**；`data` 的字符串值同样；`data={"access_token": SECRET}` 的**键名层**仍然命中（值级层不能取代它）；同目录的 `test_platform_redaction_scrub.py` 钉住函数级对抗——复合键 `refresh_token`/`client_secret`、`Authorization: Bearer xxx` 整段吞（不只遮 `Bearer`）、`{"token":{"v":1}}` 遮成 `"***"` 后仍是合法 JSON、`design=1`/`sign_method=` 不误伤。**反向验证**：删掉 `write()` 里的 scrub → 前三条必须变红 |
 | `test_static_invariants.py` | 用 subprocess 跑 §4.7 三条 grep 断言并比对期望：A 只命中 `tracing.py`、B′ 恰好 4 行全在 `models.py`、C `class AgentRuntime` 恰好 1 行；**断言按"赋值/增量/定义"形态匹配，不按名字出现次数**（否则 `nodes.py` 的 `import reconcile_step_count` 会假阳性，见 §4.7 断言取向）；另断言 `adapters.py` 内无 `insert_`/`update_`/`select(`/`session` 等数据访问（§4.8 禁令 1）；**v1.4.0 追加**：`grep -rn "cost_cents or 0\|gross_margin or 0" backend/app` 为空（§8.5） |
@@ -2623,8 +2675,8 @@ G:\SN\doudian-agent\.venv\Scripts\python.exe -m uvicorn app.main:app --app-dir b
 
 **agent-core**
 - [ ] `AgentState` 字段名逐个照抄 §3.3，order 不重要，**名字必须一致**
-- [ ] 节点函数名/签名照抄 §4.3；只有 8 个节点
-- [ ] **8 个节点全部用 `traced()` 包起来**，且 `step_count` 只由 `tracing.py` 写（§4.7）
+- [ ] 节点函数名/签名照抄 §4.3；只有 9 个节点（v1.6.0 起，含旁路节点 `explain`）
+- [ ] **9 个节点全部用 `traced()` 包起来**，且 `step_count` 只由 `tracing.py` 写（§4.7）
 - [ ] `interrupt` payload 与恢复 payload 形状照抄 §4.4
 - [ ] 恢复用 `{interrupt_id: payload}`，不用 list
 - [ ] `approval_request` 的 upsert 是 insert-if-absent
@@ -2635,6 +2687,7 @@ G:\SN\doudian-agent\.venv\Scripts\python.exe -m uvicorn app.main:app --app-dir b
 - [ ] **v1.4.0**：`detect_anomalies` 按 §5.4 写**两轮**（店铺轮 + 每 SKU 一轮），轮次由「`when` 引用的名字是否含 SKU 级名字」判定，**不自创 `scope` 参数**（§1.1）；`anomaly_id` 含 `sku_id`（`sha256(f"{run_id}|{rule_id}|{metric}|{sku_id or ''}")[:16]`）；`Anomaly.sku_id` 贯通到 `ActionProposal.target` 与 `evidence.sku_id`
 - [ ] **v1.4.0**：`SHOP_NAMES` / `SKU_NAMES` 两个常量集合在 `services/rules.py` 里且**互斥**（`load_rules` 断言）；`None` 参与比较 → `False` 且**不进 skipped**；真错误 → `RuleEvalError` 且**进 skipped**（两者分开记，§5.4）
 - [ ] **v1.4.0**：`config/sku_costs.yaml`（§8.5）由 agent-core 维护；缺条目 → `cost_cents=None`，**绝不填 0**；`grep -rn "cost_cents or 0\|gross_margin or 0" backend/app` 为空
+- [ ] **v1.6.0**：`explain` 只写 `explanations` / `suggestions` 与三条 `llm.*` 审计，**不产动作、不改 `status`、不进审批**（§3.3 的四条硬语义）；它走**普通边**且不挂 `RetryPolicy` / `TimeoutPolicy`（§4.2 / §4.3 规则 6）；四个 `LLM_*` 只经 `services/llm.config_from_env()` 读，`LLM_BASE_URL` / `LLM_TIMEOUT_S` 写坏必须在**启动期**抛 `ConfigError`，而 `LLM_API_KEY` 为空是**合法状态**（§8.6）
 
 **platform**
 - [ ] ORM 列名/类型/唯一约束照抄 §6.1
@@ -2836,6 +2889,16 @@ export interface LogsResponse {
 | 1.5.0 | 2026-10-24 | **成本/毛利率落地（纯增量）**：把 v1.4.0 里"已入册、代码未实现"的**成本表 + 店铺级毛利率**真正实现，并把三处"写不出来 / 做不到 / 会误伤"的条文改成可执行形态。**① 已落地**：(a) **§3.3 `MetricsSnapshot` 新增 `gross_margin` / `cost_coverage_ratio`**（`float` 或 `None`，**店铺级**口径）；(b) **§5.3 `compute_metrics(..., cost_table=…)` 由"已入册未实现"转为已实现**，补两条公式（只对有成本 SKU 加权；覆盖率 = 有成本成交额 / 全店 GMV；分母 0 → `None`；**覆盖率不裁剪**，`> 1` 用于暴露上游汇总与明细对不上）+ 6 条数据形状错误的 `ValueError` 边界；(c) **新增数据面 `order_summary["by_sku"] = {sku_id: {gmv_cents: int, units: int}}`**：只统计**已支付**订单行、无 `sku_id` 的已支付行只进 GMV 分母（计为未覆盖）、**退款单仍计入**、件数缺失按 1 件（**偏乐观**：成本被少算 → 毛利率偏高 → 只会**漏报**亏损，不会误报；算例见 §5.3 边界表）、件数非 int / 负数 → `ValueError`；(d) **§8.3.3 `ALLOWED_NAMES` 新增 `gross_margin` / `cost_coverage_ratio`（店铺级）**，店铺级名字 13→15（12 个指标名 + 3 个派生量，并更正原文"12+3=15"的计数错误）、SKU 轮命名空间 23→25 键；(e) **§8.3 `rules.yaml` 新增 `loss_making`**：`severity=critical`、`metric=gross_margin`、条件含 `cost_coverage_ratio >= 0.6`、**无 `actions`（只告警）**；(f) **§8.5 补实现细节**：顶层 `version` / `effective_from` / `costs`、值 `int > 0`、键 `^[A-Za-z0-9_-]{1,64}$`、**重复键 → `ConfigError`**（PyYAML 默认静默取后者，加载器自检）、空值 / 0 / 负数 / float / 字符串 / bool → `ConfigError`、非 UTF-8 → `ConfigError`、**文件缺失 → 记 warn、视为空表**；(g) **§7.5 `MetricPoint` 新增两个可选字段**（默认 `null`，老 checkpoint 无这两个键仍通过校验）。**② 三条裁定（ADR-021）**：(h) **命名冲突**——`gross_margin` 被**店铺级**占用，而 §8.3.3 的 SKU 名字集合里原本也写着它，现冻结硬规则：**SKU 轮次落地时 SKU 侧必须命名 `sku_gross_margin`**，两集合互斥断言触发时必须报**明确错误**并指向本条，**不允许静默失败**；(i) **`loss_making` 无 `actions` 的取舍**——店铺级加权毛利率**指不出具体 SKU**，现有动作类型都要求确定 `target`，用"GMV 最高 SKU"去猜会给好货降价 / 下架，所以**只告警不给动作**；(j) **§8.5 的"启动期校验成本键能在 `raw.products` 里对上"物理上做不到**（启动期没有 `raw`），改写为**运行期在 `compute_metrics` 节点审计 `sku_costs.unmatched`**（只记不阻断；商品列表为空时不报）。**③ 完成情况（逐条按实际状态；"未完成"不得读作"已完成"，"已结清"也不许留在"未完成"里）**：(k) **已结清**（原列在"未完成项"里是归类错误，v1.5.1 更正）：**前端 TS 类型已同步（原"未同步"已结清）**——`frontend/src/api/types.ts` 的 `MetricPoint` 已加 `gross_margin?: number | null` / `cost_coverage_ratio?: number | null`，§12 的逐字块在同一次提交里改完（`verify.mjs` 的 §12 diff 绿）；看板的毛利率已改为**零计算读后端字段**，契约外字段 `cost_cents` 与那套 `(GMV−退款−成本)/(GMV−退款)` 公式**已删除**，并加了"只给 cost_cents 时必须算不出数"的反向断言锁死回潮；(l) **未完成（设计债）**：**alert-only 的 anomaly 不出现在 `/api/alerts`**——该端点读 `approval_request` 表，只有**产生了审批行**的异常才可见，因此运营**从审批台看不到** `loss_making`，当前唯一可见通道是 `/api/logs` 的 `anomaly.detected`（summary 含 `rule_ids`，**detail 行还带 `observed` / `threshold` / `severity`**，形状见 §7.6.3）与 `metrics.computed`（含两个成本字段）；**需要一个独立的告警出口，属于设计债，不是本次实现**。**代码锚点**：`backend/app/services/costs.py`（新）、`backend/config/sku_costs.yaml`（新）、`backend/app/services/metrics.py`、`backend/app/agent/state.py`、`backend/app/agent/nodes.py`、`backend/app/services/rules.py`、`backend/app/services/anomalies.py`、`backend/app/main.py`、`backend/app/schemas.py`、`backend/config/rules.yaml`、`backend/tests/platform/test_platform_gross_margin.py`（**34 用例全绿**）。 | 全部（agent-core：成本表加载器 + 毛利率 / 覆盖率公式 + `by_sku` 归集 + 未匹配审计；platform：lifespan 加载成本表、`MetricPoint` 两个默认 `null` 的字段；qa：`test_platform_gross_margin.py` 34 例；**frontend：无需改动**——§12 净改动为零，但**看板口径已对齐（`types.ts` + §12 逐字块 + 看板取值 + `verify-suite.ts` 断言同一次提交完成；基线 verify 的 27/28 红也已修，根因是 §12 正文内嵌围栏标记），**(k) 已结清**（v1.5.1 更正：原文把它列进"未完成项"是归类错误）**；reviewer：新增可查项——正文里每一处 `v1.5.0` 标注都要能在本行找到落点，且"未完成项"不得被读成"已实现"） |
 | 1.5.1 | 2026-10-25 | **审计事件登记（纯增量）**：§7.6 新增 **7.6.3「审计事件（JSONL）」**，把 `nodes.py` 已在写、契约里却没有位置的形状补登记。**① 已登记（正文与代码同时成立）**：(a) 与 `node.trace` 的分工表（谁写、`data` 键集合、条数、靠 `event` 名区分；`node.trace` 仍只由 `tracing.py` 写、键集合未改）；(b) 7 行事件表：`metrics.computed`（`info`，`date` / `gmv_cents` / `history_days` / `gmv_7d_avg_cents` / `gross_margin` / `cost_coverage_ratio`）、`anomaly.detected` 的 `kind="summary"`（`info`，`count` / `rule_ids` / `skipped` / `dropped`）与 `kind="detail"`（`level` 由 `severity` 派生 `critical→error` / `warn→warn` / `info→info`，`anomaly_id` / `rule_id` / `metric` / `observed` / `threshold` / `comparator` / `severity` / `window` / `detected_at`）、`collect.units_degraded` / `collect.zero_revenue_paid` / `collect.row_rejected`（均 `warn`：`kind` / `count` / `reasons` / `sample_limit` / `samples_truncated` / `samples`，`row_rejected` 另有 `excluded_from_metrics=true`）、`sku_costs.unmatched`（`warn`：`sku_ids` / `count`）；(c) **`anomaly.detected` 两形态的硬规则**：消费方按 `data.kind` 分支，**禁止**用"有没有 `rule_id`"猜（临时做法作废）；明细行带 `observed` / `threshold` / `severity`，因此 §8.3 "alert-only 规则的唯一可见通道"由"只有 `rule_ids`"升级为"有明细"；(d) **采集层行级判定表**（一行脏 → 整行拒绝且不进任何指标；能猜出含义 → 有界降级；整批契约坏 → 硬失败不 500；全行被拒（`rows_seen>0` 且 `rows_accepted==0`）→ 视同整批失败；零行 → 正常成功），并写明"整批坏与全行被拒在 JSONL 上**没有** `collect.*` 事件，只有 `node.trace` 的 `outcome="error"`"；(e) `samples` 截断（`count` 是全量、`sample_limit` 当前 5、`samples_truncated`）与三种事件的样本 schema；(f) `source.partial` 的语义（"这份指标不完整"≠"出错了"，且**目前不在任何 REST / JSONL 出口**）；(g) 脱敏沿用 §7.6.2 两层，并写明"写盘失败是旁路失败"；同时明确 **`action.proposed` / `approval.decided` / `action.executed` / `effect.registered` / `run.finished` 仍只进 `state.audit`、不进 JSONL**，而 **`collect.done` / `collect.failed` 本版起进 JSONL**（见本节末）（登记它们等于许一个 `/api/logs` 永远查不到的空承诺）。**② 顺带更正（v1.5.0 行）**：把 1.5.0 行的 (k)（前端 TS 类型已同步）从"未完成项"里移出并标"已结清"（原文与实际不符），(l) 的"唯一可见通道"补上明细行指针。**③ 未修（属前端夹具，不在本次范围）**：`frontend/mock/logs.json` 的 `anomaly.detected`（`data` 只有 `anomaly_ids`、无 `kind`）与 `metrics.computed`（缺 `date` / `history_days` / 两个成本字段）仍是旧形状，按 §7.6.3 属**不合规夹具**；`frontend/mock/logs.json` 里还有 `collect.started` / `approval.requested` 两个 backend **没有生产者**的事件名（`frontend/src/mock/mockServer.ts` 同样在写这两个），因此 `python backend/tests/fixtures/demo/check_event_names.py frontend/mock/logs.json` 现在是**红**的（exit 1） | 全部（platform：`/api/logs` 原样透传、`event` 前缀匹配不变，**不按事件名做分支**；agent-core：新事件必须走 `_log_audit`（不得自建 logger），`node.trace` 不得加键；frontend：非 trace 行仍按 `level` 展示、按 `event` 前缀过滤，**若渲染 `anomaly.detected` 必须按 `data.kind` 分支**；qa：`test_node_audit_sink.py` / `test_collect_row_contract.py` 已覆盖，新增形状沿用"读回落盘文件"的验收方式；reviewer：新增可查项——正文里每一处 event 名都要能在 `nodes.py` 找到 `_log_audit` 调用点，反之亦然） |
 | 1.5.2 | 2026-10-25 | **行级账目补全（纯增量）**：①**把"契约没跟上代码"改对**——v1.5.1 的代码已把 `rows_seen` / `rows_accepted` 写进 `collect.row_rejected` 的 `data`，正文却写"不在 JSONL，除非先改本节"；本版按代码改正，并补 `rows_out_of_window`（`_aggregate_orders` 早已在算、但没进任何事件）。②`collect.done` / `collect.failed` / `collect.row_rejected` 三处都带 `rows_out_of_window`，冻结行级账目恒等式 `rows_seen == rows_accepted + rows_rejected + rows_out_of_window`（`collect.row_rejected` 的被拒项就是它自己的 `count`），并由 `_check_row_accounting` 在每个出口写入前显式断言。③行级判定表补 **`no_known_fields`** 档（`{}` / `{"foo": 1}` 不是"一笔 0 元订单"）。④新增 **`collect.date_fallback`**（warn）：行被**接受**但 `create_time` 存在却不可用（falsy / 解析失败）、靠 `pay_time` 才解析成功时必须留痕且 `source.partial=true`，**不计入** `row_rejected`（否则"上游把 `create_time` 全写成 `False`"永远查不出来）。⑤顺带把 §7.6.3 里与代码不符的可见性/键集合改对：`collect.done` **没有** `source`、`collect.failed` 的键集合、`collect.failed.reason` 三档、`source.partial` 已在 JSONL、`_business_date_of` 不再接 `TypeError`。**为什么升 1.5.2 而不是写成"1.5.1 的登记补全"**：本版不只是文字追上代码，还新增了 JSONL 键（`rows_out_of_window`）、新事件名（`collect.date_fallback`）与新行为（日期降级置 `source.partial=true`）；按 §0 的冻结规则，这些必须占一个补丁版本号，否则"冻结的 1.5.1 正文"仍会与代码不一致。历史 1.5.1 行保留不改。**代码锚点**：`backend/app/agent/nodes.py`（`_row_business_date` / `_read_order_row` / `_aggregate_orders` / `_check_row_accounting` / `collect`）；测试 `backend/tests/agent_core/test_collect_row_contract.py`。**未完成项**：无 | 全部（agent-core：新增/补全事件与键；platform：`/api/logs` 原样透传、前缀过滤，**不改代码**；frontend：非 `node.trace` 行按 `level` 展示，**不改代码**；qa：新增 8 条用例（falsy 日期回落留痕 / 4 桶恒等式 / 全窗口外失败 / TypeError 两处口径）；reviewer：新增可查项——每个 `rows_*` 键都能在对应出口找到，恒等式在代码里有显式 `raise`） |
+| 1.6.0 | 2026-10-27 | **新增 `explain` 旁路节点（纯增量）**：①**§4.2 拓扑**——节点数 8 → 9，`detect_anomalies → explain → propose_actions` 是两段**普通边**（理由：它没有"要不要走另一条路"的判断；降级也继续往下走，"这一轮死了没有"由 `_aborted` 短路表达），并**更正**旧正文"条件边只有一条"的漏登记（`propose_actions → route_after_propose_actions` 也是一条）；②**§4.3** 增 `explain_node` 的逐字签名 + 新规则 6（不挂 `RetryPolicy` / `TimeoutPolicy`）+ 规则 5 的依赖白名单补 `get_llm_client`；③**§3.2 / §3.3** 新增 `explanations` / `suggestions`（`NotRequired[dict[str, str]]`，键是本次的 `anomaly_id`），并冻结四条硬语义（只有 `explain` 写、**任何决策代码不许读**、老 checkpoint 缺键要容忍、空 dict ≠ 没事）；④**§4.7** `step_count` 9 → 10，并写清构成（9 个节点 + `approval_gate` 重放一次）与"写这个数字必须同时写清构成"；⑤**§7.6.3** 补三行：`llm.explained`（info，`count` / `suggestions`）、`llm.skipped`（warn，`reason="no_client"` / `anomalies`）、`llm.degraded`（warn，`reason` ∈ `timeout` / `http_error` / `bad_json` / `schema_mismatch` + `detail` + `unexplained`，来源②另有 `dropped`），三行都标"旁路事件：不改变任何业务结论"，并写明 `llm.ready` 属启动横幅**故意不登记**；⑥**§8.4 补说明 + 新增 §8.6**：`LLM_API_KEY`（空 = 关闭，合法状态）/ `LLM_BASE_URL`（默认 `https://api.deepseek.com`）/ `LLM_MODEL`（默认 `deepseek-chat`）/ `LLM_TIMEOUT_S`（默认 5，写坏在**启动期**抛 `ConfigError`），并写明没配 key 时 demo 仍能离线跑、这四个变量**不进** `settings.yaml`；⑦**§4.8** `__all__` 逐字块补 `get_llm_client` / `set_llm_client`，职责补第 6 条；⑧§0.1 文件树里 `nodes.py` 的注释 8 → 9；⑨§11 自检清单两条写死 8 的改成 9，并新增一条 v1.6.0 项。**代码锚点**：`backend/app/services/llm.py`、`backend/app/agent/nodes.py`（`_explain_input` / `_explain_degraded` / `explain_node`）、`backend/app/agent/state.py`、`backend/app/agent/graph.py`、`backend/app/agent/adapters.py`、`backend/app/main.py`（`_build_llm` + lifespan）；测试 `backend/tests/agent_core/test_llm_explain_node.py`、`backend/tests/agent_core/test_graph_paths.py`、`backend/tests/api/test_api_flow.py`。**未完成项**：无 | 全部（agent-core：`explain` 节点 + state 两字段 + `adapters` 两个导出；platform：`/api/logs` 原样透传（**不改代码**）、lifespan 装配 `_build_llm` / `set_llm_client`；frontend：**无需改动**；qa：三条 `llm.*` 的用例；reviewer：新增可查项——三事件都走 `_log_audit` 出口、`explanations` / `suggestions` 没有任何决策代码读取） |
+
+**1.6.0 的兼容性**：**纯增量：`/api/*` 的响应形状未变、`node.trace` 的 5 键未变**。具体：
+- **REST 一字未动**：`explanations` / `suggestions` **只活在 checkpoint 的 state 里**，`/api/agent/run`、`/api/alerts`、`/api/approve`、`/api/metrics`、`/api/logs` 的请求与响应键一个都没加（§12 的 TS 类型净改动为零）。
+- **`node.trace` 一字未动**：`data` 仍是 5 键、`outcome` 仍是三态、`message` 仍是三种取值。新增的三条是**新事件名**；`/api/logs` 的 `event` 本来就是自由字符串、只做前缀匹配，服务端不需要枚举校验，前端不需要改代码（未知事件名原样显示）。
+- **旧 checkpoint 仍能读**：两个新字段是 `NotRequired`，老 state 里没有它们不算不合法（读侧一律 `state.get(...) or {}`）；**不需要回填、不需要重跑**。
+- **唯一的数值变化是 §4.7 的 `step_count`（9 → 10）**，而它是"节点数 + 重放次数"的派生量，不是行为变化：带审批的一轮会多一条 `node.trace`（`explain`）与一条 `llm.*`（没配 key 时是 `llm.skipped`）——那是节点真的执行了。
+- **没配 `LLM_API_KEY` 时行为变化为零**：`explain` 立刻返回两个空 dict + 一条 `llm.skipped`（warn），不联网、不阻塞、不改任何决策与状态迁移；§10.4 的离线跑法不受影响。
+- **配了 key 时唯一的变化仍是旁路**：多两条**文字**（给人看）+ 一条 `llm.explained`；四类失败一律降级成 `llm.degraded`，**不重试、不抛出**（旁路没有资格占用第二次机会，也没有资格让主链路失败）。
+- **`.env.example` 逐行内容不在本契约里**（那个文件归 devops，§0.1）：四个变量的**名字与默认值**由 §8.6 冻结，用不用只取决于进程环境里有没有值；它们不覆盖 `settings.yaml`，所以也不进 §8.4 那套映射。
 
 **1.5.2 的兼容性**：**纯增量，不改任何既有签名 / 表列 / 错误码 / 路由 / `node.trace` 键集合**。具体：
 - **JSONL 只加键、不改既有键的含义**：`collect.row_rejected` / `collect.done` / `collect.failed` 的 `data` 新增 `rows_out_of_window`（`collect.row_rejected` 另外补上代码里早已写出的 `rows_seen` / `rows_accepted`）；`collect.date_fallback` 是新事件名——`/api/logs` 的 `event` 本来就是自由字符串、只做前缀过滤，服务端不需要枚举校验，前端不需要改代码（未知事件名原样显示）。

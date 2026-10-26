@@ -11,14 +11,17 @@
 采集 → 算指标 → 按规则找异常 → 提议动作 → 【人审批：挂起】→ 恢复 → 执行 → T+1/T+3 回看效果
 ```
 
-**它目前不含大模型调用。** 判定完全由 `config/rules.yaml` 里的白名单规则给出
+**模型的在场位置是刻意的：它只解释，不决策。** 判定完全由 `config/rules.yaml` 里的白名单规则给出
 （可读、可审计、改一行就改行为）。这个选择是有意的：涉钱的动作如果需要"模型觉得该改价"
 才执行，你就得为它的错觉负责；规则能被人逐条 review，模型不能。
 
-> 什么时候会引入 LLM：只在**它出错也不致命**的位置——异常的自然语言解释、
-> 给运营的动作建议草稿、日志摘要。引入时的硬约束是：结构化输出 + schema 校验 +
-> 超时 + 失败降级回规则结论，**且不参与最终决策**（人仍是最后一票）。
-> 这一项在契约 §13 里记为未落地，没有假装已实现。
+> v1.6.0 起多了一个**旁路节点 `explain`**：它把命中的异常翻译成一句人话 + 一条建议草稿，
+> 写进 `explanations` / `suggestions` 两个 state 字段，**任何决策代码都不读它们**。
+> 硬约束三条，都有测试锁死：结构化输出 + schema 校验（模型编出本次之外的 `anomaly_id` 会被丢弃并留痕）；
+> 超时 5 秒、失败一律降级回规则结论（`llm.degraded`）；**没配 `LLM_API_KEY` 时整条链路照跑**
+> （写 `llm.skipped`），因此 demo 仍然是零凭据离线的。
+>
+> 换句话说：**模型挂了流程不挂，模型错了结论不错。** 这是"把模型当不可靠组件"的最低要求。
 
 这条工作流的三个工程要点，也是它跟"demo 级 Agent"的区别：
 
@@ -256,7 +259,7 @@ npm run dev      # → http://localhost:5173
 .\.venv\Scripts\python.exe -m pytest backend\tests -q
 ```
 
-零外网、零凭据（`dry_run` + `httpx.MockTransport` + 固定夹具）。**当前 210 passed。**
+零外网、零凭据（`dry_run` + `httpx.MockTransport` + 固定夹具）。**当前 350 passed。**
 
 ### 5. Docker（一条命令起前后端）
 
@@ -294,7 +297,7 @@ backend/
     models.py db.py    # 4 张表（agent_traces/approval_request/action_log/effect_snapshot）
     schemas.py         # §7 全部请求/响应模型（pydantic v2，金额 *_cents）
     api/               # 6 个端点 + 错误包络 + X-Trace-Id 中间件
-    agent/             # graph.py（状态机）nodes.py（8 个节点）tracing.py（trace/失败判定）
+    agent/             # graph.py（状态机）nodes.py（9 个节点，含 LLM 旁路 explain）tracing.py（trace/失败判定）
     services/          # 抖店 client（签名/限流/重试）、指标、规则、审批、效果
     observability/     # JSONL 日志汇（带脱敏）
   config/              # settings.yaml + rules.yaml（密钥只写环境变量名，不写值）

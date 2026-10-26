@@ -17,7 +17,7 @@ reducer 规则（§3.1，硬性，违反即 bug）：
 - `AgentState` 是 **`total=True`（全部必需）**，这不是没来得及标可选：图节点的第一件事就是
   `state["run_id"]` / `state["shop_id"]` 这类直取，缺键会**当场 KeyError**，而不是静默拿到
   `None` 之后在几十行后变成一个更难查的错误。所以"必需"在这里是一种**早失败**设计：
-  `graph._initial_state` 必须把 19 个字段一次给全。
+  `graph._initial_state` 必须把 20 个必需字段一次给全（`explanations` / `suggestions` 两个旁路字段可选）。
 - 全字段必需还有一个后果：`TypedDict` 在运行期只是 `dict`，**不做任何校验**。`status` 标注
   成 `RunStatus`、实际写进去的是 `RunStatus.XXX.value`（字符串）——这是有意的（`StrEnum`
   就是 `str`，"值"与"枚举"在比较时等价），但 `isinstance` 检查会失败，不要拿类型注记当
@@ -295,7 +295,7 @@ class AuditEntry(TypedDict):
 
 
 class AgentState(TypedDict):
-    """整个 run 的状态（§3.2）：LangGraph 的唯一数据载体，21 个字段（19 必需 + 2 旁路可选）。
+    """整个 run 的状态（§3.2）：LangGraph 的唯一数据载体，22 个字段（20 必需 + 2 旁路可选）。
 
     ## 为什么（几乎）全必需（`total=True`）
 
