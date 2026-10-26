@@ -105,7 +105,7 @@ def test_resume_survives_process_restart(
         ]
     finally:
         reopened.close()
-    assert len(events) == 9
+    assert len(events) == 10
     assert sorted(row["node"] for row in events).count("approval_gate") == 2
 
 # ======================================================================================

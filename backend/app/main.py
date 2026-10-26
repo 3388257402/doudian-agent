@@ -50,6 +50,7 @@ from app.config import (
 )
 from app.db import create_engine_from_settings, init_db, reset_engine, session_scope
 from app.observability.logging import JsonlLogSink, configure_logging, get_logger
+from app.services import llm
 from app.services.costs import get_sku_costs
 
 __all__ = ["create_app", "lifespan_for", "app"]
